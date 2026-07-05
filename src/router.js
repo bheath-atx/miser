@@ -31,13 +31,14 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(body),
         'anthropic-version': incomingHeaders['anthropic-version'] || '2023-06-01',
-        'x-api-key': incomingHeaders['x-api-key'] || '',
       },
     };
 
-    if (incomingHeaders['anthropic-beta']) {
-      options.headers['anthropic-beta'] = incomingHeaders['anthropic-beta'];
-    }
+    // Forward all auth headers — subscription uses Authorization: Bearer,
+    // API-key use x-api-key. Forward both so either auth mode works unchanged.
+    if (incomingHeaders['x-api-key']) options.headers['x-api-key'] = incomingHeaders['x-api-key'];
+    if (incomingHeaders['authorization']) options.headers['authorization'] = incomingHeaders['authorization'];
+    if (incomingHeaders['anthropic-beta']) options.headers['anthropic-beta'] = incomingHeaders['anthropic-beta'];
 
     const req = https.request(options, (upstream) => {
       if (upstream.statusCode === 429) {
