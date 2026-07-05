@@ -1,0 +1,22 @@
+# miser systemd user unit
+# Install: cp miser.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload
+#          systemctl --user enable --now miser
+
+[Unit]
+Description=miser — local token compression + provider routing
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=node /home/nacho/miser/src/index.js
+Restart=on-failure
+RestartSec=5
+Environment=MISER_PORT=20128
+Environment=MISER_OLLAMA_URL=http://127.0.0.1:11435
+Environment=MISER_COMPRESSION_THRESHOLD=32000
+Environment=MISER_FALLBACK_MODELS=qwen2.5-coder:14b,qwen2.5:7b,qwen2.5:3b
+EnvironmentFile=-%h/.termdeck/secrets.env
+
+[Install]
+WantedBy=default.target

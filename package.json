@@ -1,0 +1,19 @@
+{
+  "name": "@bheath-atx/miser",
+  "version": "0.1.0",
+  "description": "Local token compression + provider routing for Claude Code and the TermDeck stack",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "keywords": ["termdeck", "claude", "proxy", "compression", "ollama"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bheath-atx/miser.git"
+  }
+}
