@@ -33,8 +33,11 @@ function createProxy() {
       return;
     }
 
-    // Only handle Messages API
-    if (req.method !== 'POST' || !req.url.startsWith('/v1/messages')) {
+    // Route: Anthropic Messages API or OpenAI Chat Completions
+    const isAnthropic = req.method === 'POST' && req.url.startsWith('/v1/messages');
+    const isOpenAI    = req.method === 'POST' && req.url.startsWith('/v1/chat/completions');
+
+    if (!isAnthropic && !isOpenAI) {
       json(res, 404, { error: { type: 'not_found', message: `miser: unknown route ${req.url}` } });
       return;
     }
@@ -43,15 +46,16 @@ function createProxy() {
       const raw = await readBody(req);
       const body = JSON.parse(raw);
       const project = req.headers['x-termdeck-project'] || 'default';
+      const format = isOpenAI ? 'openai' : 'anthropic';
 
       const { messages, tokens, rawTokens } = compress(body, config.compressionThreshold);
       const savedTokens = rawTokens - tokens;
 
       if (savedTokens > 0) {
-        console.log(`[miser] project=${project} compressed ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
+        console.log(`[miser] project=${project} format=${format} compressed ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
       }
 
-      await routeRequest(messages, body, req.headers, res, project, savedTokens);
+      await routeRequest(messages, body, req.headers, res, project, savedTokens, format);
     } catch (err) {
       console.error('[miser] error:', err.message);
       if (!res.headersSent) {

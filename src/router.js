@@ -6,7 +6,18 @@ const { translateToOllama, translateOllamaStream } = require('./translate.js');
 const { recordUsage } = require('./quota.js');
 const config = require('./config.js');
 
-async function routeRequest(messages, originalBody, incomingHeaders, res, project, savedTokens) {
+async function routeRequest(messages, originalBody, incomingHeaders, res, project, savedTokens, format = 'anthropic') {
+  if (format === 'openai') {
+    try {
+      await forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, savedTokens);
+    } catch (err) {
+      if (err.statusCode === 429) {
+        console.log('[miser] OpenAI 429 �� falling back to Ollama');
+        await forwardToOllama(messages, originalBody, res, project, savedTokens);
+      } else throw err;
+    }
+    return;
+  }
   try {
     await forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens);
   } catch (err) {
@@ -57,6 +68,46 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
       });
       upstream.pipe(res);
       upstream.on('end', () => { recordUsage(project, 'anthropic', originalBody.model || 'unknown'); resolve(); });
+      upstream.on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, savedTokens) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ ...originalBody, messages });
+    const options = {
+      hostname: 'api.openai.com',
+      port: 443,
+      path: '/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    };
+    if (incomingHeaders['authorization']) options.headers['authorization'] = incomingHeaders['authorization'];
+
+    const req = https.request(options, (upstream) => {
+      if (upstream.statusCode === 429) {
+        const err = new Error('openai quota exhausted');
+        err.statusCode = 429;
+        upstream.resume();
+        reject(err);
+        return;
+      }
+      res.writeHead(upstream.statusCode, {
+        'content-type': upstream.headers['content-type'] || 'application/json',
+        'x-miser-provider': 'openai',
+        'x-miser-model': originalBody.model || 'unknown',
+        'x-miser-saved-tokens': String(savedTokens),
+      });
+      upstream.pipe(res);
+      upstream.on('end', () => { recordUsage(project, 'openai', originalBody.model || 'unknown'); resolve(); });
       upstream.on('error', reject);
     });
 
