@@ -63,10 +63,12 @@ Models pre-loaded on CPU lane: `qwen2.5:1.5b`, `qwen2.5:3b`, `qwen2.5:7b`, `phi3
 
 | Question | Decision | Reason |
 |---|---|---|
-| Proxy language | Node.js (custom) | ~100 lines, no dep sprawl, matches termdeck/mnestra/rumen stack |
-| Compression method | Turn-truncation first | Zero deps, instant, handles 80% of use case; LLMLingua is upgrade path |
-| Compression threshold | 32K tokens (configurable per-panel) | Global default in config.yaml; `miser_threshold` in session meta overrides |
-| Fallback visibility | Meta-visible, session-silent | `miserModel` written to TermDeck session meta; Claude session uninterrupted |
+| Proxy language | ✓ Node.js (custom) | ~100 lines, no dep sprawl, matches termdeck/mnestra/rumen stack |
+| Compression method | ✓ Turn-truncation | Zero deps, instant, handles 80% of use case; LLMLingua is upgrade path if needed |
+| Compression threshold | ✓ 32K tokens, configurable per-panel | Global default in config.yaml; `miser_threshold` in session meta overrides |
+| Fallback visibility | ✓ Meta-visible, session-silent | `miserModel` written to TermDeck session meta; Claude session uninterrupted |
+
+*All decisions confirmed by Brad 2026-07-05.*
 
 ---
 
