@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { compress, estimateTokens, messageTokens } = require('../src/compress.js');
+const { compress, estimateTokens, messageTokens, validateMessageIntegrity } = require('../src/compress.js');
 
 test('estimateTokens returns 0 for empty/null', () => {
   assert.equal(estimateTokens(''), 0);
@@ -55,4 +55,52 @@ test('compress accounts for system tokens', () => {
   const result = compress(body, 100);
   // system alone (~1000 tokens) exceeds threshold — messages list may be at MIN_KEEP
   assert.ok(result.rawTokens > 100);
+});
+
+test('compress never orphans tool_result when dropping pair would hit MIN_KEEP', () => {
+  const long = 'x'.repeat(5000);
+  // 5 messages: exactly at MIN_KEEP+1 so dropping the pair would hit MIN_KEEP
+  const messages = [
+    { role: 'user', content: long },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'fn', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: long }] },
+    { role: 'assistant', content: long },
+    { role: 'user', content: long },
+  ];
+  const result = compress({ messages }, 1);
+  const integrity = validateMessageIntegrity(result.messages);
+  assert.ok(integrity.valid, `orphaned tool_result: ${integrity.error}`);
+});
+
+test('compress drops tool_use+tool_result pair together when safe', () => {
+  const long = 'x'.repeat(5000);
+  // 6 messages: enough room to drop the pair without hitting MIN_KEEP
+  const messages = [
+    { role: 'user', content: long },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'fn', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: long }] },
+    { role: 'assistant', content: long },
+    { role: 'user', content: long },
+    { role: 'assistant', content: long },
+  ];
+  const result = compress({ messages }, 1);
+  const integrity = validateMessageIntegrity(result.messages);
+  assert.ok(integrity.valid, `orphaned tool_result after compress: ${integrity.error}`);
+});
+
+test('validateMessageIntegrity catches orphaned tool_result', () => {
+  const messages = [
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'missing_id', content: 'x' }] },
+  ];
+  const result = validateMessageIntegrity(messages);
+  assert.equal(result.valid, false);
+  assert.ok(result.error.includes('missing_id'));
+});
+
+test('validateMessageIntegrity passes clean messages', () => {
+  const messages = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'fn', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }] },
+  ];
+  assert.deepEqual(validateMessageIntegrity(messages), { valid: true });
 });

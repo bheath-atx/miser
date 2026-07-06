@@ -14,6 +14,11 @@ function messageTokens(msg) {
   return estimateTokens(content) + 4; // 4-token overhead per message turn
 }
 
+function hasToolUse(msg) {
+  if (!Array.isArray(msg.content)) return false;
+  return msg.content.some(b => b.type === 'tool_use');
+}
+
 // Turn-truncation: drop oldest messages when context exceeds threshold.
 // Always preserves the last MIN_KEEP messages so the immediate context is intact.
 function compress(body, threshold) {
@@ -35,10 +40,52 @@ function compress(body, threshold) {
   let tokens = rawTokens;
 
   while (tokens > threshold && truncated.length > MIN_KEEP) {
-    tokens -= messageTokens(truncated.shift());
+    const candidate = truncated[0];
+
+    if (hasToolUse(candidate)) {
+      // The next turn holds the paired tool_result blocks. We must drop both
+      // together — dropping the tool_use alone leaves an orphaned tool_result
+      // that causes a 400 from the Anthropic API.
+      const hasPair = truncated.length > 1 && truncated[1].role === 'user';
+      if (hasPair && truncated.length <= MIN_KEEP + 1) {
+        // Dropping both would fall below MIN_KEEP — stop here.
+        break;
+      }
+      truncated.shift();
+      tokens -= messageTokens(candidate);
+      if (hasPair) {
+        tokens -= messageTokens(truncated.shift());
+      }
+    } else {
+      truncated.shift();
+      tokens -= messageTokens(candidate);
+    }
   }
 
   return { messages: truncated, tokens, rawTokens };
 }
 
-module.exports = { compress, estimateTokens, messageTokens };
+// Returns { valid: true } or { valid: false, error: string }.
+// Catches orphaned tool_result blocks that would cause upstream 400s.
+function validateMessageIntegrity(messages) {
+  const toolUseIds = new Set();
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'tool_use') toolUseIds.add(block.id);
+      }
+    }
+  }
+  for (const msg of messages) {
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'tool_result' && !toolUseIds.has(block.tool_use_id)) {
+          return { valid: false, error: `orphaned tool_result: tool_use_id ${block.tool_use_id} has no corresponding tool_use block` };
+        }
+      }
+    }
+  }
+  return { valid: true };
+}
+
+module.exports = { compress, estimateTokens, messageTokens, validateMessageIntegrity };

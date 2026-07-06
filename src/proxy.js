@@ -1,6 +1,6 @@
 'use strict';
 
-const { compress } = require('./compress.js');
+const { compress, validateMessageIntegrity } = require('./compress.js');
 const { routeRequest } = require('./router.js');
 const { getAllUsage } = require('./quota.js');
 const config = require('./config.js');
@@ -53,6 +53,13 @@ function createProxy() {
 
       if (savedTokens > 0) {
         console.log(`[miser] project=${project} format=${format} compressed ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
+      }
+
+      const integrity = validateMessageIntegrity(messages);
+      if (!integrity.valid) {
+        console.error(`[miser] integrity error, refusing to forward: ${integrity.error}`);
+        json(res, 400, { error: { type: 'miser_integrity_error', message: integrity.error } });
+        return;
       }
 
       await routeRequest(messages, body, req.headers, res, project, savedTokens, format);
