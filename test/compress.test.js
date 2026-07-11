@@ -57,6 +57,54 @@ test('compress accounts for system tokens', () => {
   assert.ok(result.rawTokens > 100);
 });
 
+// REGRESSION (Codex inversion R2 finding #1): object-form system must not throw
+// (previously body.system.map TypeError'd → proxy 500 before failover ran).
+test('compress does not throw on object-form system {text}', () => {
+  const body = { system: { text: 'x'.repeat(4000) }, messages: [{ role: 'user', content: 'hi' }] };
+  const result = compress(body, 100);
+  assert.ok(result.rawTokens > 100);
+});
+
+test('compress does not throw on object-form system with non-string text', () => {
+  const body = { system: { text: { nested: true } }, messages: [{ role: 'user', content: 'hi' }] };
+  const result = compress(body, 100000);
+  assert.equal(result.messages.length, 1);
+});
+
+// REGRESSION (Codex inversion R3 finding #1): null/malformed blocks in a content
+// array must not throw during token estimation.
+test('compress does not throw on null block inside content array', () => {
+  const body = { messages: [{ role: 'user', content: [null, { type: 'text', text: 'ok' }] }] };
+  const result = compress(body, 100000);
+  assert.equal(result.messages.length, 1);
+});
+
+test('compress does not throw on circular block content', () => {
+  const circular = {}; circular.self = circular;
+  const body = { messages: [{ role: 'user', content: [circular] }] };
+  const result = compress(body, 100000);
+  assert.ok(result.rawTokens >= 0);
+});
+
+// REGRESSION (Codex inversion R4 finding #1): null blocks must not throw in the
+// tool-use detection or integrity-validation paths either.
+test('compress does not throw on null block in an over-threshold assistant turn', () => {
+  const body = { messages: [
+    { role: 'assistant', content: [null, { type: 'text', text: 'x'.repeat(200000) }] },
+    { role: 'user', content: 'hi' },
+  ] };
+  const result = compress(body, 500); // over-threshold → exercises hasToolUse path
+  assert.ok(Array.isArray(result.messages));
+});
+
+test('validateMessageIntegrity does not throw on null blocks', () => {
+  const messages = [
+    { role: 'assistant', content: [null, { type: 'tool_use', id: 't1', name: 'f', input: {} }] },
+    { role: 'user', content: [null, { type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+  ];
+  assert.deepEqual(validateMessageIntegrity(messages), { valid: true });
+});
+
 test('compress never orphans tool_result when dropping pair would hit MIN_KEEP', () => {
   const long = 'x'.repeat(5000);
   // 5 messages: exactly at MIN_KEEP+1 so dropping the pair would hit MIN_KEEP

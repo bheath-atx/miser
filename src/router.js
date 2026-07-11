@@ -3,31 +3,102 @@
 const https = require('node:https');
 const http = require('node:http');
 const { translateToOllama, translateOllamaStream } = require('./translate.js');
+const { translateToOpenAI, validateOpenAIRequest } = require('./translate-openai.js');
+const { hardCapOllamaBody } = require('./hardcap.js');
+const { getCodexBearer } = require('./oauth.js');
 const { recordUsage } = require('./quota.js');
 const config = require('./config.js');
 
-async function routeRequest(messages, originalBody, incomingHeaders, res, project, savedTokens, format = 'anthropic') {
+// ---------------------------------------------------------------------------
+// Failover chain (anthropic format):
+//
+//   Anthropic          --429-->  Codex/OpenAI (subscription OAuth, translated)
+//   Codex/OpenAI       --429 or transient-->  hard-capped Ollama
+//
+// Every network leg goes through an injectable transport seam so the offline
+// test harness can drive the whole chain with zero sockets (no :20128, no real
+// api.anthropic.com / api.openai.com / Ollama). Production uses the real
+// https/http transports defined below.
+// ---------------------------------------------------------------------------
+
+function defaultDeps() {
+  return {
+    transports: {
+      anthropic: forwardToAnthropic,
+      openaiPassthrough: forwardToOpenAI,
+      codex: forwardToCodex,
+      ollama: forwardToOllama,
+    },
+    getBearer: getCodexBearer,
+    ollamaCap: config.ollamaHardCap,
+  };
+}
+
+async function routeRequest(messages, originalBody, incomingHeaders, res, project, savedTokens, format = 'anthropic', deps = {}) {
+  const base = defaultDeps();
+  const transports = { ...base.transports, ...(deps.transports || {}) };
+  const getBearer = deps.getBearer || base.getBearer;
+  const ollamaCap = deps.ollamaCap != null ? deps.ollamaCap : base.ollamaCap;
+
   if (format === 'openai') {
+    // Already-OpenAI-format request: passthrough, Ollama on 429. (Unchanged
+    // legacy path — no Codex leg, the caller is already speaking OpenAI.)
     try {
-      await forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, savedTokens);
+      await transports.openaiPassthrough(messages, originalBody, incomingHeaders, res, project, savedTokens);
     } catch (err) {
-      if (err.statusCode === 429) {
-        console.log('[miser] OpenAI 429 �� falling back to Ollama');
-        await forwardToOllama(messages, originalBody, res, project, savedTokens);
+      if (err.statusCode === 429 && !res.headersSent) {
+        console.log('[miser] OpenAI 429 — falling back to hard-capped Ollama');
+        await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
       } else throw err;
     }
     return;
   }
+
+  // --- Anthropic path ------------------------------------------------------
   try {
-    await forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens);
+    await transports.anthropic(messages, originalBody, incomingHeaders, res, project, savedTokens);
+    return;
   } catch (err) {
-    if (err.statusCode === 429) {
-      console.log('[miser] Anthropic 429 — falling back to Ollama');
-      await forwardToOllama(messages, originalBody, res, project, savedTokens);
-    } else {
-      throw err;
-    }
+    if (err.statusCode !== 429 || res.headersSent) throw err;
+    console.log('[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)');
   }
+
+  // --- Leg 2: Codex/OpenAI via subscription OAuth --------------------------
+  try {
+    const bearer = await getBearer(); // fail closed: throws if no valid token
+    const openaiReq = translateToOpenAI(messages, originalBody);
+    const check = validateOpenAIRequest(openaiReq);
+    if (!check.valid) {
+      // Never ship a request that could trigger the messages.0 brick.
+      const e = new Error(`miser: refusing malformed Codex request: ${check.error}`);
+      e.statusCode = 400;
+      throw e;
+    }
+    await transports.codex(openaiReq, bearer, res, project, savedTokens);
+    return;
+  } catch (err) {
+    if (res.headersSent) throw err; // response already streaming — can't fail over
+    console.log(`[miser] Codex/OpenAI unavailable (${err.statusCode || err.message}) — hard-capped Ollama fallback`);
+  }
+
+  // --- Leg 3: hard-capped Ollama ------------------------------------------
+  await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
+}
+
+// ---------------------------------------------------------------------------
+// Production transports (real sockets). Not exercised by the offline harness.
+// ---------------------------------------------------------------------------
+
+// Once response headers are sent we can no longer emit a clean JSON error, and
+// the router/proxy cannot either (headersSent is true). If the upstream stream
+// then errors we MUST terminate the downstream response so the client sees a
+// broken stream rather than an indefinitely-hung connection.
+function teardownResponse(res, err) {
+  try {
+    if (res.destroyed) return;
+    if (typeof res.destroy === 'function') res.destroy(err);
+    else if (!res.writableEnded) res.end();
+  } catch (_) { /* best effort */ }
 }
 
 function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens) {
@@ -68,7 +139,7 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
       });
       upstream.pipe(res);
       upstream.on('end', () => { recordUsage(project, 'anthropic', originalBody.model || 'unknown'); resolve(); });
-      upstream.on('error', reject);
+      upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
     });
 
     req.on('error', reject);
@@ -77,6 +148,7 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
   });
 }
 
+// Legacy passthrough for requests that ARRIVE already in OpenAI format.
 function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, savedTokens) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ ...originalBody, messages });
@@ -108,7 +180,7 @@ function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, 
       });
       upstream.pipe(res);
       upstream.on('end', () => { recordUsage(project, 'openai', originalBody.model || 'unknown'); resolve(); });
-      upstream.on('error', reject);
+      upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
     });
 
     req.on('error', reject);
@@ -117,10 +189,69 @@ function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, 
   });
 }
 
-function forwardToOllama(messages, originalBody, res, project, savedTokens) {
+// Codex/OpenAI failover transport, driven by a TRANSLATED OpenAI request and a
+// subscription OAuth bearer. Rejects (before writing any response header) on 429
+// or 5xx so the router can fall through to Ollama. The exact live endpoint /
+// wire-format is pending Brad confirmation (see config.codexUrl); this
+// transport is fully mocked in the offline harness.
+function forwardToCodex(openaiReq, bearer, res, project, savedTokens) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(config.codexUrl);
+    const transport = url.protocol === 'https:' ? https : http;
+    const body = JSON.stringify(openaiReq);
+    const headers = {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      // Subscription OAuth — NOT OPENAI_API_KEY.
+      'authorization': `Bearer ${bearer.token}`,
+    };
+    if (bearer.accountId) headers['chatgpt-account-id'] = bearer.accountId;
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers,
+    };
+
+    const req = transport.request(options, (upstream) => {
+      // Fail over to Ollama on ANY non-2xx. Critically this includes 401/403:
+      // an expired/invalid subscription token must NOT be streamed to the
+      // client as a "successful" Codex response — it fails closed to Ollama.
+      // We reject BEFORE writeHead so the router can still fail over.
+      if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
+        const err = new Error(`codex non-2xx ${upstream.statusCode}`);
+        err.statusCode = upstream.statusCode;
+        upstream.resume();
+        reject(err);
+        return;
+      }
+      res.writeHead(upstream.statusCode, {
+        'content-type': upstream.headers['content-type'] || 'application/json',
+        'x-miser-provider': 'codex',
+        'x-miser-model': openaiReq.model || 'unknown',
+        'x-miser-saved-tokens': String(savedTokens),
+      });
+      upstream.pipe(res);
+      upstream.on('end', () => { recordUsage(project, 'codex', openaiReq.model || 'unknown'); resolve(); });
+      upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
+    });
+
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function forwardToOllama(messages, originalBody, res, project, savedTokens, opts = {}) {
   return new Promise((resolve, reject) => {
     const model = config.fallbackModels[0];
-    const ollamaBody = translateToOllama(messages, originalBody, model);
+    const translated = translateToOllama(messages, originalBody, model);
+    // Hard-cap the fully-translated body so an oversized double-fallback payload
+    // (or a single huge recent message) can never exceed the local context.
+    const cap = opts.cap != null ? opts.cap : config.ollamaHardCap;
+    const ollamaBody = hardCapOllamaBody(translated, cap);
     const bodyStr = JSON.stringify(ollamaBody);
     const ollamaUrl = new URL('/api/chat', config.ollamaUrl);
     const transport = ollamaUrl.protocol === 'https:' ? https : http;
@@ -145,7 +276,7 @@ function forwardToOllama(messages, originalBody, res, project, savedTokens) {
       });
       translateOllamaStream(upstream, res, model);
       upstream.on('end', () => { recordUsage(project, 'ollama', model); resolve(); });
-      upstream.on('error', reject);
+      upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
     });
 
     req.on('error', reject);
@@ -154,4 +285,14 @@ function forwardToOllama(messages, originalBody, res, project, savedTokens) {
   });
 }
 
-module.exports = { routeRequest };
+module.exports = {
+  routeRequest,
+  forwardToAnthropic,
+  forwardToOpenAI,
+  forwardToCodex,
+  forwardToOllama,
+  teardownResponse,
+  // exported so the hard-cap can be asserted end-to-end (translate → cap)
+  _buildCappedOllamaBody: (messages, originalBody, cap) =>
+    hardCapOllamaBody(translateToOllama(messages, originalBody, config.fallbackModels[0]), cap),
+};

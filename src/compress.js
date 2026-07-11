@@ -1,5 +1,7 @@
 'use strict';
 
+const { systemToText } = require('./translate-openai.js');
+
 // Rough token estimate: ~4 chars per token (GPT-style approximation).
 // Good enough for threshold decisions without pulling in tiktoken.
 function estimateTokens(text) {
@@ -7,27 +9,35 @@ function estimateTokens(text) {
   return Math.ceil(text.length / 4);
 }
 
+function safeBlockText(b) {
+  if (b == null) return '';
+  if (typeof b === 'string') return b;
+  if (typeof b.text === 'string') return b.text;
+  try { return JSON.stringify(b); } catch (_) { return ''; } // e.g. circular refs
+}
+
 function messageTokens(msg) {
   const content = typeof msg.content === 'string'
     ? msg.content
-    : msg.content.map(b => b.text || JSON.stringify(b)).join('');
+    : Array.isArray(msg.content)
+      ? msg.content.map(safeBlockText).join('')
+      : ''; // non-string, non-array content contributes only turn overhead
   return estimateTokens(content) + 4; // 4-token overhead per message turn
 }
 
 function hasToolUse(msg) {
   if (!Array.isArray(msg.content)) return false;
-  return msg.content.some(b => b.type === 'tool_use');
+  return msg.content.some(b => b && b.type === 'tool_use');
 }
 
 // Turn-truncation: drop oldest messages when context exceeds threshold.
 // Always preserves the last MIN_KEEP messages so the immediate context is intact.
 function compress(body, threshold) {
   const messages = body.messages || [];
-  const systemTokens = body.system
-    ? estimateTokens(typeof body.system === 'string'
-        ? body.system
-        : body.system.map(b => b.text || '').join(''))
-    : 0;
+  // systemToText is robust to string / block-array / object `system` shapes and
+  // never throws (previously `.map` TypeError'd on an object-form system, which
+  // surfaced as a 500 from the proxy before failover could even run).
+  const systemTokens = estimateTokens(systemToText(body.system));
 
   const rawTokens = systemTokens + messages.reduce((sum, m) => sum + messageTokens(m), 0);
 
@@ -72,14 +82,14 @@ function validateMessageIntegrity(messages) {
   for (const msg of messages) {
     if (msg.role === 'assistant' && Array.isArray(msg.content)) {
       for (const block of msg.content) {
-        if (block.type === 'tool_use') toolUseIds.add(block.id);
+        if (block && block.type === 'tool_use') toolUseIds.add(block.id);
       }
     }
   }
   for (const msg of messages) {
     if (msg.role === 'user' && Array.isArray(msg.content)) {
       for (const block of msg.content) {
-        if (block.type === 'tool_result' && !toolUseIds.has(block.tool_use_id)) {
+        if (block && block.type === 'tool_result' && !toolUseIds.has(block.tool_use_id)) {
           return { valid: false, error: `orphaned tool_result: tool_use_id ${block.tool_use_id} has no corresponding tool_use block` };
         }
       }

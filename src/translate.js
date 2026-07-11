@@ -1,23 +1,34 @@
 'use strict';
 
+const { systemToText } = require('./translate-openai.js');
+
+// JSON.stringify that never throws (e.g. on circular tool payloads).
+function safeJson(v) {
+  try { return JSON.stringify(v); } catch (_) { return '"[unserializable]"'; }
+}
+
 // Translate Anthropic Messages API request → Ollama /api/chat format.
 function translateToOllama(messages, originalBody, model) {
   const ollamaMessages = [];
 
-  if (originalBody.system) {
-    const text = typeof originalBody.system === 'string'
-      ? originalBody.system
-      : originalBody.system.map(b => b.text || '').join('\n');
-    ollamaMessages.push({ role: 'system', content: text });
+  // systemToText is robust to string / block-array / object `system` shapes and
+  // never throws on a malformed value (previously `.map` TypeError'd on an
+  // object-form system and bricked the Ollama fallback leg).
+  const sysText = systemToText(originalBody.system);
+  if (sysText) {
+    ollamaMessages.push({ role: 'system', content: sysText });
   }
 
   for (const msg of messages) {
     const content = typeof msg.content === 'string'
       ? msg.content
+      : !Array.isArray(msg.content)
+        ? ''
       : msg.content.map(block => {
-          if (block.type === 'text') return block.text;
-          if (block.type === 'tool_result') return `[tool result: ${JSON.stringify(block.content)}]`;
-          if (block.type === 'tool_use') return `[tool call: ${block.name}(${JSON.stringify(block.input)})]`;
+          if (!block || typeof block !== 'object') return '';
+          if (block.type === 'text') return typeof block.text === 'string' ? block.text : '';
+          if (block.type === 'tool_result') return `[tool result: ${safeJson(block.content)}]`;
+          if (block.type === 'tool_use') return `[tool call: ${block.name}(${safeJson(block.input)})]`;
           return '';
         }).filter(Boolean).join('\n');
 

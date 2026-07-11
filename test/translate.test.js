@@ -15,6 +15,40 @@ test('adds system message from block array system field', () => {
   assert.equal(result.messages[0].content, 'Be helpful.');
 });
 
+// REGRESSION (Codex inversion R2 finding #2): object-form system must not crash
+// the Ollama fallback leg.
+test('object-form system {text} does not throw and yields a system turn', () => {
+  const result = translateToOllama([{ role: 'user', content: 'hi' }], { system: { text: 'Be helpful.' } }, 'q');
+  assert.equal(result.messages[0].role, 'system');
+  assert.equal(result.messages[0].content, 'Be helpful.');
+});
+
+test('object-form system with non-string text is dropped, does not throw', () => {
+  const result = translateToOllama([{ role: 'user', content: 'hi' }], { system: { text: { nested: 1 } } }, 'q');
+  assert.equal(result.messages[0].role, 'user'); // no bogus system turn
+  assert.ok(result.messages.every(m => typeof m.content === 'string'));
+});
+
+test('non-array object message content does not throw', () => {
+  const result = translateToOllama([{ role: 'user', content: { weird: true } }], {}, 'q');
+  assert.ok(Array.isArray(result.messages));
+});
+
+// REGRESSION (Codex inversion R3 finding #2): null/malformed blocks in a content
+// array must not throw.
+test('null block inside content array does not throw', () => {
+  const result = translateToOllama([{ role: 'user', content: [null, { type: 'text', text: 'ok' }] }], {}, 'q');
+  assert.ok(result.messages.some(m => m.content.includes('ok')));
+});
+
+test('circular tool_use input does not throw', () => {
+  const circular = {}; circular.self = circular;
+  const result = translateToOllama(
+    [{ role: 'assistant', content: [{ type: 'tool_use', name: 'fn', input: circular }] }], {}, 'q',
+  );
+  assert.ok(Array.isArray(result.messages));
+});
+
 test('passes string content through unchanged', () => {
   const messages = [{ role: 'user', content: 'hello' }];
   const result = translateToOllama(messages, {}, 'qwen2.5:7b');
