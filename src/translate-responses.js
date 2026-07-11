@@ -58,10 +58,10 @@ function translateToResponses(messages, originalBody = {}) {
     store: false,
   };
   if (instructions) req.instructions = instructions;
-  if (typeof originalBody.max_tokens === 'number' && originalBody.max_tokens > 0) {
-    req.max_output_tokens = originalBody.max_tokens;
-  }
-  if (typeof originalBody.temperature === 'number') req.temperature = originalBody.temperature;
+  // NOTE: do NOT send max_output_tokens — the Codex backend rejects it with
+  // "400 Unsupported parameter: max_output_tokens" (confirmed by live probe
+  // 2026-07-11; the real codex request omits it too). The backend controls
+  // output length itself. Likewise no temperature (codex omits it).
   return req;
 }
 

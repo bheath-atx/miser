@@ -48,9 +48,10 @@ test('tool blocks degrade to inline text (never structured)', () => {
   assert.match(req.input[1].content[0].text, /\[tool result: match\]/);
 });
 
-test('max_tokens maps to max_output_tokens; store:false; stream forced true', () => {
+test('store:false; stream forced true; NO max_output_tokens (backend rejects it)', () => {
   const req = translateToResponses([{ role: 'user', content: 'hi' }], { max_tokens: 256 });
-  assert.equal(req.max_output_tokens, 256);
+  // Live probe (2026-07-11) confirmed the Codex backend 400s on max_output_tokens.
+  assert.ok(!('max_output_tokens' in req), 'must not send max_output_tokens');
   assert.equal(req.store, false);
   assert.equal(req.stream, true);
 });

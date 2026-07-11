@@ -63,13 +63,20 @@ response.completed              ← data.response.usage.{input,output}_tokens
 - ends on `response.completed`, reads usage ✓
 Locked by test "matches the real captured Responses event sequence".
 
-## THE ONE REMAINING UNKNOWN (before live cutover)
-Does the backend REQUIRE the codex-session headers (`x-codex-*`, `session-id`,
-`thread-id`) and/or `content-encoding: zstd`, or will it accept miser's minimal
-header set (authorization + chatgpt-account-id + accept + content-type +
-originator + user-agent + version)?
+## RESOLVED by live probe (2026-07-11, Brad-approved)
+Sent miser-shaped requests (real token) directly to the backend with 3 header
+sets: `full-mimic` (synthesized codex-session headers), `miser-now`, and `bare`
+(authorization + chatgpt-account-id + accept + content-type only).
 
-The capture proves the FULL codex request works; it does not prove a MINIMAL one
-does. Resolve with a one-shot minimal-request probe (miser-shaped body + minimal
-headers, real token) against the backend, observing 200-vs-4xx — an explicit,
-Brad-approved step. Everything else is pinned.
+Result: **ALL THREE returned `200` with `response.created` SSE.**
+- The backend does NOT require `x-codex-*` / `session-id` / `thread-id` headers.
+- It does NOT require `content-encoding: zstd`, `originator`, `user-agent`, or
+  `version`. Miser's minimal header set is sufficient.
+- BODY FIX found: the backend `400`s on `max_output_tokens` ("Unsupported
+  parameter"). Removed from translateToResponses (codex omits it too). After
+  removal → 200.
+
+**Miser's Codex Responses request is now proven end-to-end against the real
+backend** (auth + headers + body + SSE). The only step not exercised is running
+it through miser itself on :20128 — i.e. the actual cutover, which still awaits
+Brad's go.
