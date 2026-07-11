@@ -1,6 +1,6 @@
 'use strict';
 
-const { compress, validateMessageIntegrity } = require('./compress.js');
+const { compress, validateMessageIntegrity, normalizeAnthropicBody } = require('./compress.js');
 const { routeRequest } = require('./router.js');
 const { getAllUsage } = require('./quota.js');
 const config = require('./config.js');
@@ -44,15 +44,30 @@ function createProxy() {
 
     try {
       const raw = await readBody(req);
-      const body = JSON.parse(raw);
+      let body = JSON.parse(raw);
       const project = req.headers['x-termdeck-project'] || 'default';
       const format = isOpenAI ? 'openai' : 'anthropic';
 
-      const { messages, tokens, rawTokens } = compress(body, config.compressionThreshold);
+      if (format === 'anthropic') {
+        const normalized = normalizeAnthropicBody(body, body.messages || []);
+        body = { ...normalized.body, messages: normalized.messages };
+      }
+
+      const { messages, tokens, rawTokens, overflow, reason } = compress(body, config.compressionThreshold);
       const savedTokens = rawTokens - tokens;
 
       if (savedTokens > 0) {
         console.log(`[miser] project=${project} format=${format} compressed ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
+      }
+
+      // Fail-visible: the preserve set (system + first task turn + recent tail)
+      // still exceeds the threshold after lossless dedup. Do NOT silently drop
+      // preserved context — surface a 413-class response so Claude Code's native
+      // compaction fires instead of us malforming/losing the task turn.
+      if (overflow) {
+        console.warn(`[miser] project=${project} format=${format} CONTEXT PRESSURE (${tokens}/${config.compressionThreshold} tok): ${reason}`);
+        json(res, 413, { error: { type: 'miser_context_overflow', message: reason } });
+        return;
       }
 
       const integrity = validateMessageIntegrity(messages);

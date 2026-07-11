@@ -30,15 +30,19 @@ test('compress works on OpenAI-format body (no separate system field)', () => {
   assert.equal(result.tokens, result.rawTokens);
 });
 
-test('compress drops oldest OpenAI messages when over threshold', () => {
+// REDESIGN: compress no longer blind-truncates oldest turns (that was the
+// root-cause bug). With no losslessly-dedupable content it preserves every turn
+// and surfaces overflow for the proxy to act on.
+test('compress does NOT blind-truncate OpenAI messages; surfaces overflow instead', () => {
   const long = 'x'.repeat(2000);
   const messages = [
     { role: 'system', content: 'Be helpful.' },
     ...Array.from({ length: 15 }, (_, i) => ({
       role: i % 2 === 0 ? 'user' : 'assistant',
-      content: long,
+      content: `turn-${i} ${long}`, // unique per turn -> nothing to dedup
     })),
   ];
   const result = compress({ messages }, 500);
-  assert.ok(result.messages.length < messages.length);
+  assert.equal(result.messages.length, messages.length); // no silent drops
+  assert.equal(result.overflow, true);
 });
