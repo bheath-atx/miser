@@ -220,9 +220,11 @@ function forwardToCodex(codexReq, bearer, res, project, savedTokens) {
     };
     if (bearer.accountId) headers['chatgpt-account-id'] = bearer.accountId;
     if (isResponses) {
-      // Codex-backend markers the responses endpoint expects from its client.
-      if (config.codexBeta) headers['openai-beta'] = config.codexBeta;
+      // Client-identity headers matching the real codex HTTPS request (PINNED
+      // from a live capture). Note: NO `openai-beta` — the real request omits it.
       if (config.codexOriginator) headers['originator'] = config.codexOriginator;
+      if (config.codexUserAgent) headers['user-agent'] = config.codexUserAgent;
+      if (config.codexClientVersion) headers['version'] = config.codexClientVersion;
     }
 
     const options = {

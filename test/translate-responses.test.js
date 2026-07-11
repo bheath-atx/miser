@@ -140,6 +140,40 @@ test('translateResponsesStream parses CRLF split across chunk boundary', () => {
   assert.match(res.body(), /"text":"split"/);
 });
 
+// GROUND TRUTH: exact event sequence captured from the live codex 0.144
+// /backend-api/codex/responses HTTPS response (2026-07-11). Reasoning items carry
+// no text and MUST be ignored; only response.output_text.delta text is streamed.
+test('translateResponsesStream matches the real captured Responses event sequence', () => {
+  const up = fakeUpstream();
+  const res = collectRes();
+  translateResponsesStream(up, res, 'gpt-5.5');
+  const seq = [
+    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_x","usage":{"input_tokens":9}}}\n\n',
+    'event: response.in_progress\ndata: {"type":"response.in_progress","response":{"id":"resp_x"}}\n\n',
+    'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","content":[],"encrypted_content":"gAAA..."}}\n\n',
+    'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","content":[]}}\n\n',
+    'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}\n\n',
+    'event: response.content_part.added\ndata: {"type":"response.content_part.added","content_index":0,"item_id":"msg_1","part":{"type":"output_text","text":""}}\n\n',
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","content_index":0,"delta":"ok","item_id":"msg_1","obfuscation":"xxxx"}\n\n',
+    'event: response.output_text.done\ndata: {"type":"response.output_text.done","content_index":0,"item_id":"msg_1","text":"ok"}\n\n',
+    'event: response.content_part.done\ndata: {"type":"response.content_part.done","content_index":0,"item_id":"msg_1","part":{"type":"output_text","text":"ok"}}\n\n',
+    'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"ok"}]}}\n\n',
+    'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_x","status":"completed","usage":{"input_tokens":9,"output_tokens":1}}}\n\n',
+  ];
+  for (const f of seq) up.emit('data', f);
+  up.emit('end');
+  const body = res.body();
+  // exactly the final answer text, streamed once
+  const deltas = [...body.matchAll(/"type":"text_delta","text":"([^"]*)"/g)].map(m => m[1]);
+  assert.deepEqual(deltas, ['ok'], `expected only "ok" streamed, got ${JSON.stringify(deltas)}`);
+  assert.match(body, /event: message_start/);
+  assert.match(body, /"input_tokens":9/);
+  assert.match(body, /"output_tokens":1/);
+  assert.match(body, /event: message_stop/);
+  // reasoning encrypted_content must NOT leak to the client
+  assert.ok(!body.includes('encrypted_content') && !body.includes('gAAA'));
+});
+
 test('translateResponsesStream tolerates split frames across chunks', () => {
   const up = fakeUpstream();
   const res = collectRes();

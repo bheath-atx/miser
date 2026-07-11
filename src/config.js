@@ -23,8 +23,16 @@ module.exports = {
   // Wire format for the Codex leg: 'responses' (Codex backend, OAuth) or 'chat'
   // (OpenAI chat/completions, needs an API key). Default 'responses'.
   codexFormat: process.env.MISER_CODEX_FORMAT || 'responses',
-  // Codex-specific headers the backend expects from the codex client. Values
-  // extracted from the codex CLI binary; VERIFY-AT-CUTOVER against a live capture.
-  codexBeta: process.env.MISER_CODEX_BETA || 'responses=experimental',
+  // Codex client-identity headers. PINNED from a live capture of the real codex
+  // 0.144 HTTPS request to /backend-api/codex/responses (2026-07-11): the real
+  // request sends authorization + chatgpt-account-id + accept:text/event-stream
+  // + content-type:application/json + originator + user-agent + version. It does
+  // NOT send an `openai-beta` header (my earlier assumption — removed). The
+  // x-codex-* / session-id / thread-id headers are per-codex-session bookkeeping
+  // that miser has no equivalent for and omits; whether the backend REQUIRES
+  // them is the one thing a minimal-request live probe still needs to confirm
+  // before cutover.
   codexOriginator: process.env.MISER_CODEX_ORIGINATOR || 'codex_cli_rs',
+  codexUserAgent: process.env.MISER_CODEX_USER_AGENT || 'codex_cli_rs/0.144.1 (miser failover)',
+  codexClientVersion: process.env.MISER_CODEX_VERSION || '0.144.1',
 };

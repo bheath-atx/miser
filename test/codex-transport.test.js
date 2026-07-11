@@ -72,6 +72,8 @@ test('real forwardToCodex sends subscription Bearer + codex headers, never OPENA
       seen.acct = req.headers['chatgpt-account-id'];
       seen.beta = req.headers['openai-beta'];
       seen.originator = req.headers['originator'];
+      seen.ua = req.headers['user-agent'];
+      seen.version = req.headers['version'];
       seen.accept = req.headers['accept'];
       res.writeHead(401, { 'content-type': 'application/json' }); // reject so we don't need a real stream
       res.end('{}');
@@ -85,8 +87,11 @@ test('real forwardToCodex sends subscription Bearer + codex headers, never OPENA
     await assert.rejects(() => forwardToCodex(RESPONSES_REQ, BEARER, res, 'proj', 0));
     assert.equal(seen.auth, 'Bearer FAKE-SUBSCRIPTION-TOKEN');
     assert.equal(seen.acct, 'acct_fake');
-    assert.equal(seen.beta, 'responses=experimental');
+    // PINNED from live capture: real codex request sends NO openai-beta header.
+    assert.equal(seen.beta, undefined);
     assert.equal(seen.originator, 'codex_cli_rs');
+    assert.match(seen.ua, /codex/);
+    assert.equal(seen.version, '0.144.1');
     assert.equal(seen.accept, 'text/event-stream');
     assert.ok(seen.auth !== 'Bearer sk-METERED'); // never the api key
   } finally {
