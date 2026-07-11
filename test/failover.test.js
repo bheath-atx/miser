@@ -116,14 +116,14 @@ for (const status of [401, 403, 400, 502]) {
   });
 }
 
-test('Codex leg receives a validated OpenAI request + the subscription bearer', async () => {
+test('Codex leg receives a validated Responses request + the subscription bearer', async () => {
   const captured = {};
   const calls = [];
   const deps = {
     transports: {
       anthropic: failTransport('anthropic', calls, 429),
-      codex: (openaiReq, bearer, res) => {
-        captured.openaiReq = openaiReq;
+      codex: (codexReq, bearer, res) => {
+        captured.codexReq = codexReq;
         captured.bearer = bearer;
         res.writeHead(200, { 'x-miser-provider': 'codex' });
         res.end();
@@ -139,10 +139,36 @@ test('Codex leg receives a validated OpenAI request + the subscription bearer', 
   // bearer is the subscription token, not an sk- API key
   assert.equal(captured.bearer.token, 'FAKE-ACCESS-TOKEN');
   assert.ok(!captured.bearer.token.startsWith('sk-'));
-  // translated request obeys the OpenAI contract (system extracted, string content)
-  assert.equal(captured.openaiReq.messages[0].role, 'system');
-  assert.ok(captured.openaiReq.messages.every(m => typeof m.content === 'string'));
-  assert.ok(!('system' in captured.openaiReq));
+  // default format is the Responses API: system → instructions, input items with
+  // typed content parts, and NO anthropic-only keys leaked.
+  assert.equal(captured.codexReq.instructions, 'sys');
+  assert.ok(Array.isArray(captured.codexReq.input));
+  assert.equal(captured.codexReq.input[0].type, 'message');
+  assert.ok(captured.codexReq.input[0].content.every(p => typeof p.text === 'string' && p.text.length > 0));
+  assert.ok(!('system' in captured.codexReq));
+  assert.ok(!('messages' in captured.codexReq));
+});
+
+// REGRESSION (Codex inversion finding #1): if the Anthropic messages flatten to
+// no usable text, the Responses request would be empty — the router must fail
+// closed past Codex to Ollama, never ship an empty Codex request.
+test('empty-flattening messages skip Codex and fail over to Ollama', async () => {
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: successTransport('codex', calls), // would succeed — must be skipped
+      ollama: successTransport('ollama', calls),
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const emptyMsgs = [{ role: 'user', content: [] }]; // flattens to nothing
+  const res = makeRes();
+  await routeRequest(emptyMsgs, { model: 'claude', messages: emptyMsgs }, {}, res, 'proj', 0, 'anthropic', deps);
+  const names = calls.map(c => c.name);
+  assert.deepEqual(names, ['anthropic', 'ollama']);
+  assert.ok(!names.includes('codex'), 'Codex must be skipped when the translated request would be empty');
 });
 
 test('non-429 Anthropic error propagates (no failover on a hard error)', async () => {

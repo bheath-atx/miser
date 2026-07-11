@@ -15,11 +15,16 @@ module.exports = {
   // passed-through Anthropic max_tokens can be huge; the local model's context
   // is shared between prompt and output, so the fallback clamps generation too.
   ollamaMaxPredict: parseInt(process.env.MISER_OLLAMA_MAX_PREDICT || '4096', 10),
-  // Codex/OpenAI subscription failover endpoint for the Anthropic-429 fallover.
-  // NOTE: the exact live endpoint + wire format is an OPEN DECISION pending
-  // Brad confirmation (ChatGPT Codex backend `responses` vs OpenAI
-  // `chat/completions`). Offline tests mock this transport entirely; no live
-  // cutover happens without approval. Default is the chat/completions shape the
-  // translator + tests validate.
-  codexUrl: process.env.MISER_CODEX_URL || 'https://api.openai.com/v1/chat/completions',
+  // Codex subscription failover endpoint for the Anthropic-429 fallover.
+  // Brad-chosen (2026-07-11): the ChatGPT Codex backend `responses` API, which
+  // is where the subscription OAuth token actually authenticates. Offline tests
+  // mock this transport entirely; no live cutover happens without approval.
+  codexUrl: process.env.MISER_CODEX_URL || 'https://chatgpt.com/backend-api/codex/responses',
+  // Wire format for the Codex leg: 'responses' (Codex backend, OAuth) or 'chat'
+  // (OpenAI chat/completions, needs an API key). Default 'responses'.
+  codexFormat: process.env.MISER_CODEX_FORMAT || 'responses',
+  // Codex-specific headers the backend expects from the codex client. Values
+  // extracted from the codex CLI binary; VERIFY-AT-CUTOVER against a live capture.
+  codexBeta: process.env.MISER_CODEX_BETA || 'responses=experimental',
+  codexOriginator: process.env.MISER_CODEX_ORIGINATOR || 'codex_cli_rs',
 };

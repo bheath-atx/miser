@@ -35,6 +35,12 @@ async function withCodexUpstream(status, body, fn) {
 }
 
 const OPENAI_REQ = { model: 'gpt-5.5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
+const RESPONSES_REQ = {
+  model: 'gpt-5.5',
+  instructions: 'be helpful',
+  input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+  stream: true, store: false,
+};
 const BEARER = { token: 'FAKE-SUBSCRIPTION-TOKEN', accountId: 'acct_fake' };
 
 for (const status of [401, 403]) {
@@ -58,24 +64,66 @@ test('real forwardToCodex rejects on 500 without writing headers', async () => {
   });
 });
 
-test('real forwardToCodex sends the subscription Bearer, never OPENAI_API_KEY', async () => {
+test('real forwardToCodex sends subscription Bearer + codex headers, never OPENAI_API_KEY', async () => {
   const seen = {};
   const { srv, port } = await new Promise((resolve) => {
     const s = http.createServer((req, res) => {
       seen.auth = req.headers['authorization'];
       seen.acct = req.headers['chatgpt-account-id'];
+      seen.beta = req.headers['openai-beta'];
+      seen.originator = req.headers['originator'];
+      seen.accept = req.headers['accept'];
       res.writeHead(401, { 'content-type': 'application/json' }); // reject so we don't need a real stream
       res.end('{}');
     });
     s.listen(0, '127.0.0.1', () => resolve({ srv: s, port: s.address().port }));
   });
   const prev = config.codexUrl;
-  config.codexUrl = `http://127.0.0.1:${port}/v1/chat/completions`;
+  config.codexUrl = `http://127.0.0.1:${port}/backend-api/codex/responses`;
   try {
     const res = makeRes();
-    await assert.rejects(() => forwardToCodex(OPENAI_REQ, BEARER, res, 'proj', 0));
+    await assert.rejects(() => forwardToCodex(RESPONSES_REQ, BEARER, res, 'proj', 0));
     assert.equal(seen.auth, 'Bearer FAKE-SUBSCRIPTION-TOKEN');
     assert.equal(seen.acct, 'acct_fake');
+    assert.equal(seen.beta, 'responses=experimental');
+    assert.equal(seen.originator, 'codex_cli_rs');
+    assert.equal(seen.accept, 'text/event-stream');
+    assert.ok(seen.auth !== 'Bearer sk-METERED'); // never the api key
+  } finally {
+    config.codexUrl = prev; srv.close();
+  }
+});
+
+// Full 2xx path: fake Codex upstream emits Responses-API SSE; assert the client
+// receives ANTHROPIC SSE (message_start → text_delta → message_stop).
+test('real forwardToCodex translates Responses SSE → Anthropic SSE on 200', async () => {
+  const frames = [
+    'event: response.created\ndata: {"type":"response.created","response":{"usage":{"input_tokens":5}}}\n\n',
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n',
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":" world"}\n\n',
+    'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"output_tokens":2}}}\n\n',
+  ];
+  const { srv, port } = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const f of frames) res.write(f);
+      res.end();
+    });
+    s.listen(0, '127.0.0.1', () => resolve({ srv: s, port: s.address().port }));
+  });
+  const prev = config.codexUrl;
+  config.codexUrl = `http://127.0.0.1:${port}/backend-api/codex/responses`;
+  try {
+    const res = makeRes();
+    await forwardToCodex(RESPONSES_REQ, BEARER, res, 'proj', 0);
+    const body = res.body();
+    assert.match(body, /event: message_start/);
+    assert.match(body, /"type":"text_delta","text":"Hello"/);
+    assert.match(body, /"type":"text_delta","text":" world"/);
+    assert.match(body, /event: message_stop/);
+    // no raw Responses events leak to the client
+    assert.ok(!body.includes('response.output_text.delta'));
+    assert.equal(res.headers['x-miser-provider'], 'codex');
   } finally {
     config.codexUrl = prev; srv.close();
   }

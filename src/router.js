@@ -4,6 +4,7 @@ const https = require('node:https');
 const http = require('node:http');
 const { translateToOllama, translateOllamaStream } = require('./translate.js');
 const { translateToOpenAI, validateOpenAIRequest } = require('./translate-openai.js');
+const { translateToResponses, validateResponsesRequest, translateResponsesStream } = require('./translate-responses.js');
 const { hardCapOllamaBody } = require('./hardcap.js');
 const { getCodexBearer } = require('./oauth.js');
 const { recordUsage } = require('./quota.js');
@@ -63,18 +64,24 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     console.log('[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)');
   }
 
-  // --- Leg 2: Codex/OpenAI via subscription OAuth --------------------------
+  // --- Leg 2: Codex via subscription OAuth ---------------------------------
   try {
     const bearer = await getBearer(); // fail closed: throws if no valid token
-    const openaiReq = translateToOpenAI(messages, originalBody);
-    const check = validateOpenAIRequest(openaiReq);
+    // Build the request in the configured Codex wire format. Default is the
+    // Responses API (Codex backend, where the subscription OAuth authenticates);
+    // 'chat' keeps the OpenAI chat/completions shape available.
+    const useChat = config.codexFormat === 'chat';
+    const codexReq = useChat
+      ? translateToOpenAI(messages, originalBody)
+      : translateToResponses(messages, originalBody);
+    const check = useChat ? validateOpenAIRequest(codexReq) : validateResponsesRequest(codexReq);
     if (!check.valid) {
-      // Never ship a request that could trigger the messages.0 brick.
+      // Never ship a malformed request (this is what bricked the client before).
       const e = new Error(`miser: refusing malformed Codex request: ${check.error}`);
       e.statusCode = 400;
       throw e;
     }
-    await transports.codex(openaiReq, bearer, res, project, savedTokens);
+    await transports.codex(codexReq, bearer, res, project, savedTokens);
     return;
   } catch (err) {
     if (res.headersSent) throw err; // response already streaming — can't fail over
@@ -189,23 +196,34 @@ function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, 
   });
 }
 
-// Codex/OpenAI failover transport, driven by a TRANSLATED OpenAI request and a
-// subscription OAuth bearer. Rejects (before writing any response header) on 429
-// or 5xx so the router can fall through to Ollama. The exact live endpoint /
-// wire-format is pending Brad confirmation (see config.codexUrl); this
-// transport is fully mocked in the offline harness.
-function forwardToCodex(openaiReq, bearer, res, project, savedTokens) {
+// Codex failover transport. Driven by a TRANSLATED Codex request (Responses API
+// by default) + a subscription OAuth bearer. On ANY non-2xx it rejects BEFORE
+// writing a response header so the router can fail over to Ollama — critically
+// this includes 401/403 (expired/invalid token → fail closed, never streamed to
+// the client). On 2xx it re-emits the Codex SSE in ANTHROPIC event shape so the
+// client can parse it (raw-piping the Responses stream would brick the client,
+// exactly like a raw Ollama stream). Backend headers + SSE schema are extracted
+// from the codex CLI and flagged VERIFY-AT-CUTOVER; fully mocked in the offline
+// harness.
+function forwardToCodex(codexReq, bearer, res, project, savedTokens) {
   return new Promise((resolve, reject) => {
     const url = new URL(config.codexUrl);
     const transport = url.protocol === 'https:' ? https : http;
-    const body = JSON.stringify(openaiReq);
+    const body = JSON.stringify(codexReq);
+    const isResponses = config.codexFormat !== 'chat';
     const headers = {
       'content-type': 'application/json',
       'content-length': Buffer.byteLength(body),
       // Subscription OAuth — NOT OPENAI_API_KEY.
       'authorization': `Bearer ${bearer.token}`,
+      'accept': isResponses ? 'text/event-stream' : 'application/json',
     };
     if (bearer.accountId) headers['chatgpt-account-id'] = bearer.accountId;
+    if (isResponses) {
+      // Codex-backend markers the responses endpoint expects from its client.
+      if (config.codexBeta) headers['openai-beta'] = config.codexBeta;
+      if (config.codexOriginator) headers['originator'] = config.codexOriginator;
+    }
 
     const options = {
       hostname: url.hostname,
@@ -227,14 +245,18 @@ function forwardToCodex(openaiReq, bearer, res, project, savedTokens) {
         reject(err);
         return;
       }
-      res.writeHead(upstream.statusCode, {
-        'content-type': upstream.headers['content-type'] || 'application/json',
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
         'x-miser-provider': 'codex',
-        'x-miser-model': openaiReq.model || 'unknown',
+        'x-miser-model': codexReq.model || 'unknown',
         'x-miser-saved-tokens': String(savedTokens),
       });
-      upstream.pipe(res);
-      upstream.on('end', () => { recordUsage(project, 'codex', openaiReq.model || 'unknown'); resolve(); });
+      if (isResponses) {
+        translateResponsesStream(upstream, res, codexReq.model || 'codex'); // Responses SSE → Anthropic SSE
+      } else {
+        upstream.pipe(res); // chat/completions: already JSON/OpenAI shape
+      }
+      upstream.on('end', () => { recordUsage(project, 'codex', codexReq.model || 'unknown'); resolve(); });
       upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
     });
 
