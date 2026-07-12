@@ -49,7 +49,8 @@ server.listen(config.port, '127.0.0.1', () => {
   writeLock();
   console.log(`[miser] v0.1.0 listening on 127.0.0.1:${config.port} (pid ${process.pid})`);
   console.log(`[miser] lockfile: ${LOCK_FILE}`);
-  console.log(`[miser] compression threshold: ${config.compressionThreshold} tokens`);
+  console.log(`[miser] compress: lossless dedup (no size ceiling); cache-hint ${config.cacheHint ? 'ON' : 'OFF'}`);
+  console.log(`[miser] anthropic url: ${config.anthropicUrl}`);
   console.log(`[miser] ollama url: ${config.ollamaUrl}`);
   console.log(`[miser] fallback models: ${config.fallbackModels.join(', ')}`);
   console.log(`[miser] health: GET http://127.0.0.1:${config.port}/api/miser/health`);

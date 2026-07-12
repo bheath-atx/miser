@@ -1,6 +1,6 @@
 'use strict';
 
-const { compress, validateMessageIntegrity, normalizeAnthropicBody } = require('./compress.js');
+const { compress } = require('./compress.js');
 const { routeRequest } = require('./router.js');
 const { getAllUsage } = require('./quota.js');
 const config = require('./config.js');
@@ -19,11 +19,16 @@ function json(res, code, body) {
   res.end(JSON.stringify(body, null, 2));
 }
 
-function createProxy() {
+// `deps` is an OPTIONAL injectable seam forwarded verbatim to routeRequest()
+// (transports / getBearer / ollamaCap). Production callers pass nothing, so
+// routeRequest falls back to its real transports. The offline test harness uses
+// it to drive the full proxy→compress→routeRequest→failover chain with zero
+// sockets. Never populated on the production path.
+function createProxy(deps = {}) {
   return async function handler(req, res) {
     // Health check
     if (req.method === 'GET' && req.url === '/api/miser/health') {
-      json(res, 200, { ok: true, port: config.port, threshold: config.compressionThreshold });
+      json(res, 200, { ok: true, port: config.port, cacheHint: config.cacheHint });
       return;
     }
 
@@ -44,40 +49,27 @@ function createProxy() {
 
     try {
       const raw = await readBody(req);
-      let body = JSON.parse(raw);
+      const originalBody = JSON.parse(raw);
       const project = req.headers['x-termdeck-project'] || 'default';
       const format = isOpenAI ? 'openai' : 'anthropic';
 
-      if (format === 'anthropic') {
-        const normalized = normalizeAnthropicBody(body, body.messages || []);
-        body = { ...normalized.body, messages: normalized.messages };
-      }
-
-      const { messages, tokens, rawTokens, overflow, reason } = compress(body, config.compressionThreshold);
+      // compress() v2 is LOSSLESS: it returns the REDUCED body (hoisted system,
+      // optional cache hint, deduped messages). NO threshold gate, NO synthetic
+      // client rejection, NO size ceiling — a client-illegal request is forwarded
+      // as-is so Anthropic's authoritative error reaches the client (I1–I3, §8.8).
+      const { body, messages, tokens, rawTokens } = compress(originalBody, {
+        format,
+        cacheHint: config.cacheHint,
+      });
       const savedTokens = rawTokens - tokens;
 
       if (savedTokens > 0) {
-        console.log(`[miser] project=${project} format=${format} compressed ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
+        console.log(`[miser] project=${project} format=${format} deduped ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
       }
 
-      // Fail-visible: the preserve set (system + first task turn + recent tail)
-      // still exceeds the threshold after lossless dedup. Do NOT silently drop
-      // preserved context — surface a 413-class response so Claude Code's native
-      // compaction fires instead of us malforming/losing the task turn.
-      if (overflow) {
-        console.warn(`[miser] project=${project} format=${format} CONTEXT PRESSURE (${tokens}/${config.compressionThreshold} tok): ${reason}`);
-        json(res, 413, { error: { type: 'miser_context_overflow', message: reason } });
-        return;
-      }
-
-      const integrity = validateMessageIntegrity(messages);
-      if (!integrity.valid) {
-        console.error(`[miser] integrity error, refusing to forward: ${integrity.error}`);
-        json(res, 400, { error: { type: 'miser_integrity_error', message: integrity.error } });
-        return;
-      }
-
-      await routeRequest(messages, body, req.headers, res, project, savedTokens, format);
+      // Forward the REDUCED body (I6) — every leg serializes THIS body, so the
+      // hoisted top-level `system` and any cache hint reach the wire on all legs.
+      await routeRequest(messages, body, req.headers, res, project, savedTokens, format, deps);
     } catch (err) {
       console.error('[miser] error:', err.message);
       if (!res.headersSent) {

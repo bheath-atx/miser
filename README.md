@@ -105,7 +105,6 @@ Models pre-loaded on CPU lane: `qwen2.5:1.5b`, `qwen2.5:3b`, `qwen2.5:7b`, `phi3
 miser:
   enabled: true
   endpoint: http://127.0.0.1:20128
-  compressionThreshold: 32000   # tokens, global default
   fallbackModels:
     - qwen2.5-coder:14b
     - qwen2.5:7b
