@@ -64,10 +64,26 @@ function messageSystemText(msg) {
   return '';
 }
 
+// True iff a top-level `system` value is a block array that carries structured
+// state we must NOT flatten to a string — specifically a client `cache_control`
+// breakpoint (I5 / §3.4: "preserve any client cache_control breakpoints exactly;
+// never remove"). Flattening such a system via systemToText() would strip the
+// breakpoint, so when this is true we merge by APPENDING text blocks instead.
+function systemHasStructuredBlocks(system) {
+  return Array.isArray(system) && system.some(b => b && typeof b === 'object' && b.cache_control);
+}
+
 // Hoist role:system messages into top-level `system` and strip them from
 // messages[]. Anthropic rejects system prompts inside messages[] — they must use
 // the top-level field. Returns { body, messages } where body carries the merged
 // top-level `system`. NEVER truncates, NEVER reorders the surviving messages.
+//
+// I5 / §3.4: a client `cache_control` breakpoint on a block-array top-level
+// `system` is sacred — it must survive the hoist. So when the existing top-level
+// `system` is a block array carrying cache_control, we PRESERVE it as blocks and
+// APPEND the hoisted role:system text as additional text block(s), rather than
+// flattening everything to a string (which would drop the breakpoint). The
+// string-merge form is used only when there is no structured system state to lose.
 function normalizeAnthropicBody(body, messages) {
   const out = { ...body };
   const systemMsgs = messages.filter(m => m && m.role === 'system');
@@ -77,10 +93,26 @@ function normalizeAnthropicBody(body, messages) {
     return { body: out, messages: cleanMessages };
   }
 
-  let system = out.system;
+  const hoistedTexts = [];
   for (const msg of systemMsgs) {
     const text = messageSystemText(msg);
-    if (!text) continue;
+    if (text) hoistedTexts.push(text);
+  }
+
+  if (systemHasStructuredBlocks(out.system)) {
+    // Block-array system with a client cache_control breakpoint → preserve the
+    // blocks (and their breakpoints) exactly; append each hoisted role:system
+    // message as its own trailing text block. Never flatten to a string.
+    const merged = out.system.map(b =>
+      (b && typeof b === 'object') ? { ...b } : { type: 'text', text: String(b) });
+    for (const text of hoistedTexts) merged.push({ type: 'text', text });
+    out.system = merged;
+    return { body: out, messages: cleanMessages };
+  }
+
+  // No structured system state to lose → safe string-merge form.
+  let system = out.system;
+  for (const text of hoistedTexts) {
     system = system ? `${systemToText(system)}\n${text}` : text;
   }
   if (system) {
@@ -234,6 +266,13 @@ function bodyHasCacheControl(body) {
     if (Array.isArray(m.content)) {
       if (m.content.some(b => b && b.cache_control)) return true;
     }
+  }
+  // Anthropic also lets a client place a cache_control breakpoint on a tools[]
+  // entry (a common pattern: cache the tool definitions prefix). If ANY such
+  // breakpoint exists, the client already manages caching and we must not insert
+  // a second one ("insert iff zero client breakpoints", §3.4).
+  if (Array.isArray(body.tools)) {
+    if (body.tools.some(t => t && t.cache_control)) return true;
   }
   return false;
 }
@@ -421,7 +460,11 @@ function compress(body, opts = {}) {
   const firstTaskIdx = normMessages.findIndex(m => m && m.role === 'user'); // -1 if none
   const work = normMessages.map(cloneMsg);
   const pairings = buildPairings(work);
-  dedupMiddle(work, firstTaskIdx, tailStart, pairings);
+  // `opts._dedupImpl` is a TEST-ONLY seam (undefined in production) so a test can
+  // inject a dedup that DOES break adjacency and prove the §3.5 revert below is
+  // load-bearing. Production always uses the real lossless dedupMiddle.
+  const dedupImpl = opts._dedupImpl || dedupMiddle;
+  dedupImpl(work, firstTaskIdx, tailStart, pairings);
 
   // §3.5 adjacency re-validation. On failure, revert DEDUP ONLY — back to the
   // §3.1-normalized messages (system already hoisted; never the raw illegal

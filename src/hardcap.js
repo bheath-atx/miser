@@ -5,10 +5,12 @@ const config = require('./config.js');
 
 // Hard-cap for the Ollama fallback leg of the failover chain.
 //
-// compress.js only drops WHOLE oldest messages and always preserves MIN_KEEP
-// recent turns. That means a single huge recent message (or MIN_KEEP huge
-// messages) can still blow past the local model's context window — which is
-// exactly how the double-fallback path could ship a >32k payload at Ollama.
+// compress.js v2 does NO truncation and enforces NO size ceiling on the primary
+// path — it only losslessly dedups byte-identical tool_result content and hoists
+// role:system. So the body handed to the Ollama leg can be arbitrarily large
+// (e.g. a single huge recent message, or a large zero-duplicate transcript that
+// dedup cannot shrink). That is exactly how the double-fallback path could ship a
+// >32k payload at Ollama.
 //
 // This module is the last line of defence before Ollama: it operates on the
 // already-translated Ollama chat body ({model, messages:[{role,content}], …})

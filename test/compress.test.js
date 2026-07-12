@@ -172,6 +172,35 @@ test('AC2: role:system hoist that EXPOSES an illegal opener still forwards as-is
   assert.equal(result.messages.length, 2);
 });
 
+// AC2 — replay the ACTUAL directive-block brick class. In the live v1 path, a
+// >32K transcript was truncated down to MIN_KEEP recent turns; that shift could
+// leave an Anthropic directive-only block (content:[] with output_config) at the
+// NEW messages[0] → "400 messages.0: use the top-level 'system' parameter…". A
+// legal user turn opens THIS body, but a directive block sits at a middle index.
+// v2 does NO truncation, so the directive block never migrates to index 0 and the
+// forwarded messages[0] stays a legal, non-empty user turn.
+test('AC2: directive-block brick class — no truncation keeps a legal messages[0] (directive stays mid-transcript)', () => {
+  const big = 'w'.repeat(6000); // each turn ~1.5K tokens → 30 turns ≫ 32K
+  const directiveBlock = { role: 'user', content: [], output_config: { type: 'directive' } };
+  const messages = [
+    { role: 'user', content: `LEGAL OPENER handoff ${big}` }, // real, non-empty opener
+    ...Array.from({ length: 20 }, (_, i) => ({
+      role: i % 2 === 0 ? 'assistant' : 'user',
+      content: `turn-${i} ${big}`,
+    })),
+    directiveBlock, // an Anthropic directive block sitting mid/late in the transcript
+    { role: 'assistant', content: 'tail' },
+  ];
+  const result = compress({ messages });
+  // Nothing dropped: the legal opener is still messages[0], NOT the directive block.
+  assert.equal(result.messages.length, messages.length);
+  assert.equal(result.messages[0].content, `LEGAL OPENER handoff ${big}`);
+  assert.ok(typeof result.messages[0].content === 'string' && result.messages[0].content.length > 0);
+  // The directive block was neither dropped nor relocated to index 0 — it stays put.
+  const directiveIdx = result.messages.findIndex(m => Array.isArray(m.content) && m.content.length === 0);
+  assert.ok(directiveIdx > 0, 'directive-only block must NOT be forwarded at messages[0]');
+});
+
 test('AC2: orphan tool_result at index 0 forwarded as-is (miser emits no rejection)', () => {
   const messages = [
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'never_paired', content: 'x' }] },
@@ -362,6 +391,59 @@ test('AC4: cache-hint NOT inserted for a short conversation (≤ MIN_KEEP turns)
   assert.equal(result.body.system, 'sys');
 });
 
+// MF2 regression guard: a client breakpoint on tools[] must suppress insertion
+// (§3.4 "insert iff zero client breakpoints"). Before the fix, bodyHasCacheControl
+// ignored tools[] → a SECOND breakpoint landed on system.
+test('AC4: cache-hint NOT inserted when the client breakpoint is on tools[] (MF2)', () => {
+  const body = {
+    system: 'Top-level system prompt.',
+    tools: [
+      { name: 'Read', description: 'read a file', input_schema: { type: 'object' } },
+      { name: 'Write', description: 'write a file', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral' } },
+    ],
+    messages: Array.from({ length: MIN_KEEP + 2 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: `turn-${i}`,
+    })),
+  };
+  const result = compress(body, { cacheHint: true });
+  // system stays a plain string (no marker inserted) — the tools[] breakpoint is
+  // the client's single breakpoint and must not be duplicated.
+  assert.equal(result.body.system, 'Top-level system prompt.');
+  // Total client breakpoints across the body is exactly 1 (the tools one).
+  const toolBps = result.body.tools.filter(t => t && t.cache_control).length;
+  const sysBps = Array.isArray(result.body.system)
+    ? result.body.system.filter(b => b && b.cache_control).length : 0;
+  assert.equal(toolBps + sysBps, 1);
+});
+
+// MF1 regression guard: hoisting a role:system message when top-level system is a
+// block array carrying a client cache_control breakpoint must PRESERVE that
+// breakpoint (I5 / §3.4 default OFF: never remove a client cache_control marker).
+test('AC4: system-hoist preserves a client cache_control breakpoint on block-array system (MF1, cacheHint off)', () => {
+  const body = {
+    system: [
+      { type: 'text', text: 'Stable boot prefix.', cache_control: { type: 'ephemeral' } },
+    ],
+    messages: [
+      { role: 'system', content: 'Hoisted directive block.' },
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'ok' },
+    ],
+  };
+  const result = compress(body, { cacheHint: false });
+  // system remains a block array (not flattened to a string).
+  assert.ok(Array.isArray(result.body.system));
+  // The client breakpoint survives on the original block.
+  assert.deepEqual(result.body.system[0].cache_control, { type: 'ephemeral' });
+  assert.equal(result.body.system[0].text, 'Stable boot prefix.');
+  // The hoisted role:system text is APPENDED as an additional text block.
+  const texts = result.body.system.map(b => b.text);
+  assert.ok(texts.includes('Hoisted directive block.'));
+  // role:system was stripped from messages[].
+  assert.ok(!result.messages.some(m => m.role === 'system'));
+});
+
 // ===========================================================================
 // AC5 — miser-introduced adjacency safety (revert dedup) + no synthetic reject.
 // ===========================================================================
@@ -397,6 +479,45 @@ test('AC5: validateMessageIntegrity rejects an unanswered tool_use', () => {
   assert.match(r.error, /following/);
 });
 
+// LOAD-BEARING revert proof. The real dedupMiddle preserves tool_use_id, so it
+// can never break adjacency — leaving the §3.5 revert branch untested. We inject
+// a dedup that DELIBERATELY corrupts a tool_result's tool_use_id (breaking
+// adjacency) and assert compress() detects the integrity failure and REVERTS to
+// the §3.1-normalized (pre-dedup) messages. If the `validateMessageIntegrity(work)`
+// / revert block is removed, compress() would forward the corrupted messages and
+// this test FAILS (adjacency broken + wrong tool_use_id surfaced).
+test('AC5: compress() reverts dedup when miser\'s OWN dedup would break adjacency', () => {
+  const messages = [
+    { role: 'user', content: 'FIRST TASK' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'fn', input: { n: 1 } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'r1' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu2', name: 'fn', input: { n: 2 } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu2', content: 'r2' }] },
+  ];
+  // Injected adjacency-breaking "dedup": rewrite an outside-tail tool_result's
+  // tool_use_id so it no longer pairs with the preceding assistant tool_use.
+  const breakingDedup = (work) => {
+    for (const m of work) {
+      if (m.role !== 'user' || !Array.isArray(m.content)) continue;
+      m.content = m.content.map(b =>
+        (b && b.type === 'tool_result') ? { ...b, tool_use_id: 'CORRUPTED', content: 'STUBBED' } : b);
+    }
+  };
+  const result = compress({ messages }, { _dedupImpl: breakingDedup });
+  // Reverted: the forwarded messages are the pre-dedup normalized set, NOT the
+  // corrupted ones. Original tool_use_ids + content survive; adjacency holds.
+  assert.equal(result.messages[2].content[0].tool_use_id, 'tu1');
+  assert.equal(result.messages[2].content[0].content, 'r1');
+  assert.equal(result.messages[4].content[0].tool_use_id, 'tu2');
+  assert.equal(result.messages[4].content[0].content, 'r2');
+  assert.ok(validateMessageIntegrity(result.messages).valid);
+  // Guard: prove the injected dedup really WOULD have broken adjacency (so the
+  // test is meaningful — it forces the revert branch, not a no-op).
+  const corrupted = messages.map(m => ({ ...m }));
+  breakingDedup(corrupted);
+  assert.equal(validateMessageIntegrity(corrupted).valid, false);
+});
+
 // ===========================================================================
 // AC6 — No ceiling: a 100K zero-duplicate request forwards unchanged.
 // ===========================================================================
@@ -411,6 +532,27 @@ test('AC6: 100K zero-duplicate request forwards unchanged (minus normalization)'
   assert.equal(result.tokens, result.rawTokens);
   for (let i = 0; i < 18; i++) {
     assert.equal(result.messages[i].content, `unique-${i} ${chunk}`);
+  }
+});
+
+// A hard load-bearing guard against a REINTRODUCED hard-coded ceiling. The prior
+// AC6 fixture (~27K estimated tokens) would survive a hidden 32K gate, so it is
+// not a real no-ceiling proof. This fixture estimates to WELL OVER 200K tokens
+// (32 turns × ~32K chars ≈ 1M chars ≈ ~256K tokens) with ZERO duplicate
+// tool_results, so nothing can be deduped: if ANY ceiling (32K, 100K, 200K…) were
+// reintroduced, the forwarded body would be shorter than the input and this fails.
+test('AC6: a >200K-token zero-duplicate request forwards byte-for-byte (no reintroduced ceiling)', () => {
+  const chunk = 'q'.repeat(32000);
+  const messages = Array.from({ length: 32 }, (_, i) => ({
+    role: i % 2 === 0 ? 'user' : 'assistant',
+    content: `unique-${i} ${chunk}`,
+  }));
+  const result = compress({ messages });
+  assert.ok(result.rawTokens > 200000, `fixture must exceed any plausible ceiling (got ${result.rawTokens} est tokens)`);
+  assert.equal(result.messages.length, 32);       // nothing dropped by a ceiling
+  assert.equal(result.tokens, result.rawTokens);  // nothing reduced at all
+  for (let i = 0; i < 32; i++) {
+    assert.equal(result.messages[i].content, `unique-${i} ${chunk}`); // byte-for-byte
   }
 });
 

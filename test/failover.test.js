@@ -5,6 +5,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { routeRequest, teardownResponse } = require('../src/router.js');
+const { compress } = require('../src/compress.js');
+const { translateToResponses } = require('../src/translate-responses.js');
+const { translateToOllama } = require('../src/translate.js');
 const { makeRes, successTransport, failTransport } = require('./_harness.js');
 
 // Fake subscription bearer — never reads ~/.codex/auth.json.
@@ -169,6 +172,121 @@ test('empty-flattening messages skip Codex and fail over to Ollama', async () =>
   const names = calls.map(c => c.name);
   assert.deepEqual(names, ['anthropic', 'ollama']);
   assert.ok(!names.includes('codex'), 'Codex must be skipped when the translated request would be empty');
+});
+
+// ===========================================================================
+// AC9 (MF3) — LOAD-BEARING: the reduced body (hoisted top-level system + dedup
+// stub) produced by compress() is exactly what Legs 2 (Codex) and 3 (Ollama)
+// forward under an Anthropic 429. If any leg rebuilt from the ORIGINAL (pre-
+// reduction) body — a role:system turn still in messages[], the duplicate NOT
+// stubbed — these assertions fail.
+// ===========================================================================
+
+// A transcript that (a) needs role:system HOIST and (b) has a byte-identical
+// duplicate tool_result OUTSIDE the recent tail so dedup stubs the older copy.
+function reducibleTranscript() {
+  const dup = 'DUP-' + 'x'.repeat(400);
+  const mk = (id, content) => ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] });
+  const messages = [
+    { role: 'system', content: 'HOISTED-SYSTEM-MARKER' },              // must hoist to top-level
+    { role: 'user', content: 'FIRST TASK unique handoff' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'a1', name: 'Read', input: { file_path: '/c' } }] },
+    mk('a1', dup),                                                     // OLD dup → stubbed
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'a2', name: 'fn', input: { n: 2 } }] },
+    mk('a2', 'u2'),
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'a3', name: 'fn', input: { n: 3 } }] },
+    mk('a3', 'u3'),
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'a4', name: 'fn', input: { n: 4 } }] },
+    mk('a4', 'u4'),
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'a5', name: 'Read', input: { file_path: '/c' } }] },
+    mk('a5', dup),                                                     // NEW dup → authoritative
+    { role: 'assistant', content: 'done' },
+  ];
+  return { body: { model: 'claude', max_tokens: 100, messages }, dup };
+}
+
+test('AC9/MF3: Anthropic 429 → Leg 2 (Codex) receives the reduced body — hoisted system + dedup stub', async () => {
+  const { body: originalBody } = reducibleTranscript();
+  const reduced = compress(originalBody, { format: 'anthropic', cacheHint: false });
+
+  // Sanity: compress() actually hoisted + stubbed (so the leg assertions are meaningful).
+  // After the role:system hoist, the older duplicate lands at index 2 and points
+  // at the newest authoritative copy at turn 10.
+  assert.equal(reduced.body.system, 'HOISTED-SYSTEM-MARKER');
+  assert.match(reduced.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+
+  const captured = {};
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (codexReq, bearer, res) => {
+        captured.codexReq = codexReq;
+        res.writeHead(200, { 'x-miser-provider': 'codex' });
+        res.end();
+        return Promise.resolve();
+      },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  // proxy.js forwards (reduced.messages, reduced.body). Mirror that exactly.
+  await routeRequest(reduced.messages, reduced.body, {}, res, 'proj', 0, 'anthropic', deps);
+
+  // The Codex request is built from the REDUCED args (translateToResponses).
+  const expected = translateToResponses(reduced.messages, reduced.body);
+  // Leg 2 carries the HOISTED system as `instructions` (would be absent if it
+  // rebuilt from originalBody, where system is still a role:system message turn).
+  assert.equal(captured.codexReq.instructions, 'HOISTED-SYSTEM-MARKER');
+  assert.deepEqual(captured.codexReq, expected);
+  // The dedup stub reached Leg 2: the flattened tool_result text is the stub, and
+  // the full duplicate payload appears EXACTLY ONCE (the newest authoritative
+  // copy). If the leg rebuilt from originalBody it would appear TWICE.
+  const flat = JSON.stringify(captured.codexReq.input);
+  assert.match(flat, /\[miser: identical to turn 10\]/);
+  const dupHits = (flat.match(/DUP-x{400}/g) || []).length;
+  assert.equal(dupHits, 1, 'the duplicate payload must reach Leg 2 exactly once (older copy stubbed)');
+});
+
+test('AC9/MF3: Anthropic 429 → Codex 429 → Leg 3 (Ollama) receives the reduced body — hoisted system + dedup stub', async () => {
+  const { body: originalBody } = reducibleTranscript();
+  const reduced = compress(originalBody, { format: 'anthropic', cacheHint: false });
+
+  const captured = {};
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: failTransport('codex', calls, 429),
+      ollama: (messages, body, res, project, savedTokens, opts) => {
+        captured.messages = messages;
+        captured.body = body;
+        res.writeHead(200, { 'x-miser-provider': 'ollama' });
+        res.end();
+        return Promise.resolve();
+      },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(reduced.messages, reduced.body, {}, res, 'proj', 0, 'anthropic', deps);
+
+  // Leg 3 got the reduced body verbatim — hoisted top-level system present, and
+  // the role:system turn is gone from messages[].
+  assert.equal(captured.body.system, 'HOISTED-SYSTEM-MARKER');
+  assert.ok(!captured.messages.some(m => m.role === 'system'));
+  // Translate exactly as forwardToOllama does and assert the stub survived and
+  // the hoisted system became the leading system turn (proves reduced-body use).
+  const ollamaBody = translateToOllama(captured.messages, captured.body, 'test-model');
+  assert.equal(ollamaBody.messages[0].role, 'system');
+  assert.equal(ollamaBody.messages[0].content, 'HOISTED-SYSTEM-MARKER');
+  const flat = JSON.stringify(ollamaBody.messages);
+  assert.match(flat, /\[miser: identical to turn 10\]/);
+  const dupHits = (flat.match(/DUP-x{400}/g) || []).length;
+  assert.equal(dupHits, 1, 'the duplicate payload must reach Leg 3 exactly once (older copy stubbed)');
 });
 
 test('non-429 Anthropic error propagates (no failover on a hard error)', async () => {
