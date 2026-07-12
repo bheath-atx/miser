@@ -567,6 +567,29 @@ test('MF1 + §3.4: cacheHint ON does not insert a duplicate BP when role:system 
   assert.ok(!(tail && tail.cache_control), 'BP must NOT have been (re)inserted on the last block');
 });
 
+// MF1 strictness (codex R3): a block-array `system` with NO cache_control anywhere
+// must still be PRESERVED AS BLOCKS on hoist, not flattened to a string. Flattening
+// is content-equivalent for pure text today, but block shape / non-text fields must
+// not be silently dropped — string-merge is used ONLY when every source is a plain
+// string. This test FAILS if `systemHasStructuredBlocks` is narrowed back to
+// requiring cache_control.
+test('MF1: block-array system WITHOUT any BP + role:system hoist → preserved as blocks, not string-flattened', () => {
+  const body = {
+    system: [
+      { type: 'text', text: 'Alpha' },
+      { type: 'text', text: 'Beta' },
+    ],
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'Gamma' }] },
+      { role: 'user', content: 'go' },
+    ],
+  };
+  const result = compress(body, { cacheHint: false });
+  assert.ok(Array.isArray(result.body.system), 'block-array system must stay a block array (not flattened to a string)');
+  const texts = result.body.system.filter(b => b && b.type === 'text').map(b => b.text);
+  assert.deepEqual(texts, ['Alpha', 'Beta', 'Gamma'], 'all blocks preserved in order (top-level first, then hoisted role:system)');
+});
+
 // ===========================================================================
 // AC5 — miser-introduced adjacency safety (revert dedup) + no synthetic reject.
 // ===========================================================================

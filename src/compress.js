@@ -56,16 +56,14 @@ function messageTokens(msg) {
 
 // --- §3.1 normalize role:system → top-level system --------------------------
 
-// True iff a system SOURCE (top-level `system` value OR a role:system message's
-// `.content`) is a block array carrying structured state we must NOT flatten to a
-// string — specifically a client `cache_control` breakpoint (I5 / §3.4: "preserve
-// any client cache_control breakpoints exactly; never remove"). Flattening such a
-// source via systemToText() would strip the breakpoint, so when ANY participating
-// source is structured we merge by building a BLOCK ARRAY that appends each
-// source's ORIGINAL blocks (preserving cache_control), converting only
-// plain-text/string pieces to text blocks.
+// A source is "structured" (must be preserved as blocks, never flattened to a
+// string) when it is a block ARRAY containing any object block — regardless of
+// whether that block carries cache_control. Flattening a block array via
+// systemToText() would drop block shape and any non-text fields (incl.
+// cache_control); string-merge is therefore used ONLY when every source is a
+// plain string with nothing structured to lose (I5 / §3.4).
 function systemHasStructuredBlocks(source) {
-  return Array.isArray(source) && source.some(b => b && typeof b === 'object' && b.cache_control);
+  return Array.isArray(source) && source.some(b => b && typeof b === 'object');
 }
 
 // Convert ONE system source (top-level `system` value or a role:system message's

@@ -78,7 +78,6 @@ Replace `miser.service` (systemd) with `miser.plist` (launchd):
   <dict>
     <key>MISER_PORT</key><string>20128</string>
     <key>MISER_OLLAMA_URL</key><string>http://127.0.0.1:11434</string>
-    <key>MISER_COMPRESSION_THRESHOLD</key><string>32000</string>
     <key>MISER_FALLBACK_MODELS</key><string>qwen2.5-coder:14b,qwen2.5:7b,qwen2.5:3b</string>
   </dict>
   <key>RunAtLoad</key><true/>
