@@ -110,11 +110,19 @@ function teardownResponse(res, err) {
 
 function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ ...originalBody, messages });
+    // I6: `originalBody` here IS the reduced body compress() produced (hoisted
+    // system, optional cache hint, deduped messages). Serialize it verbatim —
+    // it already carries the authoritative `messages`; do NOT rebuild from a
+    // pre-reduction body or the top-level system hoist would not reach the wire.
+    const body = JSON.stringify(originalBody);
+    // §8.3: parse host/path from config.anthropicUrl (authoritative field) rather
+    // than a hardcoded host — enables the AC10 loopback-echo canary + testability.
+    // No failover-logic change.
+    const anthURL = new URL(config.anthropicUrl);
     const options = {
-      hostname: 'api.anthropic.com',
-      port: 443,
-      path: '/v1/messages',
+      hostname: anthURL.hostname,
+      port: anthURL.port || (anthURL.protocol === 'https:' ? 443 : 80),
+      path: (anthURL.pathname === '/' ? '' : anthURL.pathname) + '/v1/messages',
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -129,7 +137,10 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
     if (incomingHeaders['authorization']) options.headers['authorization'] = incomingHeaders['authorization'];
     if (incomingHeaders['anthropic-beta']) options.headers['anthropic-beta'] = incomingHeaders['anthropic-beta'];
 
-    const req = https.request(options, (upstream) => {
+    // Protocol-aware transport so a loopback http:// MISER_ANTHROPIC_URL (AC10
+    // canary / tests) works; production https:// api.anthropic.com is unchanged.
+    const anthTransport = anthURL.protocol === 'https:' ? https : http;
+    const req = anthTransport.request(options, (upstream) => {
       if (upstream.statusCode === 429) {
         const err = new Error('anthropic quota exhausted');
         err.statusCode = 429;
@@ -158,7 +169,9 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
 // Legacy passthrough for requests that ARRIVE already in OpenAI format.
 function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, savedTokens) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ ...originalBody, messages });
+    // I6: `originalBody` is the reduced body (deduped messages). Serialize it
+    // verbatim — it already carries the authoritative `messages`.
+    const body = JSON.stringify(originalBody);
     const options = {
       hostname: 'api.openai.com',
       port: 443,

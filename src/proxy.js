@@ -1,6 +1,6 @@
 'use strict';
 
-const { compress, validateMessageIntegrity } = require('./compress.js');
+const { compress } = require('./compress.js');
 const { routeRequest } = require('./router.js');
 const { getAllUsage } = require('./quota.js');
 const config = require('./config.js');
@@ -23,7 +23,7 @@ function createProxy() {
   return async function handler(req, res) {
     // Health check
     if (req.method === 'GET' && req.url === '/api/miser/health') {
-      json(res, 200, { ok: true, port: config.port, threshold: config.compressionThreshold });
+      json(res, 200, { ok: true, port: config.port, cacheHint: config.cacheHint });
       return;
     }
 
@@ -44,24 +44,26 @@ function createProxy() {
 
     try {
       const raw = await readBody(req);
-      const body = JSON.parse(raw);
+      const originalBody = JSON.parse(raw);
       const project = req.headers['x-termdeck-project'] || 'default';
       const format = isOpenAI ? 'openai' : 'anthropic';
 
-      const { messages, tokens, rawTokens } = compress(body, config.compressionThreshold);
+      // compress() v2 is LOSSLESS: it returns the REDUCED body (hoisted system,
+      // optional cache hint, deduped messages). NO threshold gate, NO synthetic
+      // client rejection, NO size ceiling — a client-illegal request is forwarded
+      // as-is so Anthropic's authoritative error reaches the client (I1–I3, §8.8).
+      const { body, messages, tokens, rawTokens } = compress(originalBody, {
+        format,
+        cacheHint: config.cacheHint,
+      });
       const savedTokens = rawTokens - tokens;
 
       if (savedTokens > 0) {
-        console.log(`[miser] project=${project} format=${format} compressed ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
+        console.log(`[miser] project=${project} format=${format} deduped ${rawTokens}→${tokens} tokens (saved ${savedTokens})`);
       }
 
-      const integrity = validateMessageIntegrity(messages);
-      if (!integrity.valid) {
-        console.error(`[miser] integrity error, refusing to forward: ${integrity.error}`);
-        json(res, 400, { error: { type: 'miser_integrity_error', message: integrity.error } });
-        return;
-      }
-
+      // Forward the REDUCED body (I6) — every leg serializes THIS body, so the
+      // hoisted top-level `system` and any cache hint reach the wire on all legs.
       await routeRequest(messages, body, req.headers, res, project, savedTokens, format);
     } catch (err) {
       console.error('[miser] error:', err.message);
