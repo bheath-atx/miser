@@ -350,6 +350,75 @@ test('teardownResponse is a no-op on an already-destroyed response', () => {
   assert.equal(called, false);
 });
 
+// ===========================================================================
+// SF3 (grok SF2) — PROXY-LEVEL end-to-end: a real client request flows through
+// the proxy handler → compress() → routeRequest(); an Anthropic 429 (injected via
+// the proxy's routeRequest deps seam) must fail over to Leg 2 (Codex). This closes
+// the last wiring gap at the proxy layer — proving the proxy actually calls
+// routeRequest such that failover fires, not just that routeRequest can fail over
+// when driven directly. Zero sockets: transports are mocked; index.js (the only
+// port bind) is never loaded.
+// ===========================================================================
+const { createProxy } = require('../src/proxy.js');
+
+// Minimal fake req that streams a JSON body to the proxy's on('data')/on('end').
+function proxyReq(bodyObj, headers = {}) {
+  const raw = JSON.stringify(bodyObj);
+  const listeners = {};
+  const req = { method: 'POST', url: '/v1/messages', headers, on(evt, cb) { listeners[evt] = cb; return req; } };
+  process.nextTick(() => {
+    if (listeners.data) listeners.data(Buffer.from(raw));
+    if (listeners.end) listeners.end();
+  });
+  return req;
+}
+
+test('SF3: proxy request → compress → routeRequest(Anthropic 429) → fails over to Leg 2 (Codex)', async () => {
+  const calls = [];
+  const captured = {};
+  // Injected deps ride through createProxy → routeRequest verbatim. The Anthropic
+  // leg 429s; the Codex leg captures what it received and succeeds. Ollama would
+  // throw if reached.
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (codexReq, bearer, res) => {
+        calls.push({ name: 'codex' });
+        captured.codexReq = codexReq;
+        res.writeHead(200, { 'x-miser-provider': 'codex' });
+        res.end('ok:codex');
+        return Promise.resolve();
+      },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const handler = createProxy(deps);
+  const res = makeRes();
+  // A transcript that needs a role:system HOIST so we can also prove the REDUCED
+  // (compressed) body — not the original — is what reaches Leg 2.
+  const body = {
+    model: 'claude',
+    max_tokens: 100,
+    messages: [
+      { role: 'system', content: 'PROXY-HOISTED-SYSTEM' },
+      { role: 'user', content: 'hello from client' },
+    ],
+  };
+  const done = new Promise((resolve) => { const e = res.end.bind(res); res.end = (c) => { const r = e(c); resolve(); return r; }; });
+  handler(proxyReq(body), res);
+  await done;
+
+  // Failover fired end-to-end at the PROXY layer: Anthropic → Codex, no Ollama.
+  assert.deepEqual(calls.map(c => c.name), ['anthropic', 'codex']);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-miser-provider'], 'codex');
+  // Leg 2 received the REDUCED body: the role:system was hoisted to `instructions`
+  // (it would be absent if the proxy had forwarded the pre-compress original).
+  assert.equal(captured.codexReq.instructions, 'PROXY-HOISTED-SYSTEM');
+});
+
 // REQUIRED: tests do not bind or connect to :20128. Proven at RUNTIME (not by
 // opening a probe socket — that would itself be a forbidden connection): the
 // ONLY code that calls server.listen(config.port) is src/index.js. If it was

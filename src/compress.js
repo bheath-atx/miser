@@ -56,21 +56,41 @@ function messageTokens(msg) {
 
 // --- §3.1 normalize role:system → top-level system --------------------------
 
-function messageSystemText(msg) {
-  if (typeof msg.content === 'string') return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content.map(b => (b && typeof b.text === 'string') ? b.text : '').filter(Boolean).join('\n');
-  }
-  return '';
+// True iff a system SOURCE (top-level `system` value OR a role:system message's
+// `.content`) is a block array carrying structured state we must NOT flatten to a
+// string — specifically a client `cache_control` breakpoint (I5 / §3.4: "preserve
+// any client cache_control breakpoints exactly; never remove"). Flattening such a
+// source via systemToText() would strip the breakpoint, so when ANY participating
+// source is structured we merge by building a BLOCK ARRAY that appends each
+// source's ORIGINAL blocks (preserving cache_control), converting only
+// plain-text/string pieces to text blocks.
+function systemHasStructuredBlocks(source) {
+  return Array.isArray(source) && source.some(b => b && typeof b === 'object' && b.cache_control);
 }
 
-// True iff a top-level `system` value is a block array that carries structured
-// state we must NOT flatten to a string — specifically a client `cache_control`
-// breakpoint (I5 / §3.4: "preserve any client cache_control breakpoints exactly;
-// never remove"). Flattening such a system via systemToText() would strip the
-// breakpoint, so when this is true we merge by APPENDING text blocks instead.
-function systemHasStructuredBlocks(system) {
-  return Array.isArray(system) && system.some(b => b && typeof b === 'object' && b.cache_control);
+// Convert ONE system source (top-level `system` value or a role:system message's
+// `.content`) to an array of content blocks, PRESERVING every original block object
+// (and its cache_control) exactly. String/plain pieces become {type:'text'} blocks.
+// Empty/blank text yields no block. Used only on the structured-merge path.
+function sourceToBlocks(source) {
+  if (source == null) return [];
+  if (typeof source === 'string') {
+    return source ? [{ type: 'text', text: source }] : [];
+  }
+  if (Array.isArray(source)) {
+    const out = [];
+    for (const b of source) {
+      if (b && typeof b === 'object') {
+        out.push({ ...b });                    // preserve blocks incl. cache_control
+      } else if (typeof b === 'string' && b) {
+        out.push({ type: 'text', text: b });
+      }
+    }
+    return out;
+  }
+  // Object form (single block-like): keep as-is if it looks like a block.
+  if (typeof source === 'object') return [{ ...source }];
+  return [];
 }
 
 // Hoist role:system messages into top-level `system` and strip them from
@@ -78,12 +98,25 @@ function systemHasStructuredBlocks(system) {
 // the top-level field. Returns { body, messages } where body carries the merged
 // top-level `system`. NEVER truncates, NEVER reorders the surviving messages.
 //
-// I5 / §3.4: a client `cache_control` breakpoint on a block-array top-level
-// `system` is sacred — it must survive the hoist. So when the existing top-level
-// `system` is a block array carrying cache_control, we PRESERVE it as blocks and
-// APPEND the hoisted role:system text as additional text block(s), rather than
-// flattening everything to a string (which would drop the breakpoint). The
-// string-merge form is used only when there is no structured system state to lose.
+// I5 / §3.4: a client `cache_control` breakpoint is sacred — it must survive the
+// hoist EXACTLY, whether it sits on the top-level block-array `system` OR on a
+// hoisted `role:system` message's own content blocks. So the merge has two forms:
+//
+//   BLOCK-MERGE (used iff ANY participating source — top-level `system` OR any
+//   role:system message content — carries structured blocks and/or a cache_control
+//   breakpoint): build the merged top-level `system` as a BLOCK ARRAY that appends
+//   each source's ORIGINAL blocks (preserving cache_control), converting only
+//   plain-text/string pieces to text blocks. Order is preserved: top-level system
+//   first, then each role:system message in order.
+//
+//   STRING-MERGE (used ONLY when nothing anywhere carries structured blocks or a
+//   cache_control breakpoint): the cheaper flatten-to-string form.
+//
+// Anthropic caps client cache_control breakpoints at 4. We only ever PRESERVE the
+// client's own breakpoints — never insert one here — so if the combined sources
+// already carry >4 we still preserve them all (the wire limit is the client's
+// concern to keep legal; miser must not silently drop a client breakpoint). We
+// simply never ADD one on this path.
 function normalizeAnthropicBody(body, messages) {
   const out = { ...body };
   const systemMsgs = messages.filter(m => m && m.role === 'system');
@@ -93,30 +126,37 @@ function normalizeAnthropicBody(body, messages) {
     return { body: out, messages: cleanMessages };
   }
 
-  const hoistedTexts = [];
-  for (const msg of systemMsgs) {
-    const text = messageSystemText(msg);
-    if (text) hoistedTexts.push(text);
-  }
+  // Ordered list of system SOURCES to merge: top-level `system` (if present),
+  // then each role:system message's content, in message order.
+  const sources = [];
+  if (out.system != null && out.system !== '') sources.push(out.system);
+  for (const msg of systemMsgs) sources.push(msg.content);
 
-  if (systemHasStructuredBlocks(out.system)) {
-    // Block-array system with a client cache_control breakpoint → preserve the
-    // blocks (and their breakpoints) exactly; append each hoisted role:system
-    // message as its own trailing text block. Never flatten to a string.
-    const merged = out.system.map(b =>
-      (b && typeof b === 'object') ? { ...b } : { type: 'text', text: String(b) });
-    for (const text of hoistedTexts) merged.push({ type: 'text', text });
-    out.system = merged;
+  // If ANY source carries structured blocks / a cache_control breakpoint, we must
+  // NOT flatten (flattening drops the breakpoint). Build a block-array system that
+  // preserves every original block exactly and text-wraps only plain pieces.
+  const anyStructured = sources.some(systemHasStructuredBlocks);
+
+  if (anyStructured) {
+    const merged = [];
+    for (const source of sources) merged.push(...sourceToBlocks(source));
+    if (merged.length > 0) {
+      out.system = merged;
+    } else {
+      delete out.system;
+    }
     return { body: out, messages: cleanMessages };
   }
 
-  // No structured system state to lose → safe string-merge form.
-  let system = out.system;
-  for (const text of hoistedTexts) {
-    system = system ? `${systemToText(system)}\n${text}` : text;
+  // No structured system state to lose → safe string-merge form. Flatten every
+  // source (top-level system + each role:system message) to text and join.
+  const parts = [];
+  for (const source of sources) {
+    const text = (typeof source === 'string') ? source : systemToText(source);
+    if (text) parts.push(text);
   }
-  if (system) {
-    out.system = system;
+  if (parts.length > 0) {
+    out.system = parts.join('\n');
   } else {
     delete out.system;
   }
@@ -425,6 +465,26 @@ function dedupOpenAIMessages(messages, tailStart) {
 }
 
 // ---------------------------------------------------------------------------
+// TEST-ONLY dedup injection seam (§3.5 revert coverage).
+//
+// The real `dedupMiddle` preserves `tool_use_id` and every semantic field, so it
+// can NEVER break adjacency — which would leave the §3.5 validate/revert branch
+// permanently dead (untestable). To keep that branch load-bearing we allow a test
+// to swap in a deliberately adjacency-breaking dedup and assert compress() detects
+// the integrity failure and reverts.
+//
+// This lives OFF the public `compress(body, opts)` surface (an opts field would let
+// any production caller inject a custom dedup). It is a module-private override set
+// ONLY by `__setDedupImplForTest`, which is exported under a `__test` namespace and
+// is never referenced by production code (proxy.js passes only {format, cacheHint}).
+let _dedupImplOverride = null;
+function __setDedupImplForTest(fn) {
+  // Pass null/undefined to restore the production dedup. Any test that sets this
+  // MUST reset it in a finally block so it can't leak across tests.
+  _dedupImplOverride = (typeof fn === 'function') ? fn : null;
+}
+
+// ---------------------------------------------------------------------------
 // compress() — the single entry point. Returns { body, messages, tokens, rawTokens }
 // where `body` is the REDUCED body proxy.js forwards on EVERY leg (I6).
 // `format` is 'anthropic' (default) or 'openai'. `opts.cacheHint` opts into §3.4.
@@ -460,10 +520,11 @@ function compress(body, opts = {}) {
   const firstTaskIdx = normMessages.findIndex(m => m && m.role === 'user'); // -1 if none
   const work = normMessages.map(cloneMsg);
   const pairings = buildPairings(work);
-  // `opts._dedupImpl` is a TEST-ONLY seam (undefined in production) so a test can
-  // inject a dedup that DOES break adjacency and prove the §3.5 revert below is
-  // load-bearing. Production always uses the real lossless dedupMiddle.
-  const dedupImpl = opts._dedupImpl || dedupMiddle;
+  // Production always uses the real lossless dedupMiddle. A module-private
+  // override (set ONLY via __setDedupImplForTest, never through opts) lets a test
+  // inject an adjacency-breaking dedup to prove the §3.5 revert below is
+  // load-bearing. Not reachable from the public compress(body, opts) surface.
+  const dedupImpl = _dedupImplOverride || dedupMiddle;
   dedupImpl(work, firstTaskIdx, tailStart, pairings);
 
   // §3.5 adjacency re-validation. On failure, revert DEDUP ONLY — back to the
@@ -497,4 +558,8 @@ module.exports = {
   normalizeAnthropicBody,
   dedupMiddle,
   MIN_KEEP,
+  // Test-only seam (see __setDedupImplForTest above). Namespaced under `__test`
+  // and never referenced by production code, so the public compress() surface
+  // cannot be used to inject a custom dedup.
+  __test: { setDedupImpl: __setDedupImplForTest },
 };

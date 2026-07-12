@@ -23,6 +23,7 @@ const {
   validateMessageIntegrity,
   normalizeAnthropicBody,
   MIN_KEEP,
+  __test,
 } = require('../src/compress.js');
 
 // ---------------------------------------------------------------------------
@@ -444,6 +445,128 @@ test('AC4: system-hoist preserves a client cache_control breakpoint on block-arr
   assert.ok(!result.messages.some(m => m.role === 'system'));
 });
 
+// ---------------------------------------------------------------------------
+// MF1 residual (round-2): a client cache_control breakpoint on a HOISTED
+// `role:system` message's OWN content blocks must survive the hoist EXACTLY. The
+// round-1 fix only preserved breakpoints on the TOP-LEVEL block-array `system`;
+// a role:system content-block breakpoint was flattened away via text extraction.
+// Each of the four cases below FAILS if the fix is reverted (the string/flatten
+// path drops the role:system breakpoint).
+// ---------------------------------------------------------------------------
+
+// Case 1: NO top-level system + role:system content is a block array with a
+// cache_control breakpoint → top-level system MUST become a BLOCK ARRAY keeping
+// that cache_control block (NOT a flattened string).
+test('MF1: no top-level system + role:system block with cache_control → block-array system preserves BP (cacheHint off)', () => {
+  const body = {
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'Boot', cache_control: { type: 'ephemeral' } }] },
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'ok' },
+    ],
+  };
+  const result = compress(body, { cacheHint: false });
+  assert.ok(Array.isArray(result.body.system), 'system must be a block array, not a flattened string');
+  const bps = result.body.system.filter(b => b && b.cache_control).length;
+  assert.equal(bps, 1);
+  const bootBlock = result.body.system.find(b => b.text === 'Boot');
+  assert.ok(bootBlock, 'the Boot block must survive');
+  assert.deepEqual(bootBlock.cache_control, { type: 'ephemeral' });
+  assert.ok(!result.messages.some(m => m.role === 'system'));
+});
+
+// Case 2: top-level STRING system + a structured role:system with a breakpoint →
+// produce a BLOCK-ARRAY system that preserves the role:system breakpoint (must NOT
+// string-merge it away).
+test('MF1: string top-level system + structured role:system BP → block-array system preserves the role:system BP', () => {
+  const body = {
+    system: 'Plain top-level prompt.',
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'Hoisted', cache_control: { type: 'ephemeral' } }] },
+      { role: 'user', content: 'go' },
+    ],
+  };
+  const result = compress(body, { cacheHint: false });
+  assert.ok(Array.isArray(result.body.system), 'system must be a block array (not string-merged)');
+  // Top-level string is preserved as a text block, in order, first.
+  const texts = result.body.system.map(b => b.text);
+  assert.deepEqual(texts, ['Plain top-level prompt.', 'Hoisted']);
+  const hoisted = result.body.system.find(b => b.text === 'Hoisted');
+  assert.deepEqual(hoisted.cache_control, { type: 'ephemeral' });
+  assert.equal(result.body.system.filter(b => b && b.cache_control).length, 1);
+});
+
+// Case 3: top-level block-array WITH cache_control + structured role:system with
+// its OWN breakpoint → keep BOTH breakpoints as blocks.
+test('MF1: block-array top-level BP + structured role:system BP → BOTH breakpoints preserved as blocks', () => {
+  const body = {
+    system: [{ type: 'text', text: 'Stable prefix', cache_control: { type: 'ephemeral' } }],
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'Hoisted directive', cache_control: { type: 'ephemeral' } }] },
+      { role: 'user', content: 'go' },
+    ],
+  };
+  const result = compress(body, { cacheHint: false });
+  assert.ok(Array.isArray(result.body.system));
+  assert.equal(result.body.system.filter(b => b && b.cache_control).length, 2, 'BOTH client breakpoints must survive');
+  const prefix = result.body.system.find(b => b.text === 'Stable prefix');
+  const directive = result.body.system.find(b => b.text === 'Hoisted directive');
+  assert.deepEqual(prefix.cache_control, { type: 'ephemeral' });
+  assert.deepEqual(directive.cache_control, { type: 'ephemeral' });
+});
+
+// Case 4: top-level block-array WITHOUT cache_control + structured role:system
+// WITH a breakpoint → must NOT fall into the string-merge path; the role:system
+// breakpoint is preserved as a block.
+test('MF1: block-array top-level (no BP) + structured role:system BP → NOT string-merged; role:system BP preserved', () => {
+  const body = {
+    system: [{ type: 'text', text: 'Prefix without BP' }],
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'Hoisted', cache_control: { type: 'ephemeral' } }] },
+      { role: 'user', content: 'go' },
+    ],
+  };
+  const result = compress(body, { cacheHint: false });
+  assert.ok(Array.isArray(result.body.system), 'must not flatten to a string — that would drop the role:system BP');
+  const hoisted = result.body.system.find(b => b.text === 'Hoisted');
+  assert.ok(hoisted, 'the hoisted block must survive');
+  assert.deepEqual(hoisted.cache_control, { type: 'ephemeral' });
+  assert.equal(result.body.system.filter(b => b && b.cache_control).length, 1);
+});
+
+// §3.4 opt-in interaction: with cacheHint ON, a preserved role:system breakpoint
+// (now living in top-level `system` blocks) must be SEEN by bodyHasCacheControl so
+// miser does NOT insert a duplicate breakpoint.
+test('MF1 + §3.4: cacheHint ON does not insert a duplicate BP when role:system already carried one', () => {
+  // The client breakpoint sits on the FIRST of two role:system blocks (not the
+  // last). If the fix were reverted, the role:system BP would be destroyed on
+  // hoist, bodyHasCacheControl would see none, and applyCacheHint would insert a
+  // NEW breakpoint on the LAST system block — landing the BP on 'Tail', not 'Boot'.
+  // The fix instead preserves the ORIGINAL breakpoint on 'Boot' and inserts none.
+  const body = {
+    messages: [
+      { role: 'system', content: [
+        { type: 'text', text: 'Boot', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: 'Tail' },
+      ] },
+      ...Array.from({ length: MIN_KEEP + 2 }, (_, i) => ({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: `turn-${i}`,
+      })),
+    ],
+  };
+  const result = compress(body, { cacheHint: true });
+  assert.ok(Array.isArray(result.body.system));
+  // Exactly ONE breakpoint total — the client's own, not a miser-inserted second.
+  assert.equal(result.body.system.filter(b => b && b.cache_control).length, 1);
+  // The surviving breakpoint is on the ORIGINAL 'Boot' block — proving it was
+  // preserved, not destroyed-then-reinserted onto the last ('Tail') block.
+  const boot = result.body.system.find(b => b.text === 'Boot');
+  const tail = result.body.system.find(b => b.text === 'Tail');
+  assert.deepEqual(boot.cache_control, { type: 'ephemeral' });
+  assert.ok(!(tail && tail.cache_control), 'BP must NOT have been (re)inserted on the last block');
+});
+
 // ===========================================================================
 // AC5 — miser-introduced adjacency safety (revert dedup) + no synthetic reject.
 // ===========================================================================
@@ -503,7 +626,16 @@ test('AC5: compress() reverts dedup when miser\'s OWN dedup would break adjacenc
         (b && b.type === 'tool_result') ? { ...b, tool_use_id: 'CORRUPTED', content: 'STUBBED' } : b);
     }
   };
-  const result = compress({ messages }, { _dedupImpl: breakingDedup });
+  // The dedup impl is injected via the module-private test-only seam (NOT via the
+  // public compress(body, opts) API — production callers can't reach it). Always
+  // reset in finally so the override never leaks into another test.
+  let result;
+  __test.setDedupImpl(breakingDedup);
+  try {
+    result = compress({ messages });
+  } finally {
+    __test.setDedupImpl(null);
+  }
   // Reverted: the forwarded messages are the pre-dedup normalized set, NOT the
   // corrupted ones. Original tool_use_ids + content survive; adjacency holds.
   assert.equal(result.messages[2].content[0].tool_use_id, 'tu1');
