@@ -499,7 +499,7 @@ function compress(body, opts = {}) {
     const work = dedupOpenAIMessages(rawMessages, tailStart);
     const tokens = work.reduce((sum, m) => sum + messageTokens(m), 0);
     const outBody = { ...body, messages: work };
-    return { body: outBody, messages: work, tokens, rawTokens };
+    return { body: outBody, messages: work, tokens, rawTokens, cacheHintApplied: false };
   }
 
   // --- Anthropic path ------------------------------------------------------
@@ -537,15 +537,18 @@ function compress(body, opts = {}) {
 
   // §3.4 cache-hint LAST (on the final message set), opt-in + default OFF.
   let outBody = { ...normBody, messages: finalMessages };
+  let cacheHintApplied = false;
   if (cacheHint) {
+    const bodyBeforeHint = outBody;
     outBody = applyCacheHint(outBody, finalMessages.length);
+    cacheHintApplied = outBody !== bodyBeforeHint;
   }
   // Keep body.messages authoritative and in sync with the returned messages.
   outBody.messages = finalMessages;
 
   const tokens = estimateTokens(systemToText(outBody.system)) + finalMessages.reduce((sum, m) => sum + messageTokens(m), 0);
 
-  return { body: outBody, messages: finalMessages, tokens, rawTokens };
+  return { body: outBody, messages: finalMessages, tokens, rawTokens, cacheHintApplied };
 }
 
 module.exports = {
