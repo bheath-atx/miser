@@ -86,14 +86,19 @@ class FakeRes extends Writable {
     super();
     this.headersSent = false;
     this.statusCode = null;
-    this.headers = null;
+    this.headers = {};
     this.chunks = [];
     this._doneResolvers = [];
     this.on('finish', () => this._doneResolvers.forEach(r => r()));
   }
+  setHeader(k, v) { this.headers[k.toLowerCase()] = v; }
+  removeHeader(k) { delete this.headers[k.toLowerCase()]; }
   writeHead(code, headers) {
     if (this.headersSent) throw new Error('writeHead twice');
-    this.headersSent = true; this.statusCode = code; this.headers = headers || {}; return this;
+    this.headersSent = true;
+    this.statusCode = code;
+    this.headers = { ...this.headers, ...(headers || {}) };
+    return this;
   }
   _write(chunk, enc, cb) { this.chunks.push(chunk.toString()); cb(); }
   body() { return this.chunks.join(''); }
@@ -127,6 +132,7 @@ test('AC8: hoisted top-level system reaches the Anthropic leg (loopback echo)', 
     const res = fakeRes();
     await drive(createProxy, fakeReq('POST', '/v1/messages', body, {}), res);
     assert.equal(res.statusCode, 200);
+    assert.ok(res.headers['x-miser-compact-hint']);
     assert.equal(echo.captured.length, 1);
     // The forwarded body carries the hoisted top-level system (not a messages turn).
     assert.equal(echo.captured[0].body.system, 'You are Claude Code.');
@@ -164,6 +170,7 @@ test('AC10: middle duplicate tool_result forwards as a STUB (loopback echo canar
     assert.equal(fwd.messages[10].content[0].content, dup);
     // No miser-side size rejection: upstream 200 passed through.
     assert.equal(res.statusCode, 200);
+    assert.ok(res.headers['x-miser-compact-hint']);
   } finally {
     echo.server.close(); restoreEnv();
   }

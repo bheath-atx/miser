@@ -30,6 +30,14 @@ module.exports = {
     toolSchemaCompress: /^(1|true|on|yes)$/i.test(process.env.MISER_TIER_B_SCHEMA_COMPRESS || ''),
     toolOutputTrim: /^(1|true|on|yes)$/i.test(process.env.MISER_TIER_B_OUTPUT_TRIM || ''),
   },
+  compactHintUrgentFraction: parseFloat(process.env.COMPACT_HINT_URGENT_FRACTION ?? '0.70'),
+  compactHintRecommendFraction: parseFloat(process.env.COMPACT_HINT_RECOMMEND_FRACTION ?? '0.40'),
+  modelWindows: {
+    'claude-opus': 1_000_000,
+    'claude-sonnet': 200_000,
+    'claude-haiku': 200_000,
+    'gpt': 128_000,
+  },
   // Hard cap (rough tokens) applied to the Ollama fallback leg so a
   // double-fallback (Anthropic 429 → Codex fail → Ollama) can never ship an
   // over-context payload to the local model. This gates ONLY the degraded

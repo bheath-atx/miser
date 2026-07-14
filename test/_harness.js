@@ -15,11 +15,15 @@ function makeRes() {
     chunks: [],
     ended: false,
     writableEnded: false,
+    setHeader(k, v) { this.headers = { ...(this.headers || {}), [k.toLowerCase()]: v }; },
+    removeHeader(k) {
+      if (this.headers) delete this.headers[k.toLowerCase()];
+    },
     writeHead(code, headers) {
       if (this.headersSent) throw new Error('writeHead called twice (headers already sent)');
       this.headersSent = true;
       this.statusCode = code;
-      this.headers = headers || {};
+      this.headers = { ...(this.headers || {}), ...(headers || {}) };
       return this;
     },
     write(chunk) { this.chunks.push(String(chunk)); return true; },
