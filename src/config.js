@@ -10,10 +10,26 @@ module.exports = {
   // Anthropic upstream base URL. Authoritative field (router parses host/path
   // from it) — enables the AC10 loopback-echo canary + offline testability.
   anthropicUrl: process.env.MISER_ANTHROPIC_URL || 'https://api.anthropic.com',
-  // Opt-in prompt-cache hint (§3.4). DEFAULT OFF: inserts exactly one
-  // cache_control breakpoint on top-level `system` (billing-only, lossless) only
-  // when explicitly enabled and the client sends no breakpoints of its own.
-  cacheHint: /^(1|true|on|yes)$/i.test(process.env.MISER_CACHE_HINT || ''),
+  // v3: always-on system-only cache breakpoint (AC5). Explicit false-ish env
+  // values remain an emergency override.
+  cacheHint: !/^(0|false|off|no)$/i.test(process.env.MISER_CACHE_HINT || ''),
+  // Per-project tool allowlists for Tier-A tool pruning (v3).
+  // Format: JSON map { "<project>": ["tool1", "tool2", ...] }
+  // Loaded from MISER_TOOL_ALLOWLISTS env var (JSON string) or empty.
+  // If missing/unparseable -> empty map -> pruning is NO-OP for all projects.
+  toolAllowlists: (() => {
+    try {
+      const raw = process.env.MISER_TOOL_ALLOWLISTS || '{}';
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+      return {};
+    } catch (_) { return {}; }
+  })(),
+  // Tier B opt-in flags (default OFF; no behavior is wired in v3).
+  tierB: {
+    toolSchemaCompress: /^(1|true|on|yes)$/i.test(process.env.MISER_TIER_B_SCHEMA_COMPRESS || ''),
+    toolOutputTrim: /^(1|true|on|yes)$/i.test(process.env.MISER_TIER_B_OUTPUT_TRIM || ''),
+  },
   // Hard cap (rough tokens) applied to the Ollama fallback leg so a
   // double-fallback (Anthropic 429 → Codex fail → Ollama) can never ship an
   // over-context payload to the local model. This gates ONLY the degraded

@@ -10,6 +10,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { Writable } = require('node:stream');
 
 // Start an ephemeral loopback echo server. `handler(reqBody)` returns
@@ -40,15 +43,24 @@ function startEcho(handler) {
 // Load a FRESH proxy/router/config with MISER_ANTHROPIC_URL pointed at the echo.
 function freshProxy(anthropicUrl, extraEnv = {}) {
   for (const k of Object.keys(require.cache)) {
-    if (/\/src\/(proxy|router|config|compress)\.js$/.test(k.replace(/\\/g, '/'))) {
+    if (/\/src\/(proxy|router|config|compress|stats|toolprune)\.js$/.test(k.replace(/\\/g, '/'))) {
       delete require.cache[k];
     }
   }
   const prev = { ...process.env };
+  const statsFile = extraEnv.MISER_STATS_FILE
+    || path.join(os.tmpdir(), `miser-proxy-test-stats-${process.pid}-${Date.now()}-${Math.random()}.json`);
   process.env.MISER_ANTHROPIC_URL = anthropicUrl;
+  process.env.MISER_STATS_FILE = statsFile;
   for (const [k, v] of Object.entries(extraEnv)) process.env[k] = v;
   const { createProxy } = require('../src/proxy.js');
-  return { createProxy, restoreEnv: () => { process.env = prev; } };
+  return {
+    createProxy,
+    restoreEnv: () => {
+      process.env = prev;
+      try { fs.unlinkSync(statsFile); } catch (_) {}
+    },
+  };
 }
 
 // Minimal fake req/res to drive the proxy handler in-process.
@@ -208,14 +220,76 @@ test('AC5: a client-illegal request (orphan tool_result) is FORWARDED, not miser
 
 test('health payload drops the deleted threshold; reports cacheHint', async () => {
   const echo = await startEcho(() => ({ status: 200, body: {} }));
-  const { createProxy, restoreEnv } = freshProxy(echo.url);
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_CACHE_HINT: '' });
   try {
     const res = fakeRes();
     await drive(createProxy, fakeReq('GET', '/api/miser/health', null, {}), res);
     const payload = JSON.parse(res.body());
     assert.equal(payload.ok, true);
     assert.ok(!('threshold' in payload));
-    assert.ok('cacheHint' in payload);
+    assert.equal(payload.cacheHint, true);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('/api/miser/stats returns 200 with the expected shape', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url);
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats', null, {}), res);
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 200);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.days, 7);
+    assert.ok(payload.since);
+    assert.ok(payload.perTechnique.dedup);
+    assert.ok(payload.perTechnique.cacheHint);
+    assert.ok(payload.perTechnique.toolPrune);
+    assert.deepEqual(payload.perProject, {});
+    assert.deepEqual(Object.keys(payload.totals), ['inputTokensRemoved', 'cacheBillingDelta', 'appliedCount']);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('/api/miser/stats?days=abc returns 400', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url);
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats?days=abc', null, {}), res);
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 400);
+    assert.equal(payload.error.type, 'stats_error');
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('/api/miser/stats?days=-1 returns 400', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url);
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats?days=-1', null, {}), res);
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 400);
+    assert.equal(payload.error.type, 'stats_error');
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('/api/miser/quota still returns 200', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url);
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/quota', null, {}), res);
+    assert.equal(res.statusCode, 200);
+    assert.doesNotThrow(() => JSON.parse(res.body()));
   } finally {
     echo.server.close(); restoreEnv();
   }
