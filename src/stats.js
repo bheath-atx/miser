@@ -50,6 +50,8 @@ function ensureProjectBucket(project) {
   if (!bucket.dedup) bucket.dedup = emptyTechniqueBucket();
   if (!bucket.cacheHint) bucket.cacheHint = emptyTechniqueBucket();
   if (!bucket.toolPrune) bucket.toolPrune = { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
+  if (!Number.isFinite(bucket.likelyPollCount)) bucket.likelyPollCount = 0;
+  if (!Number.isFinite(bucket.workTurnCount)) bucket.workTurnCount = 0;
   return bucket;
 }
 
@@ -60,6 +62,7 @@ function recordStats(project, opts = {}) {
     inputTokensRemoved = 0,
     cacheBillingDelta = 0,
     toolsRemoved = 0,
+    pollClass,
     techniques = {},
   } = opts;
 
@@ -75,6 +78,11 @@ function recordStats(project, opts = {}) {
     // inputTokensRemoved stays 0 for toolPrune in v1 (no reliable byte estimate at proxy time)
     bucket.toolPrune.toolsRemovedCount += toolsRemoved;
     bucket.toolPrune.appliedCount += 1;
+  }
+  if (pollClass === 'likely') {
+    bucket.likelyPollCount += 1;
+  } else if (pollClass === 'unlikely') {
+    bucket.workTurnCount += 1;
   }
 
   flushStats();
@@ -113,6 +121,7 @@ function getStats(daysParam, projectFilter) {
           dedup: emptyTechniqueBucket(),
           cacheHint: emptyTechniqueBucket(),
           toolPrune: { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
+          pollClass: { likely: 0, work: 0 },
         };
       }
       for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
@@ -124,6 +133,8 @@ function getStats(daysParam, projectFilter) {
           perProject[proj][tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
         }
       }
+      perProject[proj].pollClass.likely += projData.likelyPollCount || 0;
+      perProject[proj].pollClass.work += projData.workTurnCount || 0;
     }
   }
 
