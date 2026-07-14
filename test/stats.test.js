@@ -89,7 +89,8 @@ test('getStats returns correct per-technique totals for N days', () => {
     assert.equal(result.perTechnique.dedup.inputTokensRemoved, 15);
     assert.equal(result.perTechnique.cacheHint.cacheBillingDelta, 10);
     assert.equal(result.perTechnique.toolPrune.inputTokensRemoved, 3);
-    assert.equal(result.totals.inputTokensRemoved, 18);
+    // toolPrune.inputTokensRemoved is legacy data from the seeded file; totals excludes it
+    assert.equal(result.totals.inputTokensRemoved, 15);
     assert.equal(result.totals.cacheBillingDelta, 10);
     assert.ok(!result.perProject.old);
   } finally {
@@ -174,7 +175,8 @@ test('recordStats toolPrune-only increments only the toolPrune bucket', () => {
     const stats = freshStats(file);
     stats.recordStats('alpha', { toolsRemoved: 3, techniques: { toolPrune: true } });
     const result = stats.getStats('1');
-    assert.equal(result.perProject.alpha.toolPrune.inputTokensRemoved, 3);
+    assert.equal(result.perProject.alpha.toolPrune.toolsRemovedCount, 3);
+    assert.equal(result.perProject.alpha.toolPrune.inputTokensRemoved, 0);
     assert.equal(result.perProject.alpha.toolPrune.appliedCount, 1);
     assert.equal(result.perProject.alpha.dedup.appliedCount, 0);
     assert.equal(result.perProject.alpha.cacheHint.appliedCount, 0);

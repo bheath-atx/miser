@@ -248,7 +248,7 @@ test('/api/miser/stats returns 200 with the expected shape', async () => {
     assert.ok(payload.perTechnique.cacheHint);
     assert.ok(payload.perTechnique.toolPrune);
     assert.deepEqual(payload.perProject, {});
-    assert.deepEqual(Object.keys(payload.totals), ['inputTokensRemoved', 'cacheBillingDelta', 'appliedCount']);
+    assert.deepEqual(Object.keys(payload.totals), ['inputTokensRemoved', 'cacheBillingDelta', 'appliedCount', 'toolsRemovedCount']);
   } finally {
     echo.server.close(); restoreEnv();
   }

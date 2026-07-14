@@ -49,7 +49,7 @@ function ensureProjectBucket(project) {
 
   if (!bucket.dedup) bucket.dedup = emptyTechniqueBucket();
   if (!bucket.cacheHint) bucket.cacheHint = emptyTechniqueBucket();
-  if (!bucket.toolPrune) bucket.toolPrune = emptyTechniqueBucket();
+  if (!bucket.toolPrune) bucket.toolPrune = { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
   return bucket;
 }
 
@@ -72,7 +72,8 @@ function recordStats(project, opts = {}) {
     bucket.cacheHint.appliedCount += 1;
   }
   if (techniques.toolPrune && toolsRemoved > 0) {
-    bucket.toolPrune.inputTokensRemoved += toolsRemoved;
+    // inputTokensRemoved stays 0 for toolPrune in v1 (no reliable byte estimate at proxy time)
+    bucket.toolPrune.toolsRemovedCount += toolsRemoved;
     bucket.toolPrune.appliedCount += 1;
   }
 
@@ -111,7 +112,7 @@ function getStats(daysParam, projectFilter) {
         perProject[proj] = {
           dedup: emptyTechniqueBucket(),
           cacheHint: emptyTechniqueBucket(),
-          toolPrune: emptyTechniqueBucket(),
+          toolPrune: { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
         };
       }
       for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
@@ -119,6 +120,9 @@ function getStats(daysParam, projectFilter) {
         perProject[proj][tech].inputTokensRemoved += projData[tech].inputTokensRemoved || 0;
         perProject[proj][tech].cacheBillingDelta += projData[tech].cacheBillingDelta || 0;
         perProject[proj][tech].appliedCount += projData[tech].appliedCount || 0;
+        if (tech === 'toolPrune') {
+          perProject[proj][tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
+        }
       }
     }
   }
@@ -126,20 +130,25 @@ function getStats(daysParam, projectFilter) {
   const perTechnique = {
     dedup: emptyTechniqueBucket(),
     cacheHint: emptyTechniqueBucket(),
-    toolPrune: emptyTechniqueBucket(),
+    toolPrune: { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
   };
   for (const projData of Object.values(perProject)) {
     for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
       perTechnique[tech].inputTokensRemoved += projData[tech].inputTokensRemoved;
       perTechnique[tech].cacheBillingDelta += projData[tech].cacheBillingDelta;
       perTechnique[tech].appliedCount += projData[tech].appliedCount;
+      if (tech === 'toolPrune') {
+        perTechnique[tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
+      }
     }
   }
 
   const totals = {
-    inputTokensRemoved: Object.values(perTechnique).reduce((sum, t) => sum + t.inputTokensRemoved, 0),
+    // toolPrune no longer contributes to inputTokensRemoved (it counts tools, not bytes)
+    inputTokensRemoved: (perTechnique.dedup.inputTokensRemoved || 0) + (perTechnique.cacheHint.inputTokensRemoved || 0),
     cacheBillingDelta: Object.values(perTechnique).reduce((sum, t) => sum + t.cacheBillingDelta, 0),
     appliedCount: Object.values(perTechnique).reduce((sum, t) => sum + t.appliedCount, 0),
+    toolsRemovedCount: perTechnique.toolPrune.toolsRemovedCount || 0,
   };
 
   return {

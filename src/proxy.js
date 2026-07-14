@@ -73,7 +73,7 @@ function createProxy(deps = {}) {
       // optional cache hint, deduped messages). NO threshold gate, NO synthetic
       // client rejection, NO size ceiling — a client-illegal request is forwarded
       // as-is so Anthropic's authoritative error reaches the client (I1–I3, §8.8).
-      const { body, messages, tokens, rawTokens } = compress(originalBody, {
+      const { body, messages, tokens, rawTokens, cacheHintApplied } = compress(originalBody, {
         format,
         cacheHint: config.cacheHint,
       });
@@ -103,7 +103,7 @@ function createProxy(deps = {}) {
         toolsRemoved,
         techniques: {
           dedup: savedTokens > 0,
-          cacheHint: config.cacheHint,
+          cacheHint: cacheHintApplied,
           toolPrune: toolsRemoved > 0,
         },
       });
