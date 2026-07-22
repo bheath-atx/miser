@@ -296,7 +296,8 @@ function dedupMiddle(messages, firstTaskIdx, tailStart, pairings) {
 // Inserted IFF cache-hint is enabled AND there are zero client breakpoints AND
 // there are > MIN_KEEP turns. If there is no `system`, SKIP (no tools/user-turn
 // placement — those have wire-legal edge cases not worth the risk, §3.4).
-function bodyHasCacheControl(body) {
+function requestCarriesClientCache(body) {
+  if (body && body.cache_control) return true;
   if (Array.isArray(body.system)) {
     if (body.system.some(b => b && b.cache_control)) return true;
   }
@@ -318,7 +319,7 @@ function bodyHasCacheControl(body) {
 function applyCacheHint(body, turnCount) {
   if (body.system == null || body.system === '') return body; // no system → skip
   if (turnCount <= MIN_KEEP) return body;
-  if (bodyHasCacheControl(body)) return body; // client already manages breakpoints
+  if (requestCarriesClientCache(body)) return body; // client already manages breakpoints
 
   const out = { ...body };
   if (typeof out.system === 'string') {
@@ -514,16 +515,22 @@ function compress(body, opts = {}) {
   // to do here — an already-illegal client opener forwards as-is.
 
   // §3.3 lossless tool_result dedup (on a clone; original messages untouched).
+  // v4 cache-safety: Anthropic clients carrying cache_control already manage
+  // prompt-cache breakpoints. Rewriting older cached prefix bytes can be
+  // billing-negative, so skip dedup unless the test/emergency override is set.
   const tailStart = Math.max(0, normMessages.length - MIN_KEEP);
   const firstTaskIdx = normMessages.findIndex(m => m && m.role === 'user'); // -1 if none
   const work = normMessages.map(cloneMsg);
-  const pairings = buildPairings(work);
-  // Production always uses the real lossless dedupMiddle. A module-private
-  // override (set ONLY via __setDedupImplForTest, never through opts) lets a test
-  // inject an adjacency-breaking dedup to prove the §3.5 revert below is
-  // load-bearing. Not reachable from the public compress(body, opts) surface.
-  const dedupImpl = _dedupImplOverride || dedupMiddle;
-  dedupImpl(work, firstTaskIdx, tailStart, pairings);
+  const skipDedup = requestCarriesClientCache(normBody) && process.env.MISER_DEDUP_FORCE !== '1';
+  if (!skipDedup) {
+    const pairings = buildPairings(work);
+    // Production always uses the real lossless dedupMiddle. A module-private
+    // override (set ONLY via __setDedupImplForTest, never through opts) lets a test
+    // inject an adjacency-breaking dedup to prove the §3.5 revert below is
+    // load-bearing. Not reachable from the public compress(body, opts) surface.
+    const dedupImpl = _dedupImplOverride || dedupMiddle;
+    dedupImpl(work, firstTaskIdx, tailStart, pairings);
+  }
 
   // §3.5 adjacency re-validation. On failure, revert DEDUP ONLY — back to the
   // §3.1-normalized messages (system already hoisted; never the raw illegal
@@ -557,6 +564,7 @@ module.exports = {
   messageTokens,
   validateMessageIntegrity,
   normalizeAnthropicBody,
+  requestCarriesClientCache,
   dedupMiddle,
   MIN_KEEP,
   // Test-only seam (see __setDedupImplForTest above). Namespaced under `__test`

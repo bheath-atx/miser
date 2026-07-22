@@ -8,6 +8,8 @@ const { translateToResponses, validateResponsesRequest, translateResponsesStream
 const { hardCapOllamaBody } = require('./hardcap.js');
 const { getCodexBearer } = require('./oauth.js');
 const { recordUsage } = require('./quota.js');
+const { recordAnthropicUsage } = require('./stats.js');
+const { AnthropicUsageParser } = require('./usage.js');
 const config = require('./config.js');
 
 // ---------------------------------------------------------------------------
@@ -108,6 +110,56 @@ function teardownResponse(res, err) {
   } catch (_) { /* best effort */ }
 }
 
+function proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject) {
+  const statusCode = upstream.statusCode;
+  const contentType = upstream.headers['content-type'] || 'application/json';
+  const parser = new AnthropicUsageParser({
+    isSSE: /^text\/event-stream\b/i.test(contentType),
+    model: originalBody.model || 'unknown',
+  });
+  let parserWarned = false;
+  function warnParser(err) {
+    if (parserWarned) return;
+    parserWarned = true;
+    console.warn(`[miser] usage parser skipped: ${err.message}`);
+  }
+
+  res.writeHead(statusCode, {
+    'content-type': contentType,
+    'x-miser-provider': 'anthropic',
+    'x-miser-model': originalBody.model || 'unknown',
+    'x-miser-saved-tokens': String(savedTokens),
+  });
+
+  upstream.on('data', (chunk) => {
+    try {
+      parser.observeChunk(chunk);
+    } catch (err) {
+      parser.failed = true;
+      warnParser(err);
+    }
+    res.write(chunk);
+  });
+  upstream.on('end', () => {
+    res.end();
+    if (statusCode >= 200 && statusCode < 300) {
+      let parsed = null;
+      try {
+        parsed = parser.finish();
+      } catch (err) {
+        warnParser(err);
+      }
+      const model = (parsed && parsed.model) || originalBody.model || 'unknown';
+      recordUsage(project, 'anthropic', model);
+      if (parsed && (parsed.usage || parsed.appliedEdits)) {
+        recordAnthropicUsage(project, 'anthropic', model, parsed.usage || {}, parsed.appliedEdits);
+      }
+    }
+    resolve({ statusCode });
+  });
+  upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
+}
+
 function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens) {
   return new Promise((resolve, reject) => {
     // I6: `originalBody` here IS the reduced body compress() produced (hoisted
@@ -149,15 +201,7 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
         return;
       }
 
-      res.writeHead(upstream.statusCode, {
-        'content-type': upstream.headers['content-type'] || 'application/json',
-        'x-miser-provider': 'anthropic',
-        'x-miser-model': originalBody.model || 'unknown',
-        'x-miser-saved-tokens': String(savedTokens),
-      });
-      upstream.pipe(res);
-      upstream.on('end', () => { recordUsage(project, 'anthropic', originalBody.model || 'unknown'); resolve(); });
-      upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
+      proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject);
     });
 
     req.on('error', reject);
@@ -324,6 +368,7 @@ function forwardToOllama(messages, originalBody, res, project, savedTokens, opts
 
 module.exports = {
   routeRequest,
+  proxyAnthropicResponse,
   forwardToAnthropic,
   forwardToOpenAI,
   forwardToCodex,
