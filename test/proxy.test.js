@@ -427,7 +427,12 @@ test('v4 C1: injected non-429 non-2xx passes through and writes no usage stats',
 
     const statsRes = fakeRes();
     await drive(createProxy, fakeReq('GET', '/api/miser/stats?days=1&project=alpha', null, {}), statsRes);
-    assert.deepEqual(JSON.parse(statsRes.body()).usage, {});
+    const stats = JSON.parse(statsRes.body());
+    assert.deepEqual(stats.usage, {});
+    assert.deepEqual(stats.perProject, {});
+    assert.equal(stats.perTechnique.dedup.appliedCount, 0);
+    assert.equal(stats.perTechnique.cacheHint.appliedCount, 0);
+    assert.equal(stats.perTechnique.toolPrune.appliedCount, 0);
   } finally {
     echo.server.close(); restoreEnv();
   }

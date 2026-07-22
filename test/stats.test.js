@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const statsPath = require.resolve('../src/stats.js');
+const preV4FixturePath = path.join(__dirname, 'fixtures-pre-v4-stats-snapshot.json');
 
 function tmpStatsFile(name) {
   return path.join(os.tmpdir(), `miser-test-stats-${process.pid}-${name}-${Date.now()}.json`);
@@ -253,6 +254,47 @@ test('v4 M2: usage tree omits absent measurements instead of zero-filling', () =
   }
 });
 
+test('v4 M2: legacy total cache_creation_input_tokens records as cacheWrite1h when nested TTLs are absent', () => {
+  const file = tmpStatsFile('legacy-cache-creation');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-legacy', {
+      input_tokens: 8,
+      cache_creation_input_tokens: 21,
+    });
+    const bucket = stats.getStats('1').usage.alpha.anthropic['claude-legacy'];
+    assert.deepEqual(bucket, { requests: 1, input: 8, cacheWrite1h: 21 });
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('v4 M2: pure usage writes do not persist legacy technique zero buckets', () => {
+  const file = tmpStatsFile('usage-no-legacy');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-4', { output_tokens: 9 });
+    const raw = stats.loadStats();
+    const rawProject = raw[dayKey()].alpha;
+    assert.deepEqual(rawProject, {
+      usage: {
+        anthropic: {
+          'claude-sonnet-4': { requests: 1, output: 9 },
+        },
+      },
+    });
+    assert.ok(!('dedup' in rawProject));
+    assert.ok(!('cacheHint' in rawProject));
+    assert.ok(!('toolPrune' in rawProject));
+    assert.ok(!('likelyPollCount' in rawProject));
+    assert.ok(!('workTurnCount' in rawProject));
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
 test('v4 M2: context_management.applied_edits aggregate per project', () => {
   const file = tmpStatsFile('edits');
   const prevEnv = process.env.MISER_STATS_FILE;
@@ -277,25 +319,19 @@ test('v4 M2: context_management.applied_edits aggregate per project', () => {
 test('v4 M2: real pre-v4 stats fixture loads byte-compatible and usage stays absent', () => {
   const file = tmpStatsFile('legacy');
   const prevEnv = process.env.MISER_STATS_FILE;
-  const fixture = {
-    [dayKey()]: {
-      alpha: {
-        dedup: { inputTokensRemoved: 10, cacheBillingDelta: 0, appliedCount: 1 },
-        cacheHint: { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0 },
-        toolPrune: { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
-        likelyPollCount: 3,
-        workTurnCount: 4,
-      },
-    },
-  };
+  const fixtureRaw = fs.readFileSync(preV4FixturePath, 'utf8');
+  const fixture = JSON.parse(fixtureRaw);
   try {
-    fs.writeFileSync(file, JSON.stringify(fixture, null, 2), 'utf8');
+    fs.writeFileSync(file, fixtureRaw, 'utf8');
     const stats = freshStats(file);
     assert.deepEqual(stats.loadStats(), fixture);
-    const result = stats.getStats('1');
-    assert.equal(result.perProject.alpha.dedup.inputTokensRemoved, 10);
+    const result = stats.getStats('9999');
+    assert.equal(result.perProject.default.dedup.inputTokensRemoved, 4149);
+    assert.equal(result.perProject.default.dedup.appliedCount, 294);
+    assert.equal(result.perProject.default.pollClass.likely, 5864);
+    assert.equal(result.perProject.default.pollClass.work, 6400);
     assert.deepEqual(result.usage, {});
-    assert.ok(!('usage' in result.perProject.alpha));
+    assert.ok(!('usage' in result.perProject.default));
   } finally {
     cleanup(file, prevEnv);
   }

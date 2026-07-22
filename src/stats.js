@@ -67,6 +67,14 @@ function ensureProjectBucket(project) {
   return bucket;
 }
 
+function ensureMeasuredProjectBucket(project) {
+  const day = todayKey();
+  const proj = project || 'default';
+  if (!_stats[day]) _stats[day] = {};
+  if (!_stats[day][proj]) _stats[day][proj] = {};
+  return _stats[day][proj];
+}
+
 // opts: { inputTokensRemoved, cacheBillingDelta, toolsRemoved, techniques }
 function recordStats(project, opts = {}) {
   const bucket = ensureProjectBucket(project);
@@ -120,6 +128,9 @@ function normalizeUsage(raw = {}) {
     : {};
   addMeasured(out, 'cacheWrite5m', creation.ephemeral_5m_input_tokens);
   addMeasured(out, 'cacheWrite1h', creation.ephemeral_1h_input_tokens);
+  if (!raw.cache_creation || typeof raw.cache_creation !== 'object') {
+    addMeasured(out, 'cacheWrite1h', raw.cache_creation_input_tokens);
+  }
   return out;
 }
 
@@ -137,7 +148,7 @@ function normalizeAppliedEdits(appliedEdits) {
 }
 
 function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEdits = null) {
-  const bucket = ensureProjectBucket(project);
+  const bucket = ensureMeasuredProjectBucket(project);
   const providerKey = provider || 'anthropic';
   const modelKey = model || 'unknown';
   const usage = normalizeUsage(rawUsage);

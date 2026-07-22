@@ -1,0 +1,199 @@
+{
+  "2026-07-14": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 520,
+        "cacheBillingDelta": 0,
+        "appliedCount": 40
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 4
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "likelyPollCount": 134,
+      "workTurnCount": 77
+    }
+  },
+  "2026-07-15": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 334,
+      "workTurnCount": 316
+    }
+  },
+  "2026-07-16": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 21,
+        "cacheBillingDelta": 0,
+        "appliedCount": 21
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 678,
+      "workTurnCount": 694
+    }
+  },
+  "2026-07-17": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 8,
+        "cacheBillingDelta": 0,
+        "appliedCount": 8
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 438,
+      "workTurnCount": 402
+    }
+  },
+  "2026-07-18": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 243,
+      "workTurnCount": 255
+    }
+  },
+  "2026-07-19": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 1093,
+      "workTurnCount": 1221
+    }
+  },
+  "2026-07-20": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 432,
+      "workTurnCount": 402
+    }
+  },
+  "2026-07-21": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 1952,
+        "cacheBillingDelta": 0,
+        "appliedCount": 122
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 2077,
+      "workTurnCount": 2565
+    }
+  },
+  "2026-07-22": {
+    "default": {
+      "dedup": {
+        "inputTokensRemoved": 1648,
+        "cacheBillingDelta": 0,
+        "appliedCount": 103
+      },
+      "cacheHint": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0
+      },
+      "toolPrune": {
+        "inputTokensRemoved": 0,
+        "cacheBillingDelta": 0,
+        "appliedCount": 0,
+        "toolsRemovedCount": 0
+      },
+      "likelyPollCount": 435,
+      "workTurnCount": 468
+    }
+  }
+}

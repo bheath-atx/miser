@@ -166,6 +166,10 @@ function updateContextBreaker(project, injected, statusCode) {
   contextBreaker.set(project, 0);
 }
 
+function shouldRecordInjectedStats(statusCode) {
+  return Number.isFinite(statusCode) && statusCode >= 200 && statusCode < 300;
+}
+
 // `deps` is an OPTIONAL injectable seam forwarded verbatim to routeRequest()
 // (transports / getBearer / ollamaCap). Production callers pass nothing, so
 // routeRequest falls back to its real transports. The offline test harness uses
@@ -250,7 +254,7 @@ function createProxy(deps = {}) {
       suppressCompactHeadersOnErrors(res);
       for (const [k, v] of Object.entries(compactHeaders)) res.setHeader(k, v);
 
-      recordStats(project, {
+      const legacyStats = {
         inputTokensRemoved: savedTokens,
         toolsRemoved,
         pollClass: compactHeaders['x-miser-poll-class'],
@@ -259,7 +263,7 @@ function createProxy(deps = {}) {
           cacheHint: cacheHintApplied,
           toolPrune: toolsRemoved > 0,
         },
-      });
+      };
 
       let forwardBody = prunedBody;
       let forwardHeaders = req.headers;
@@ -271,11 +275,16 @@ function createProxy(deps = {}) {
         if (c1Injected) console.log(`[miser] c1-injected project=${project}`);
       }
 
+      if (!c1Injected) recordStats(project, legacyStats);
+
       // Forward the REDUCED body (I6) — every leg serializes THIS body, so the
       // hoisted top-level `system` and any cache hint reach the wire on all legs.
       await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format, deps);
       if (c1Injected && (res.statusCode < 200 || res.statusCode >= 300)) {
         console.warn(`[miser] c1-injected non-2xx project=${project} status=${res.statusCode}`);
+      }
+      if (c1Injected && shouldRecordInjectedStats(res.statusCode)) {
+        recordStats(project, legacyStats);
       }
       updateContextBreaker(project, c1Injected, res.statusCode);
     } catch (err) {

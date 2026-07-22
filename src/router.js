@@ -117,6 +117,12 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, savedToken
     isSSE: /^text\/event-stream\b/i.test(contentType),
     model: originalBody.model || 'unknown',
   });
+  let parserWarned = false;
+  function warnParser(err) {
+    if (parserWarned) return;
+    parserWarned = true;
+    console.warn(`[miser] usage parser skipped: ${err.message}`);
+  }
 
   res.writeHead(statusCode, {
     'content-type': contentType,
@@ -126,16 +132,27 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, savedToken
   });
 
   upstream.on('data', (chunk) => {
-    parser.observeChunk(chunk);
+    try {
+      parser.observeChunk(chunk);
+    } catch (err) {
+      parser.failed = true;
+      warnParser(err);
+    }
     res.write(chunk);
   });
   upstream.on('end', () => {
     res.end();
     if (statusCode >= 200 && statusCode < 300) {
-      const parsed = parser.finish();
-      recordUsage(project, 'anthropic', parsed.model || originalBody.model || 'unknown');
-      if (parsed.usage || parsed.appliedEdits) {
-        recordAnthropicUsage(project, 'anthropic', parsed.model || originalBody.model || 'unknown', parsed.usage || {}, parsed.appliedEdits);
+      let parsed = null;
+      try {
+        parsed = parser.finish();
+      } catch (err) {
+        warnParser(err);
+      }
+      const model = (parsed && parsed.model) || originalBody.model || 'unknown';
+      recordUsage(project, 'anthropic', model);
+      if (parsed && (parsed.usage || parsed.appliedEdits)) {
+        recordAnthropicUsage(project, 'anthropic', model, parsed.usage || {}, parsed.appliedEdits);
       }
     }
     resolve({ statusCode });
@@ -351,6 +368,7 @@ function forwardToOllama(messages, originalBody, res, project, savedTokens, opts
 
 module.exports = {
   routeRequest,
+  proxyAnthropicResponse,
   forwardToAnthropic,
   forwardToOpenAI,
   forwardToCodex,
