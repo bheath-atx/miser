@@ -26,7 +26,7 @@ function startEcho(handler) {
       const raw = Buffer.concat(chunks).toString('utf8');
       let parsed = null;
       try { parsed = JSON.parse(raw); } catch (_) {}
-      captured.push({ url: req.url, body: parsed, raw });
+      captured.push({ url: req.url, headers: req.headers, body: parsed, raw });
       const { status, body } = handler(parsed, req) || { status: 200, body: { ok: true } };
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body));
@@ -43,7 +43,7 @@ function startEcho(handler) {
 // Load a FRESH proxy/router/config with MISER_ANTHROPIC_URL pointed at the echo.
 function freshProxy(anthropicUrl, extraEnv = {}) {
   for (const k of Object.keys(require.cache)) {
-    if (/\/src\/(proxy|router|config|compress|stats|toolprune)\.js$/.test(k.replace(/\\/g, '/'))) {
+    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage)\.js$/.test(k.replace(/\\/g, '/'))) {
       delete require.cache[k];
     }
   }
@@ -255,7 +255,7 @@ test('/api/miser/stats returns 200 with the expected shape', async () => {
     assert.ok(payload.perTechnique.cacheHint);
     assert.ok(payload.perTechnique.toolPrune);
     assert.deepEqual(payload.perProject, {});
-    assert.deepEqual(Object.keys(payload.totals), ['inputTokensRemoved', 'cacheBillingDelta', 'appliedCount', 'toolsRemovedCount']);
+    assert.deepEqual(Object.keys(payload.totals), ['inputTokensRemoved', 'estRemovedTokens', 'cacheBillingDelta', 'appliedCount', 'toolsRemovedCount']);
   } finally {
     echo.server.close(); restoreEnv();
   }
@@ -297,6 +297,216 @@ test('/api/miser/quota still returns 200', async () => {
     await drive(createProxy, fakeReq('GET', '/api/miser/quota', null, {}), res);
     assert.equal(res.statusCode, 200);
     assert.doesNotThrow(() => JSON.parse(res.body()));
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 P1/C1: path project beats header project for attribution and injection', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { model: 'claude', usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_CONTEXT_EDIT_PROJECTS: JSON.stringify({ pathproj: true, headerproj: true }),
+  });
+  try {
+    const body = { model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] };
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('POST', '/p/pathproj/v1/messages', body, { 'x-termdeck-project': 'headerproj' }), res);
+    assert.equal(res.statusCode, 200);
+    assert.ok(echo.captured[0].body.context_management);
+    assert.match(echo.captured[0].headers['anthropic-beta'], /context-management-2025-06-27/);
+
+    const statsRes = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats?days=1', null, {}), statsRes);
+    const stats = JSON.parse(statsRes.body());
+    assert.ok(stats.usage.pathproj);
+    assert.ok(!stats.usage.headerproj);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 C1: default env performs zero mutation', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_CONTEXT_EDIT_PROJECTS: '' });
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('POST', '/p/alpha/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, {}), res);
+    assert.equal(res.statusCode, 200);
+    assert.ok(!('context_management' in echo.captured[0].body));
+    assert.ok(!echo.captured[0].headers['anthropic-beta']);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 C1: beta merge avoids duplicates and client context_management is never overridden', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_CONTEXT_EDIT_PROJECTS: JSON.stringify({ alpha: true }),
+  });
+  try {
+    const body = {
+      model: 'claude',
+      max_tokens: 50,
+      context_management: { edits: [] },
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('POST', '/p/alpha/v1/messages', body, {
+      'anthropic-beta': 'foo, context-management-2025-06-27',
+    }), res);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(echo.captured[0].body.context_management, { edits: [] });
+    assert.equal(echo.captured[0].headers['anthropic-beta'], 'foo, context-management-2025-06-27');
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 M1/C1: usage and applied_edits are captured from non-stream Anthropic JSON', async () => {
+  const echo = await startEcho(() => ({
+    status: 200,
+    body: {
+      model: 'claude-sonnet-4',
+      usage: {
+        input_tokens: 3,
+        output_tokens: 4,
+        cache_read_input_tokens: 5,
+        cache_creation: { ephemeral_1h_input_tokens: 6 },
+      },
+      context_management: {
+        applied_edits: [{ cleared_tool_uses: 2, cleared_input_tokens: 8000 }],
+      },
+    },
+  }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_CONTEXT_EDIT_PROJECTS: JSON.stringify({ alpha: true }),
+  });
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('POST', '/p/alpha/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, {}), res);
+    const statsRes = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats?days=1&project=alpha', null, {}), statsRes);
+    const stats = JSON.parse(statsRes.body());
+    assert.deepEqual(stats.usage.alpha.anthropic['claude-sonnet-4'], {
+      requests: 1,
+      input: 3,
+      output: 4,
+      cacheRead: 5,
+      cacheWrite1h: 6,
+    });
+    assert.deepEqual(stats.perProject.alpha.contextManagement, {
+      clearedToolUses: 2,
+      clearedInputTokens: 8000,
+      editCount: 1,
+    });
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 C1: injected non-429 non-2xx passes through and writes no usage stats', async () => {
+  const echo = await startEcho(() => ({
+    status: 400,
+    body: { error: { type: 'invalid_request_error' }, usage: { input_tokens: 99 } },
+  }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_CONTEXT_EDIT_PROJECTS: JSON.stringify({ alpha: true }),
+  });
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('POST', '/p/alpha/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, {}), res);
+    assert.equal(res.statusCode, 400);
+    assert.ok(echo.captured[0].body.context_management);
+
+    const statsRes = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats?days=1&project=alpha', null, {}), statsRes);
+    assert.deepEqual(JSON.parse(statsRes.body()).usage, {});
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 C1: injected 429 keeps failover behavior', async () => {
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: (messages, body, headers) => {
+        calls.push({ name: 'anthropic', body, headers });
+        const err = new Error('anthropic 429');
+        err.statusCode = 429;
+        return Promise.reject(err);
+      },
+      codex: (codexReq, bearer, res) => {
+        calls.push({ name: 'codex', codexReq, bearer });
+        res.writeHead(200, { 'x-miser-provider': 'codex' });
+        res.end();
+        return Promise.resolve();
+      },
+      ollama: () => { throw new Error('ollama must not be called'); },
+    },
+    getBearer: () => ({ token: 'fake', accountId: 'acct' }),
+    ollamaCap: 32000,
+  };
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_CONTEXT_EDIT_PROJECTS: JSON.stringify({ alpha: true }),
+  });
+  try {
+    const res = fakeRes();
+    await drive(() => createProxy(deps), fakeReq('POST', '/p/alpha/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, {}), res);
+    assert.deepEqual(calls.map(c => c.name), ['anthropic', 'codex']);
+    assert.ok(calls[0].body.context_management);
+    assert.equal(res.headers['x-miser-provider'], 'codex');
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 C1: breaker trips on 400,400,400 and disables later injection', async () => {
+  const echo = await startEcho(() => ({ status: 400, body: { error: 'bad beta' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_CONTEXT_EDIT_PROJECTS: JSON.stringify({ alpha: true }),
+  });
+  try {
+    for (let i = 0; i < 4; i++) {
+      const res = fakeRes();
+      await drive(createProxy, fakeReq('POST', '/p/alpha/v1/messages', {
+        model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: `hi ${i}` }],
+      }, {}), res);
+    }
+    assert.ok(echo.captured[0].body.context_management);
+    assert.ok(echo.captured[1].body.context_management);
+    assert.ok(echo.captured[2].body.context_management);
+    assert.ok(!echo.captured[3].body.context_management);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('v4 C1: breaker does not trip when 400s are reset by 2xx', async () => {
+  const statuses = [400, 200, 400, 200, 400, 200];
+  const echo = await startEcho(() => ({ status: statuses.shift(), body: { usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_CONTEXT_EDIT_PROJECTS: JSON.stringify({ alpha: true }),
+  });
+  try {
+    for (let i = 0; i < 6; i++) {
+      const res = fakeRes();
+      await drive(createProxy, fakeReq('POST', '/p/alpha/v1/messages', {
+        model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: `hi ${i}` }],
+      }, {}), res);
+    }
+    assert.equal(echo.captured.length, 6);
+    assert.ok(echo.captured.every(c => c.body.context_management));
   } finally {
     echo.server.close(); restoreEnv();
   }

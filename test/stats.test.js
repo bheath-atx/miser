@@ -52,6 +52,7 @@ test('recordStats persists across a simulated restart', () => {
     stats = freshStats(file);
     const result = stats.getStats('1');
     assert.equal(result.perProject.alpha.dedup.inputTokensRemoved, 12);
+    assert.equal(result.perProject.alpha.dedup.estRemovedTokens, 12);
     assert.equal(result.perProject.alpha.dedup.appliedCount, 1);
   } finally {
     cleanup(file, prevEnv);
@@ -197,6 +198,104 @@ test('stats keep byte-removed and cache-billing counters separate', () => {
     assert.equal(result.perProject.alpha.dedup.cacheBillingDelta, 0);
     assert.equal(result.perProject.alpha.cacheHint.inputTokensRemoved, 0);
     assert.equal(result.perProject.alpha.cacheHint.cacheBillingDelta, 13);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('v4 M2: recordAnthropicUsage writes sparse provider/model usage and weighted equivalents', () => {
+  const file = tmpStatsFile('usage');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const prevWarn = console.warn;
+  const warns = [];
+  console.warn = (line) => warns.push(String(line));
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-4', {
+      input_tokens: 10,
+      output_tokens: 2,
+      cache_read_input_tokens: 30,
+      cache_creation: {
+        ephemeral_5m_input_tokens: 4,
+        ephemeral_1h_input_tokens: 5,
+      },
+    });
+    const result = stats.getStats('1');
+    const bucket = result.usage.alpha.anthropic['claude-sonnet-4'];
+    assert.deepEqual(bucket, {
+      requests: 1,
+      input: 10,
+      output: 2,
+      cacheRead: 30,
+      cacheWrite5m: 4,
+      cacheWrite1h: 5,
+    });
+    assert.equal(result.weightedTokenEquivalents.total, 38);
+    assert.match(warns.join('\n'), /cacheWrite5m observed/);
+  } finally {
+    console.warn = prevWarn;
+    cleanup(file, prevEnv);
+  }
+});
+
+test('v4 M2: usage tree omits absent measurements instead of zero-filling', () => {
+  const file = tmpStatsFile('sparse');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'unknown', { output_tokens: 9 });
+    const bucket = stats.getStats('1').usage.alpha.anthropic.unknown;
+    assert.deepEqual(bucket, { requests: 1, output: 9 });
+    assert.ok(!('input' in bucket));
+    assert.ok(!('cacheRead' in bucket));
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('v4 M2: context_management.applied_edits aggregate per project', () => {
+  const file = tmpStatsFile('edits');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude', {}, [
+      { cleared_tool_uses: 2, cleared_input_tokens: 1000 },
+      { cleared_tool_use_count: 1, cleared_input_tokens: 2000 },
+    ]);
+    const result = stats.getStats('1');
+    assert.deepEqual(result.perProject.alpha.contextManagement, {
+      clearedToolUses: 3,
+      clearedInputTokens: 3000,
+      editCount: 2,
+    });
+    assert.deepEqual(result.usage, {});
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('v4 M2: real pre-v4 stats fixture loads byte-compatible and usage stays absent', () => {
+  const file = tmpStatsFile('legacy');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const fixture = {
+    [dayKey()]: {
+      alpha: {
+        dedup: { inputTokensRemoved: 10, cacheBillingDelta: 0, appliedCount: 1 },
+        cacheHint: { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0 },
+        toolPrune: { inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
+        likelyPollCount: 3,
+        workTurnCount: 4,
+      },
+    },
+  };
+  try {
+    fs.writeFileSync(file, JSON.stringify(fixture, null, 2), 'utf8');
+    const stats = freshStats(file);
+    assert.deepEqual(stats.loadStats(), fixture);
+    const result = stats.getStats('1');
+    assert.equal(result.perProject.alpha.dedup.inputTokensRemoved, 10);
+    assert.deepEqual(result.usage, {});
+    assert.ok(!('usage' in result.perProject.alpha));
   } finally {
     cleanup(file, prevEnv);
   }

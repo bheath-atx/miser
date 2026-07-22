@@ -7,8 +7,12 @@ const { getAllUsage } = require('./quota.js');
 const { recordStats, getStats } = require('./stats.js');
 const { pruneTools } = require('./toolprune.js');
 const config = require('./config.js');
+const { classifyRoute } = require('./routing.js');
+const { injectContextManagement } = require('./context-management.js');
 
 const projectFingerprints = new Map();
+const contextBreaker = new Map();
+const contextDisabled = new Set();
 const COMPACT_HEADER_NAMES = [
   'x-miser-input-tokens-est',
   'x-miser-poll-class',
@@ -134,6 +138,34 @@ function suppressCompactHeadersOnErrors(res) {
   };
 }
 
+function headerProject(headers) {
+  const raw = headers['x-termdeck-project'];
+  if (Array.isArray(raw)) return raw[0] || 'default';
+  return raw || 'default';
+}
+
+function contextProjectConfig() {
+  const projects = {};
+  for (const [project, knobs] of Object.entries(config.contextEditProjects || {})) {
+    if (!contextDisabled.has(project)) projects[project] = knobs;
+  }
+  return projects;
+}
+
+function updateContextBreaker(project, injected, statusCode) {
+  if (!injected) return;
+  if (statusCode === 400) {
+    const next = (contextBreaker.get(project) || 0) + 1;
+    contextBreaker.set(project, next);
+    if (next >= 3 && !contextDisabled.has(project)) {
+      contextDisabled.add(project);
+      console.warn(`[miser] context-management disabled project=${project} reason=three-consecutive-400`);
+    }
+    return;
+  }
+  contextBreaker.set(project, 0);
+}
+
 // `deps` is an OPTIONAL injectable seam forwarded verbatim to routeRequest()
 // (transports / getBearer / ollamaCap). Production callers pass nothing, so
 // routeRequest falls back to its real transports. The offline test harness uses
@@ -141,25 +173,27 @@ function suppressCompactHeadersOnErrors(res) {
 // sockets. Never populated on the production path.
 function createProxy(deps = {}) {
   return async function handler(req, res) {
+    const route = classifyRoute(req.method, req.url);
+
     // Health check
-    if (req.method === 'GET' && req.url === '/api/miser/health') {
+    if (route.kind === 'health') {
       json(res, 200, { ok: true, port: config.port, cacheHint: config.cacheHint });
       return;
     }
 
     // Quota dashboard
-    if (req.method === 'GET' && req.url === '/api/miser/quota') {
+    if (route.kind === 'quota') {
       json(res, 200, getAllUsage());
       return;
     }
 
     // Persisted optimizer stats
-    if (req.method === 'GET' && req.url.startsWith('/api/miser/stats')) {
+    if (route.kind === 'stats') {
       const url = new URL(req.url, 'http://localhost');
       const daysParam = url.searchParams.get('days');
       const projectFilter = url.searchParams.get('project') || undefined;
       try {
-        const result = getStats(daysParam !== null ? daysParam : undefined, projectFilter);
+        const result = getStats(daysParam !== null ? daysParam : undefined, projectFilter, config.weightedTokenWeights);
         json(res, 200, result);
       } catch (err) {
         json(res, err.statusCode || 500, { error: { type: 'stats_error', message: err.message } });
@@ -167,20 +201,18 @@ function createProxy(deps = {}) {
       return;
     }
 
-    // Route: Anthropic Messages API or OpenAI Chat Completions
-    const isAnthropic = req.method === 'POST' && req.url.startsWith('/v1/messages');
-    const isOpenAI    = req.method === 'POST' && req.url.startsWith('/v1/chat/completions');
-
-    if (!isAnthropic && !isOpenAI) {
+    if (route.kind !== 'messages') {
       json(res, 404, { error: { type: 'not_found', message: `miser: unknown route ${req.url}` } });
       return;
     }
 
+    let project = 'default';
+    let c1Injected = false;
     try {
       const raw = await readBody(req);
       const originalBody = JSON.parse(raw);
-      const project = req.headers['x-termdeck-project'] || 'default';
-      const format = isOpenAI ? 'openai' : 'anthropic';
+      project = route.project || headerProject(req.headers);
+      const format = route.format;
 
       // compress() v2 is LOSSLESS: it returns the REDUCED body (hoisted system,
       // optional cache hint, deduped messages). NO threshold gate, NO synthetic
@@ -220,7 +252,6 @@ function createProxy(deps = {}) {
 
       recordStats(project, {
         inputTokensRemoved: savedTokens,
-        cacheBillingDelta: 0,
         toolsRemoved,
         pollClass: compactHeaders['x-miser-poll-class'],
         techniques: {
@@ -230,10 +261,25 @@ function createProxy(deps = {}) {
         },
       });
 
+      let forwardBody = prunedBody;
+      let forwardHeaders = req.headers;
+      if (format === 'anthropic') {
+        const injected = injectContextManagement(prunedBody, req.headers, project, contextProjectConfig());
+        forwardBody = injected.body;
+        forwardHeaders = injected.headers;
+        c1Injected = injected.injected;
+        if (c1Injected) console.log(`[miser] c1-injected project=${project}`);
+      }
+
       // Forward the REDUCED body (I6) — every leg serializes THIS body, so the
       // hoisted top-level `system` and any cache hint reach the wire on all legs.
-      await routeRequest(messages, prunedBody, req.headers, res, project, savedTokens, format, deps);
+      await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format, deps);
+      if (c1Injected && (res.statusCode < 200 || res.statusCode >= 300)) {
+        console.warn(`[miser] c1-injected non-2xx project=${project} status=${res.statusCode}`);
+      }
+      updateContextBreaker(project, c1Injected, res.statusCode);
     } catch (err) {
+      updateContextBreaker(project, c1Injected, undefined);
       console.error('[miser] error:', err.message);
       if (!res.headersSent) {
         json(res, 500, { error: { type: 'proxy_error', message: err.message } });
@@ -242,4 +288,4 @@ function createProxy(deps = {}) {
   };
 }
 
-module.exports = { createProxy, computeCompactHeaders };
+module.exports = { createProxy, computeCompactHeaders, __test: { contextBreaker, contextDisabled } };

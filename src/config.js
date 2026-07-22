@@ -1,5 +1,9 @@
 'use strict';
 
+const { parseContextEditProjects } = require('./context-management.js');
+
+const contextEditConfig = parseContextEditProjects(process.env.MISER_CONTEXT_EDIT_PROJECTS || '');
+
 module.exports = {
   port: parseInt(process.env.MISER_PORT || '20128', 10),
   // compress() v2 is LOSSLESS: no size/token ceiling gates the primary forward
@@ -32,6 +36,14 @@ module.exports = {
   },
   compactHintUrgentFraction: parseFloat(process.env.COMPACT_HINT_URGENT_FRACTION ?? '0.70'),
   compactHintRecommendFraction: parseFloat(process.env.COMPACT_HINT_RECOMMEND_FRACTION ?? '0.40'),
+  contextEditProjects: contextEditConfig.projects,
+  weightedTokenWeights: {
+    input: parseFloat(process.env.MISER_WEIGHT_INPUT ?? '1.0'),
+    cacheRead: parseFloat(process.env.MISER_WEIGHT_CACHE_READ ?? '0.1'),
+    cacheWrite5m: parseFloat(process.env.MISER_WEIGHT_CACHE_WRITE_5M ?? '1.25'),
+    cacheWrite1h: parseFloat(process.env.MISER_WEIGHT_CACHE_WRITE_1H ?? '2.0'),
+    output: parseFloat(process.env.MISER_WEIGHT_OUTPUT ?? '5.0'),
+  },
   modelWindows: {
     'claude-opus': 1_000_000,
     'claude-sonnet': 200_000,
