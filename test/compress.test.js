@@ -22,6 +22,7 @@ const {
   messageTokens,
   validateMessageIntegrity,
   normalizeAnthropicBody,
+  requestCarriesClientCache,
   MIN_KEEP,
   __test,
 } = require('../src/compress.js');
@@ -132,6 +133,66 @@ test('AC1: 200K request with heavy duplicate tool_results is deduped + forwarded
   assert.equal(result.messages[10].content[0].content, dup);
   assert.ok(result.tokens < result.rawTokens);
   assert.ok(validateMessageIntegrity(result.messages).valid);
+});
+
+function assertDedupSkippedForCacheControl(name, patchBody) {
+  test(`v4 S1: Anthropic dedup skips when client cache_control is present at ${name}`, () => {
+    const dup = 'CACHE-SAFE-DUP-' + 'z'.repeat(400);
+    const body = patchBody({ messages: bigDuplicateTranscript(dup, 'unique') });
+    const result = compress(body);
+    assert.equal(requestCarriesClientCache(result.body), true);
+    assert.equal(result.messages[2].content[0].content, dup);
+    assert.equal(result.messages[10].content[0].content, dup);
+    assert.equal(result.tokens, result.rawTokens);
+  });
+}
+
+assertDedupSkippedForCacheControl('top-level body.cache_control', body => ({
+  ...body,
+  cache_control: { type: 'ephemeral' },
+}));
+
+assertDedupSkippedForCacheControl('system[] block', body => ({
+  ...body,
+  system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }],
+}));
+
+assertDedupSkippedForCacheControl('messages[].content[] block', body => {
+  const messages = body.messages.map((m, i) => {
+    if (i !== 0) return m;
+    return { ...m, content: [{ type: 'text', text: 'FIRST TASK', cache_control: { type: 'ephemeral' } }] };
+  });
+  return { ...body, messages };
+});
+
+assertDedupSkippedForCacheControl('tools[] entry', body => ({
+  ...body,
+  tools: [{ name: 'Read', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral' } }],
+}));
+
+test('v4 S1: Anthropic dedup still runs without client cache_control', () => {
+  const dup = 'NO-CACHE-DUP-' + 'n'.repeat(400);
+  const result = compress({ messages: bigDuplicateTranscript(dup, 'unique') });
+  assert.equal(requestCarriesClientCache(result.body), false);
+  assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+  assert.equal(result.messages[10].content[0].content, dup);
+});
+
+test('v4 S1: MISER_DEDUP_FORCE=1 restores Anthropic dedup with client cache_control', () => {
+  const prev = process.env.MISER_DEDUP_FORCE;
+  try {
+    process.env.MISER_DEDUP_FORCE = '1';
+    const dup = 'FORCE-DUP-' + 'f'.repeat(400);
+    const result = compress({
+      cache_control: { type: 'ephemeral' },
+      messages: bigDuplicateTranscript(dup, 'unique'),
+    });
+    assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+    assert.equal(result.messages[10].content[0].content, dup);
+  } finally {
+    if (prev === undefined) delete process.env.MISER_DEDUP_FORCE;
+    else process.env.MISER_DEDUP_FORCE = prev;
+  }
 });
 
 // ===========================================================================
