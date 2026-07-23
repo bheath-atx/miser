@@ -59,12 +59,9 @@ function createLedger(filePath, nowFn = () => new Date()) {
       console.warn(`[miser/alert-ledger] WARN corrupt ledger file ${file}; starting empty`);
     }
   } catch (err) {
-    if (err.code !== 'ENOENT') {
-      // Non-ENOENT errors (disk failure, permission) → warn + empty ledger.
-      // ENOENT is a clean start (no prior alerts this day) — intentionally silent.
-      console.warn(`[miser/alert-ledger] WARN ledger load failed (${err.message}); starting empty`);
-    }
-    // ENOENT: clean start, no warning needed.
+    // Missing or unreadable file → empty ledger + one warning (spec §3 / AC7).
+    // Worst case on ENOENT: one duplicate alert on restart (acceptable per spec).
+    console.warn(`[miser/alert-ledger] WARN ledger load failed (${err.message}); starting empty`);
   }
   prune();
 

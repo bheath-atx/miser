@@ -120,14 +120,15 @@ test('non-object ledger JSON (array) → warning + empty ledger', () => {
   }
 });
 
-test('missing file is a clean start (no warning)', () => {
+test('missing file emits one warning and starts empty (spec §3 / AC7)', () => {
   const file = tmpLedgerFile('missing');
   const prevWarn = console.warn;
   const warns = [];
   console.warn = (line) => warns.push(String(line));
   try {
     const ledger = createLedger(file, () => new Date('2026-07-23T12:00:00Z'));
-    assert.equal(warns.length, 0);
+    assert.equal(warns.length, 1);
+    assert.ok(warns[0].includes('ledger load failed'), `expected load-failed warn, got: ${warns[0]}`);
     assert.equal(ledger.shouldSend('k'), true);
   } finally {
     console.warn = prevWarn;
