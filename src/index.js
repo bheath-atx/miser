@@ -7,6 +7,7 @@ const os = require('node:os');
 const { createProxy } = require('./proxy.js');
 const { flushNow, getRawStatsSnapshot } = require('./stats.js');
 const { startDailyRollupInterval } = require('./daily-rollup.js');
+const { buildGuardDeps } = require('./budgets.js');
 const config = require('./config.js');
 
 // --- Single-instance advisory lock -----------------------------------------
@@ -45,7 +46,12 @@ try {
   }
 } catch (_) { /* no lockfile = clean start */ }
 
-const server = http.createServer(createProxy());
+// Sprint B guardrail wiring (normative §2.5, assembled by buildGuardDeps):
+// ledger creation is CONDITIONAL — when both MISER_BUDGETS and MISER_POLICY
+// are OFF, no ledger I/O happens at startup and guardDeps stays empty (zero
+// overhead). checkContextBloat is only wired when MISER_POLICY is active.
+const guardDeps = buildGuardDeps(config);
+const server = http.createServer(createProxy({ guardDeps }));
 startDailyRollupInterval(getRawStatsSnapshot);
 
 server.listen(config.port, '127.0.0.1', () => {
@@ -57,6 +63,7 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log(`[miser] ollama url: ${config.ollamaUrl}`);
   console.log(`[miser] fallback models: ${config.fallbackModels.join(', ')}`);
   console.log(`[miser] env: MISER_PRICING_JSON=${process.env.MISER_PRICING_JSON ? 'set' : 'unset'} MISER_PKACHU_TOKEN=${process.env.MISER_PKACHU_TOKEN ? 'set' : 'unset'} MISER_PKACHU_ENDPOINT=${process.env.MISER_PKACHU_ENDPOINT ? 'set' : 'unset'}`);
+  console.log(`[miser] guardrails: budgets ${config.budgets ? `ON (${Object.keys(config.budgets).length} project(s))` : 'OFF'}; policy watchdog ${config.policy ? `ON (${Object.keys(config.policy).length} project(s))` : 'OFF'}`);
   console.log(`[miser] health: GET http://127.0.0.1:${config.port}/api/miser/health`);
   console.log(`[miser] quota:  GET http://127.0.0.1:${config.port}/api/miser/quota`);
   console.log(`[miser] trend:  GET http://127.0.0.1:${config.port}/api/miser/stats/trend`);

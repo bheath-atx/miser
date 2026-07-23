@@ -59,13 +59,32 @@ function historyCost(stats, project, today) {
   return daysWithData >= 3 ? total : null;
 }
 
+// Sprint B: guardrail rollup fields, appended only when nonzero (sparse).
+function guardrailSuffix(projectData) {
+  const blocked = (projectData.budget && projectData.budget.blockedCount) || 0;
+  const drift = (projectData.policy && projectData.policy.modelDriftCount) || 0;
+  const bloat = (projectData.policy && projectData.policy.contextBloatCount) || 0;
+  let out = '';
+  if (blocked > 0) out += ` blocked:${blocked}`;
+  if (drift > 0) out += ` drift:${drift}`;
+  if (bloat > 0) out += ` bloat:${bloat}`;
+  return out;
+}
+
 function buildRollupText(stats, now = new Date()) {
   const today = dayKey(now);
   const todayData = stats[today] || {};
   const rows = [];
 
   for (const [project, projectData] of Object.entries(todayData)) {
-    if (!projectData || !projectData.usage) continue;
+    if (!projectData) continue;
+    const guard = guardrailSuffix(projectData);
+    if (!projectData.usage) {
+      // Guardrail-only project (no Anthropic usage): line only when any
+      // guardrail count is nonzero; no token fields — no usage data.
+      if (guard) rows.push({ project, anthropicEstCostUSD: 0, line: `${project}: $0.00${guard}` });
+      continue;
+    }
     const anthropicEstCostUSD = computeCost(projectData.usage);
     const totals = usageTotals(projectData.usage);
     const baseline = historyCost(stats, project, now);
@@ -75,7 +94,7 @@ function buildRollupText(stats, now = new Date()) {
     rows.push({
       project,
       anthropicEstCostUSD,
-      line: `${project}: $${anthropicEstCostUSD.toFixed(2)} (${formatK(totals.input)} input / ${formatK(totals.output)} output / ${formatK(totals.cacheRead)} cacheRead tokens)${anomaly}`,
+      line: `${project}: $${anthropicEstCostUSD.toFixed(2)} (${formatK(totals.input)} input / ${formatK(totals.output)} output / ${formatK(totals.cacheRead)} cacheRead tokens)${anomaly}${guard}`,
     });
   }
 
@@ -145,6 +164,24 @@ async function emitDailyRollup(stats, pkachu = postPkachu, opts = {}) {
   }
 }
 
+// Shared alert dispatcher (Sprint B §2.5) — the single outbound path for
+// guardrail alerts. Reads env + token on EVERY call (consistent with
+// emitDailyRollup; the token file may rotate). NEVER throws: pkachu failure
+// logs one warn per call (the alert ledger already guarantees at most one
+// call per key per UTC day). Callers invoke it fire-and-forget via
+// Promise.resolve().then(() => sendAlert(text)).catch(() => {}).
+async function sendAlert(text) {
+  const endpoint = process.env.MISER_PKACHU_ENDPOINT;
+  const tokenPath = process.env.MISER_PKACHU_TOKEN;
+  if (!endpoint || !tokenPath) return; // silently skip if not configured
+  try {
+    const token = await readToken(tokenPath);
+    await postPkachu(endpoint, token, text);
+  } catch (err) {
+    console.warn(`[miser/alert] WARN alert send failed: ${err.message}`);
+  }
+}
+
 function shouldEmitNow(now = new Date()) {
   return now.getUTCHours() === 0 && now.getUTCMinutes() < 2;
 }
@@ -170,6 +207,7 @@ module.exports = {
   buildRollupText,
   emitDailyRollup,
   postPkachu,
+  sendAlert,
   shouldEmitNow,
   startDailyRollupInterval,
 };

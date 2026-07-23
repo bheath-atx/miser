@@ -1,6 +1,8 @@
 'use strict';
 
 const { parseContextEditProjects } = require('./context-management.js');
+const { parseBudgets, parseBudgetGrace } = require('./budgets.js');
+const { parsePolicy } = require('./policy-watchdog.js');
 
 const contextEditConfig = parseContextEditProjects(process.env.MISER_CONTEXT_EDIT_PROJECTS || '');
 
@@ -37,6 +39,12 @@ module.exports = {
   compactHintUrgentFraction: parseFloat(process.env.COMPACT_HINT_URGENT_FRACTION ?? '0.70'),
   compactHintRecommendFraction: parseFloat(process.env.COMPACT_HINT_RECOMMEND_FRACTION ?? '0.40'),
   contextEditProjects: contextEditConfig.projects,
+  // Sprint B guardrails (fail-closed-to-OFF: null ↔ feature fully OFF).
+  // G3 per-project daily USD budget caps + grace list; B6 policy watchdog.
+  // Parsers warn at startup only when the relevant env var is actually set.
+  budgets: parseBudgets(process.env.MISER_BUDGETS || ''),
+  budgetGrace: parseBudgetGrace(process.env.MISER_BUDGET_GRACE || ''),
+  policy: parsePolicy(process.env.MISER_POLICY || ''),
   weightedTokenWeights: {
     input: parseFloat(process.env.MISER_WEIGHT_INPUT ?? '1.0'),
     cacheRead: parseFloat(process.env.MISER_WEIGHT_CACHE_READ ?? '0.1'),

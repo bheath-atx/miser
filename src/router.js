@@ -52,6 +52,9 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   const transports = { ...base.transports, ...(deps.transports || {}) };
   const getBearer = deps.getBearer || base.getBearer;
   const ollamaCap = deps.ollamaCap != null ? deps.ollamaCap : base.ollamaCap;
+  // Sprint B: guardrail deps ride along to the Anthropic leg only (B6 context
+  // bloat consumes MEASURED usage, which only the Anthropic leg captures).
+  const guardDeps = deps.guardDeps;
 
   if (format === 'openai') {
     // Already-OpenAI-format request: passthrough, Ollama on 429. (Unchanged
@@ -75,7 +78,7 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
 
   // --- Anthropic path ------------------------------------------------------
   try {
-    await transports.anthropic(messages, originalBody, incomingHeaders, res, project, savedTokens);
+    await transports.anthropic(messages, originalBody, incomingHeaders, res, project, savedTokens, guardDeps);
     return;
   } catch (err) {
     incrementLegError('anthropic');
@@ -133,7 +136,7 @@ function teardownResponse(res, err) {
   } catch (_) { /* best effort */ }
 }
 
-function proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject) {
+function proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject, guardDeps) {
   const statusCode = upstream.statusCode;
   const contentType = upstream.headers['content-type'] || 'application/json';
   const parser = new AnthropicUsageParser({
@@ -177,13 +180,23 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, savedToken
       if (parsed && (parsed.usage || parsed.appliedEdits)) {
         recordAnthropicUsage(project, 'anthropic', model, parsed.usage || {}, parsed.appliedEdits);
       }
+      // B6 context bloat (Sprint B §2.2): fire-and-forget, exception-isolated,
+      // never delays resolve(). guardDeps.checkContextBloat is only present
+      // when MISER_POLICY is active (index.js wiring) — with G3-only or
+      // guardrails-OFF this guard is false and zero bloat code runs. Legs with
+      // no usage capture pass null and checkContextBloat returns immediately.
+      if (guardDeps && guardDeps.checkContextBloat) {
+        Promise.resolve()
+          .then(() => guardDeps.checkContextBloat(project, model, parsed && parsed.usage, guardDeps))
+          .catch(e => console.warn('[miser] bloat check error:', e.message));
+      }
     }
     resolve({ statusCode });
   });
   upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
 }
 
-function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens) {
+function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens, guardDeps) {
   return new Promise((resolve, reject) => {
     // I6: `originalBody` here IS the reduced body compress() produced (hoisted
     // system, optional cache hint, deduped messages). Serialize it verbatim —
@@ -224,7 +237,7 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
         return;
       }
 
-      proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject);
+      proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject, guardDeps);
     });
 
     req.on('error', reject);
