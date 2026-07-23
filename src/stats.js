@@ -470,18 +470,25 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
       // Sprint B guardrail aggregation across the days window (sparse):
       // blockedCount / drift / bloat counts summed; firstBlockedAt = EARLIEST
       // ISO timestamp across all days in the window.
-      if (projData.budget && typeof projData.budget === 'object') {
+      // Sparse contract (§2.3): only emit budget node when blockedCount > 0,
+      // only emit policy node when at least one count > 0. Never fabricate zeroes.
+      if (projData.budget && typeof projData.budget === 'object'
+          && (projData.budget.blockedCount || 0) > 0) {
         if (!target.budget) target.budget = { blockedCount: 0 };
-        target.budget.blockedCount += projData.budget.blockedCount || 0;
+        target.budget.blockedCount += projData.budget.blockedCount;
         const first = projData.budget.firstBlockedAt;
         if (typeof first === 'string' && (!target.budget.firstBlockedAt || first < target.budget.firstBlockedAt)) {
           target.budget.firstBlockedAt = first;
         }
       }
       if (projData.policy && typeof projData.policy === 'object') {
-        if (!target.policy) target.policy = { modelDriftCount: 0, contextBloatCount: 0 };
-        target.policy.modelDriftCount += projData.policy.modelDriftCount || 0;
-        target.policy.contextBloatCount += projData.policy.contextBloatCount || 0;
+        const dc = projData.policy.modelDriftCount || 0;
+        const bc = projData.policy.contextBloatCount || 0;
+        if (dc > 0 || bc > 0) {
+          if (!target.policy) target.policy = { modelDriftCount: 0, contextBloatCount: 0 };
+          target.policy.modelDriftCount += dc;
+          target.policy.contextBloatCount += bc;
+        }
       }
     }
   }

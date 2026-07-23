@@ -96,14 +96,14 @@ function dispatchAlert(sendAlert, text) {
   Promise.resolve().then(() => send(text)).catch(() => {});
 }
 
-// Sum of measured Anthropic-leg .requests across all provider→model buckets.
+// Sum of measured Anthropic-leg .requests — anthropic provider only (§1.5).
+// Consistent with computeCost which also filters to provider === 'anthropic'.
 function requestsToday(usageTree) {
   let total = 0;
-  for (const models of Object.values(usageTree || {})) {
-    if (!models || typeof models !== 'object') continue;
-    for (const bucket of Object.values(models)) {
-      if (bucket && Number.isFinite(bucket.requests)) total += bucket.requests;
-    }
+  const anthropicModels = (usageTree || {}).anthropic;
+  if (!anthropicModels || typeof anthropicModels !== 'object') return 0;
+  for (const bucket of Object.values(anthropicModels)) {
+    if (bucket && Number.isFinite(bucket.requests)) total += bucket.requests;
   }
   return total;
 }
