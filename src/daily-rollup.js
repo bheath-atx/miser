@@ -126,7 +126,10 @@ async function emitDailyRollup(stats, pkachu = postPkachu, opts = {}) {
 
   const endpoint = process.env.MISER_PKACHU_ENDPOINT;
   const tokenPath = process.env.MISER_PKACHU_TOKEN;
-  if (!endpoint || !tokenPath) return { emitted: false, reason: 'no_env' };
+  if (!endpoint || !tokenPath) {
+    console.warn('[miser/rollup] WARN daily rollup skipped: MISER_PKACHU_TOKEN or MISER_PKACHU_ENDPOINT not set');
+    return { emitted: false, reason: 'no_env' };
+  }
 
   const text = buildRollupText(stats || {}, now);
   if (!text) return { emitted: false, reason: 'no_data' };
@@ -148,13 +151,16 @@ function shouldEmitNow(now = new Date()) {
 
 function startDailyRollupInterval(getStatsSnapshot, opts = {}) {
   const intervalMs = opts.intervalMs || 60000;
-  const timer = setInterval(() => {
+  function tryEmit() {
     const now = new Date();
     if (!shouldEmitNow(now)) return;
     Promise.resolve()
       .then(() => emitDailyRollup(getStatsSnapshot(), undefined, { now }))
       .catch((err) => console.warn(`[miser/rollup] WARN daily rollup skipped: ${err.message}`));
-  }, intervalMs);
+  }
+  // Immediate check on startup so process starting within the midnight window doesn't miss it.
+  tryEmit();
+  const timer = setInterval(tryEmit, intervalMs);
   if (typeof timer.unref === 'function') timer.unref();
   return timer;
 }
