@@ -1,7 +1,16 @@
 'use strict';
 
 // Source snapshot: Anthropic pricing docs, https://docs.anthropic.com/en/docs/about-claude/pricing
-// Verified 2026-07-23. Values are USD per million tokens.
+// Pinned 2026-07-22; re-verified unchanged 2026-07-23. Values are USD per million tokens.
+// Dated API response model IDs (e.g. claude-haiku-4-5-20251001) are aliased to the base ID so
+// priceForModel() never falls through to the * fallback for known models.
+const _HAIKU_4_5 = Object.freeze({
+  inputPerMTok: 1.000000,
+  outputPerMTok: 5.000000,
+  cacheReadPerMTok: 0.100000,
+  cacheWrite5mPerMTok: 1.250000,
+  cacheWrite1hPerMTok: 2.000000,
+});
 const DEFAULT_PRICING = Object.freeze({
   'claude-sonnet-4-6': Object.freeze({
     inputPerMTok: 3.000000,
@@ -17,13 +26,8 @@ const DEFAULT_PRICING = Object.freeze({
     cacheWrite5mPerMTok: 6.250000,
     cacheWrite1hPerMTok: 10.000000,
   }),
-  'claude-haiku-4-5': Object.freeze({
-    inputPerMTok: 1.000000,
-    outputPerMTok: 5.000000,
-    cacheReadPerMTok: 0.100000,
-    cacheWrite5mPerMTok: 1.250000,
-    cacheWrite1hPerMTok: 2.000000,
-  }),
+  'claude-haiku-4-5': _HAIKU_4_5,
+  'claude-haiku-4-5-20251001': _HAIKU_4_5,
   '*': Object.freeze({
     inputPerMTok: 3.000000,
     outputPerMTok: 15.000000,
