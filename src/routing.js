@@ -26,6 +26,7 @@ function classifyRoute(method, reqUrl) {
 
   if (method === 'GET' && pathname === '/api/miser/health') return { kind: 'health' };
   if (method === 'GET' && pathname === '/api/miser/quota') return { kind: 'quota' };
+  if (method === 'GET' && pathname === '/api/miser/stats/trend') return { kind: 'stats_trend' };
   if (method === 'GET' && pathname === '/api/miser/stats') return { kind: 'stats' };
 
   if (method === 'POST' && pathname === '/v1/messages') return { kind: 'messages', format: 'anthropic' };

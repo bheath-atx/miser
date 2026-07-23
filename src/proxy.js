@@ -2,9 +2,15 @@
 
 const crypto = require('node:crypto');
 const { compress } = require('./compress.js');
-const { routeRequest } = require('./router.js');
+const { routeRequest, getLegErrors } = require('./router.js');
 const { getAllUsage } = require('./quota.js');
-const { recordStats, getStats } = require('./stats.js');
+const {
+  recordStats,
+  getStats,
+  getDailyTrend,
+  getFlushLagMs,
+  getPendingWriteCount,
+} = require('./stats.js');
 const { pruneTools } = require('./toolprune.js');
 const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
@@ -13,6 +19,7 @@ const { injectContextManagement } = require('./context-management.js');
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
 const contextDisabled = new Set();
+const _reqTimestamps = [];
 const COMPACT_HEADER_NAMES = [
   'x-miser-input-tokens-est',
   'x-miser-poll-class',
@@ -170,6 +177,17 @@ function shouldRecordInjectedStats(statusCode) {
   return Number.isFinite(statusCode) && statusCode >= 200 && statusCode < 300;
 }
 
+function trackRequest(now = Date.now()) {
+  _reqTimestamps.push(now);
+  while (_reqTimestamps.length > 3600) _reqTimestamps.shift();
+}
+
+function reqPerMin(now = Date.now()) {
+  const cutoff = now - 60000;
+  while (_reqTimestamps.length > 0 && _reqTimestamps[0] < cutoff) _reqTimestamps.shift();
+  return _reqTimestamps.length;
+}
+
 // `deps` is an OPTIONAL injectable seam forwarded verbatim to routeRequest()
 // (transports / getBearer / ollamaCap). Production callers pass nothing, so
 // routeRequest falls back to its real transports. The offline test harness uses
@@ -177,11 +195,20 @@ function shouldRecordInjectedStats(statusCode) {
 // sockets. Never populated on the production path.
 function createProxy(deps = {}) {
   return async function handler(req, res) {
+    trackRequest();
     const route = classifyRoute(req.method, req.url);
 
     // Health check
     if (route.kind === 'health') {
-      json(res, 200, { ok: true, port: config.port, cacheHint: config.cacheHint });
+      json(res, 200, {
+        ok: true,
+        uptimeSecs: Math.floor(process.uptime()),
+        reqPerMin: reqPerMin(),
+        perLegErrors: getLegErrors(),
+        c1DisabledProjects: [...contextDisabled],
+        statsFlushLagMs: getFlushLagMs(),
+        pendingWrites: getPendingWriteCount(),
+      });
       return;
     }
 
@@ -199,6 +226,19 @@ function createProxy(deps = {}) {
       try {
         const result = getStats(daysParam !== null ? daysParam : undefined, projectFilter, config.weightedTokenWeights);
         json(res, 200, result);
+      } catch (err) {
+        json(res, err.statusCode || 500, { error: { type: 'stats_error', message: err.message } });
+      }
+      return;
+    }
+
+    if (route.kind === 'stats_trend') {
+      const url = new URL(req.url, 'http://localhost');
+      const daysParam = url.searchParams.get('days');
+      const projectFilter = url.searchParams.get('project') || undefined;
+      try {
+        const result = getDailyTrend(daysParam !== null ? daysParam : undefined, projectFilter);
+        json(res, 200, { ok: true, ...result });
       } catch (err) {
         json(res, err.statusCode || 500, { error: { type: 'stats_error', message: err.message } });
       }
@@ -297,4 +337,8 @@ function createProxy(deps = {}) {
   };
 }
 
-module.exports = { createProxy, computeCompactHeaders, __test: { contextBreaker, contextDisabled } };
+module.exports = {
+  createProxy,
+  computeCompactHeaders,
+  __test: { contextBreaker, contextDisabled, _reqTimestamps, trackRequest, reqPerMin },
+};
