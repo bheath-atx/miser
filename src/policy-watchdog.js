@@ -34,6 +34,11 @@ function parsePolicy(env) {
       console.warn(`[miser/policy] WARN invalid project name ${JSON.stringify(project)}; policy ignored`);
       continue;
     }
+    // Reject prototype-poisoning keys that pass P1 grammar (e.g. "__proto__").
+    if (project === '__proto__' || project === 'constructor' || project === 'prototype') {
+      console.warn(`[miser/policy] WARN reserved key ${JSON.stringify(project)}; policy ignored`);
+      continue;
+    }
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       console.warn(`[miser/policy] WARN project ${project}: policy must be an object; ignored`);
       continue;

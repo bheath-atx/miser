@@ -60,8 +60,11 @@ function createLedger(filePath, nowFn = () => new Date()) {
     }
   } catch (err) {
     if (err.code !== 'ENOENT') {
+      // Non-ENOENT errors (disk failure, permission) → warn + empty ledger.
+      // ENOENT is a clean start (no prior alerts this day) — intentionally silent.
       console.warn(`[miser/alert-ledger] WARN ledger load failed (${err.message}); starting empty`);
     }
+    // ENOENT: clean start, no warning needed.
   }
   prune();
 

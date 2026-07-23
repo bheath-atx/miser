@@ -35,6 +35,11 @@ function parseBudgets(env) {
       console.warn(`[miser/budgets] WARN invalid project name ${JSON.stringify(project)}; budget ignored`);
       continue;
     }
+    // Reject prototype-poisoning keys that pass P1 grammar (e.g. "__proto__").
+    if (project === '__proto__' || project === 'constructor' || project === 'prototype') {
+      console.warn(`[miser/budgets] WARN reserved key ${JSON.stringify(project)}; budget ignored`);
+      continue;
+    }
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       console.warn(`[miser/budgets] WARN project ${project}: budget must be an object; ignored`);
       continue;
@@ -169,7 +174,7 @@ function checkBudget(project, guardDeps = {}) {
       dispatchAlert(sendAlert, `⛔ miser budget: ${project} EXHAUSTED $${spend.toFixed(2)}/$${dailyUSD.toFixed(2)}${suffix}`);
     }
     if (grace) return null; // grace-listed: alerts only, never the 429
-    recordBudgetBlock(project, nowFn);
+    recordBudgetBlock(project, () => now); // pass captured now — single clock read, no midnight split
     return buildBlockResponse(project, spend, dailyUSD, now);
   }
 
