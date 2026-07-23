@@ -97,6 +97,38 @@ Malformed config, unknown keys, invalid project names, and out-of-bounds values 
 
 ---
 
+## Guardrails (Sprint B)
+
+Two opt-in guardrails, both consuming the measured usage layer. Both are OFF by default (`null`-as-OFF: unset or malformed env → feature fully off, zero overhead, one startup warning if the env var was set but invalid). Neither ever mutates a forwarded request body or header.
+
+### G3 — per-project daily USD budget caps (the ONLY blocking feature)
+
+```bash
+MISER_BUDGETS='{"pkachu":{"dailyUSD":5},"aetheria":{"dailyUSD":10}}'
+MISER_BUDGET_GRACE='["aetheria"]'   # at/over cap: alert only, never block
+```
+
+- `dailyUSD` must be a finite number in `[0.01, 10000]` and the only key; invalid project entries are ignored with a warning (fail-open per project — miser never blocks on config it does not fully understand).
+- State per project per UTC day: `UNDER → WARNED (≥80%, one pkachu warn alert) → CAPPED (one cap alert, then 429 block until UTC midnight)`. Alerts are deduped once per project per type per day via a persisted ledger (`MISER_ALERT_LEDGER_FILE`, default `~/.miser-alert-ledger.json`).
+- The block is an exact Anthropic-shaped `rate_limit_error` 429 with `retry-after` (seconds to next UTC midnight) and `x-miser-budget: exhausted`. The request is never forwarded and accrues no stats besides a sparse `budget: { blockedCount, firstBlockedAt }` node in `/api/miser/stats`.
+- **Reactive cap:** the check compares already-measured spend against the cap before forwarding; the current request's cost is not estimated or reserved, so one expensive (or concurrent) request can overshoot the cap before the next request blocks.
+- **Anthropic spend only:** budgets bound measured Anthropic-leg dollars. Codex/Ollama/OpenAI-format legs accrue $0 — but a capped project is blocked fleet-wide, including its OpenAI-format requests (cross-leg blocking on Anthropic spend).
+- **Restart accrual-loss window:** in-memory spend is authoritative; a process crash can lose up to one async-flush window (≤5s) of accrual.
+- **Attribution is advisory:** `x-termdeck-project` (or the `/p/<project>/` path) is trusted as an operator-controlled header, not a security boundary. An absent/empty header attributes to `default`.
+- **Budgeting `default` is legal but discouraged:** `default` aggregates every unattributed panel, so capping it blocks panels that never opted into attribution.
+
+### B6 — policy watchdog (alert-only, never blocks)
+
+```bash
+MISER_POLICY='{"pkachu":{"expectedModel":"claude-sonnet","maxContextTokens":400000}}'
+```
+
+- `expectedModel` (prefix match against the request `model`) fires a model-drift alert; `maxContextTokens` fires a context-bloat alert computed from MEASURED usage only (`input + cacheRead + cacheWrite`) — never from char/4 estimates, never on legs without usage capture.
+- One pkachu alert per project per check-type per UTC day; every subsequent event still increments the sparse `policy: { modelDriftCount, contextBloatCount }` stats node.
+- Budget-blocked requests never produce drift alerts (they never reach a model).
+
+---
+
 ## Failover
 
 Anthropic 429 keeps the existing failover path:

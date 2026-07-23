@@ -41,9 +41,11 @@ function startEcho(handler) {
 }
 
 // Load a FRESH proxy/router/config with MISER_ANTHROPIC_URL pointed at the echo.
+// budgets/policy-watchdog bind the stats module at require time, so they (and
+// their pricing dep) must be re-required in the same sweep as stats.
 function freshProxy(anthropicUrl, extraEnv = {}) {
   for (const k of Object.keys(require.cache)) {
-    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage)\.js$/.test(k.replace(/\\/g, '/'))) {
+    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage|budgets|policy-watchdog|pricing|daily-rollup|alert-ledger)\.js$/.test(k.replace(/\\/g, '/'))) {
       delete require.cache[k];
     }
   }
@@ -497,6 +499,230 @@ test('v4 C1: breaker trips on 400,400,400 and disables later injection', async (
     assert.ok(echo.captured[1].body.context_management);
     assert.ok(echo.captured[2].body.context_management);
     assert.ok(!echo.captured[3].body.context_management);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Sprint B — G3 budget block + B6 drift, full proxy chain (AC2/AC4/AC5)
+// ---------------------------------------------------------------------------
+
+const SPRINT_B_PRICING = JSON.stringify({ testmodel: { inputPerMTok: 1_000_000 } }); // $1/input token
+
+function tick() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+// Must be called AFTER freshProxy(): returns the same fresh module instances
+// the proxy chain uses, plus a ready guardDeps (real ledger on a tmp file).
+function sprintBSetup(overrides = {}) {
+  const stats = require('../src/stats.js');
+  const { createLedger } = require('../src/alert-ledger.js');
+  const ledgerFile = path.join(os.tmpdir(), `miser-proxy-ledger-${process.pid}-${Date.now()}-${Math.random()}.json`);
+  const alerts = [];
+  const nowFn = () => new Date();
+  const guardDeps = {
+    ledger: createLedger(ledgerFile, nowFn),
+    sendAlert: async (t) => { alerts.push(t); },
+    nowFn,
+    ...overrides,
+  };
+  return { stats, guardDeps, alerts, cleanupLedger: () => { try { fs.unlinkSync(ledgerFile); } catch (_) {} } };
+}
+
+test('Sprint B AC2: capped project → exact 429 block, never forwarded, no usage accrual, counter increments', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_PRICING_JSON: SPRINT_B_PRICING });
+  let cleanupLedger = () => {};
+  try {
+    const setup = sprintBSetup({
+      budgetsConfig: { alpha: { dailyUSD: 5 } },
+      budgetGraceConfig: [],
+    });
+    cleanupLedger = setup.cleanupLedger;
+    setup.stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 5 }); // $5.00 = cap
+
+    const res = fakeRes();
+    await drive(() => createProxy({ guardDeps: setup.guardDeps }), fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, { 'x-termdeck-project': 'alpha' }), res);
+
+    // Exact §1.4 response.
+    assert.equal(res.statusCode, 429);
+    assert.deepEqual(JSON.parse(res.body()), {
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message: "miser: project 'alpha' daily budget of $5.00 exhausted (spent $5.00); resets at next UTC midnight",
+      },
+    });
+    assert.equal(res.headers['x-miser-budget'], 'exhausted');
+    assert.equal(res.headers['content-type'], 'application/json');
+    const retryAfter = Number(res.headers['retry-after']);
+    assert.ok(Number.isInteger(retryAfter) && retryAfter >= 1 && retryAfter <= 86400);
+    // No compact headers on the block path (block fires pre-compress).
+    assert.ok(!('x-miser-compact-hint' in res.headers));
+    assert.ok(!('x-miser-poll-class' in res.headers));
+    assert.ok(!('x-miser-input-tokens-est' in res.headers));
+    // Upstream NEVER contacted.
+    assert.equal(echo.captured.length, 0);
+    // Cap alert fired exactly once.
+    await tick();
+    assert.deepEqual(setup.alerts, ['⛔ miser budget: alpha EXHAUSTED $5.00/$5.00 — blocking until UTC midnight']);
+    // Stats: blockedCount recorded; no usage/legacy accrual from the blocked request.
+    const result = setup.stats.getStats('1');
+    assert.equal(result.perProject.alpha.budget.blockedCount, 1);
+    assert.equal(typeof result.perProject.alpha.budget.firstBlockedAt, 'string');
+    assert.deepEqual(result.usage.alpha.anthropic.testmodel, { requests: 1, input: 5 }); // only the seed
+    assert.equal(result.perProject.alpha.dedup.appliedCount, 0);
+    assert.deepEqual(result.perProject.alpha.pollClass, { likely: 0, work: 0 });
+  } finally {
+    echo.server.close(); restoreEnv(); cleanupLedger();
+  }
+});
+
+test('Sprint B AC2: grace project at cap is forwarded normally with a GRACE cap alert only', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_PRICING_JSON: SPRINT_B_PRICING });
+  let cleanupLedger = () => {};
+  try {
+    const setup = sprintBSetup({
+      budgetsConfig: { alpha: { dailyUSD: 2 } },
+      budgetGraceConfig: ['alpha'],
+    });
+    cleanupLedger = setup.cleanupLedger;
+    setup.stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 3 }); // $3 ≥ $2
+
+    const res = fakeRes();
+    await drive(() => createProxy({ guardDeps: setup.guardDeps }), fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, { 'x-termdeck-project': 'alpha' }), res);
+
+    assert.equal(res.statusCode, 200);            // forwarded, not blocked
+    assert.equal(echo.captured.length, 1);
+    assert.ok(res.headers['x-miser-compact-hint']); // normal pipeline ran
+    await tick();
+    assert.deepEqual(setup.alerts, ['⛔ miser budget: alpha EXHAUSTED $3.00/$2.00 — GRACE: alerting only, not blocking']);
+    assert.equal(setup.stats.getStats('1').perProject.alpha.budget, undefined); // never blocked
+  } finally {
+    echo.server.close(); restoreEnv(); cleanupLedger();
+  }
+});
+
+test('Sprint B AC4: OpenAI-format request is cross-leg blocked on Anthropic spend, transport never invoked', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_PRICING_JSON: SPRINT_B_PRICING });
+  let cleanupLedger = () => {};
+  try {
+    const setup = sprintBSetup({
+      budgetsConfig: { alpha: { dailyUSD: 5 } },
+      budgetGraceConfig: [],
+    });
+    cleanupLedger = setup.cleanupLedger;
+    setup.stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 6 }); // $6 > $5
+
+    const transportCalls = [];
+    const deps = {
+      guardDeps: setup.guardDeps,
+      transports: {
+        openaiPassthrough: (...args) => { transportCalls.push('openai'); throw new Error('must not forward'); },
+        anthropic: (...args) => { transportCalls.push('anthropic'); throw new Error('must not forward'); },
+        ollama: (...args) => { transportCalls.push('ollama'); throw new Error('must not forward'); },
+      },
+    };
+    const res = fakeRes();
+    await drive(() => createProxy(deps), fakeReq('POST', '/v1/chat/completions', {
+      model: 'gpt-x', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, { 'x-termdeck-project': 'alpha' }), res);
+
+    assert.equal(res.statusCode, 429);
+    assert.match(JSON.parse(res.body()).error.message, /daily budget of \$5\.00 exhausted \(spent \$6\.00\)/);
+    assert.deepEqual(transportCalls, []); // NO leg — openai or otherwise — was invoked
+    // The blocked OpenAI-format request contributed $0: spend is still $6.00.
+    const budgets = require('../src/budgets.js');
+    assert.equal(budgets.__test.computeTodaySpendUSD('alpha', new Date()).spend, 6);
+  } finally {
+    echo.server.close(); restoreEnv(); cleanupLedger();
+  }
+});
+
+test('Sprint B AC2/AC5e: budget-capped + drifted model → block only, NO drift alert or counter', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_PRICING_JSON: SPRINT_B_PRICING });
+  let cleanupLedger = () => {};
+  try {
+    const setup = sprintBSetup({
+      budgetsConfig: { alpha: { dailyUSD: 1 } },
+      budgetGraceConfig: [],
+      policyConfig: { alpha: { expectedModel: 'claude-sonnet' } },
+    });
+    cleanupLedger = setup.cleanupLedger;
+    setup.stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 2 }); // capped
+
+    const res = fakeRes();
+    await drive(() => createProxy({ guardDeps: setup.guardDeps }), fakeReq('POST', '/v1/messages', {
+      model: 'claude-opus-4-8', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }], // drifted!
+    }, { 'x-termdeck-project': 'alpha' }), res);
+
+    assert.equal(res.statusCode, 429);
+    assert.equal(echo.captured.length, 0);
+    await tick();
+    // Only the cap alert — budget check short-circuits before the drift check.
+    assert.equal(setup.alerts.length, 1);
+    assert.match(setup.alerts[0], /^⛔ miser budget: alpha EXHAUSTED/);
+    assert.equal(setup.stats.getStats('1').perProject.alpha.policy, undefined); // no drift counter
+  } finally {
+    echo.server.close(); restoreEnv(); cleanupLedger();
+  }
+});
+
+test('Sprint B AC5: drifted model under budget → forwarded UNMUTATED, drift alert fires once', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_PRICING_JSON: SPRINT_B_PRICING });
+  let cleanupLedger = () => {};
+  try {
+    const setup = sprintBSetup({
+      policyConfig: { alpha: { expectedModel: 'claude-sonnet' } },
+    });
+    cleanupLedger = setup.cleanupLedger;
+
+    const body = {
+      model: 'claude-opus-4-8', max_tokens: 50,
+      messages: [{ role: 'user', content: 'do the thing' }],
+    };
+    const res = fakeRes();
+    await drive(() => createProxy({ guardDeps: setup.guardDeps }), fakeReq('POST', '/v1/messages', body, {
+      'x-termdeck-project': 'alpha',
+    }), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(echo.captured.length, 1);
+    // Zero mutation from B6: model + messages reach the wire unchanged.
+    assert.equal(echo.captured[0].body.model, 'claude-opus-4-8');
+    assert.deepEqual(echo.captured[0].body.messages, body.messages);
+    assert.ok(res.headers['x-miser-compact-hint']); // normal pipeline untouched
+    await tick();
+    assert.deepEqual(setup.alerts, [
+      '👁 miser policy: alpha model drift — got claude-opus-4-8, expected claude-sonnet* (1× today)',
+    ]);
+    assert.equal(setup.stats.getStats('1').perProject.alpha.policy.modelDriftCount, 1);
+  } finally {
+    echo.server.close(); restoreEnv(); cleanupLedger();
+  }
+});
+
+test('Sprint B: guardrails-OFF (empty guardDeps) leaves the proxy path byte-identical', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url);
+  try {
+    const res = fakeRes();
+    await drive(() => createProxy({ guardDeps: {} }), fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
+    }, {}), res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(echo.captured.length, 1);
+    assert.ok(res.headers['x-miser-compact-hint']);
   } finally {
     echo.server.close(); restoreEnv();
   }

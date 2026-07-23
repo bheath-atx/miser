@@ -12,6 +12,8 @@ const {
   getPendingWriteCount,
 } = require('./stats.js');
 const { pruneTools } = require('./toolprune.js');
+const { checkBudget } = require('./budgets.js');
+const { checkModelDrift } = require('./policy-watchdog.js');
 const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
 const { injectContextManagement } = require('./context-management.js');
@@ -257,6 +259,38 @@ function createProxy(deps = {}) {
       const originalBody = JSON.parse(raw);
       project = route.project || headerProject(req.headers);
       const format = route.format;
+
+      // --- Sprint B guardrails (pre-compress, pre-upstream) ----------------
+      const guardDeps = deps.guardDeps || {};
+      // G3 budget check: the ONLY blocking feature — fires AFTER project
+      // resolution + route classification, BEFORE compress() and any upstream
+      // contact. Blocked requests are NEVER forwarded, accrue no usage stats,
+      // and get no compact headers (none have been set yet). Exception-safe
+      // fail-OPEN: a throwing budget check must never block traffic.
+      if (guardDeps.budgetsConfig) {
+        let block = null;
+        try {
+          block = checkBudget(project, guardDeps);
+        } catch (e) {
+          console.warn('[miser] budget check error (fail-open):', e.message);
+        }
+        if (block) {
+          res.writeHead(block.status, block.headers);
+          res.end(JSON.stringify(block.body));
+          return;
+        }
+      }
+      // B6 model drift: alert-only, read-only on originalBody.model. Runs
+      // AFTER the budget check (a blocked request never reaches the model, so
+      // no drift alert fires for it). Zero mutation to forwardBody; a throw
+      // never affects the request path.
+      if (guardDeps.policyConfig) {
+        try {
+          checkModelDrift(project, originalBody, guardDeps);
+        } catch (e) {
+          console.warn('[miser] drift check error:', e.message);
+        }
+      }
 
       // compress() v2 is LOSSLESS: it returns the REDUCED body (hoisted system,
       // optional cache hint, deduped messages). NO threshold gate, NO synthetic

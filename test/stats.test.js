@@ -318,6 +318,158 @@ test('v4 M2: context_management.applied_edits aggregate per project', () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Sprint B — guardrail writers + AC9 no-fabrication fixtures
+// ---------------------------------------------------------------------------
+
+test('Sprint B: recordBudgetBlock uses a single nowFn capture for day bucket AND firstBlockedAt', async () => {
+  const file = tmpStatsFile('budget-block');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    const nowFn = () => new Date('2026-07-20T04:05:06.000Z');
+    assert.equal(stats.recordBudgetBlock('alpha', nowFn), 1);
+    assert.equal(stats.recordBudgetBlock('alpha', nowFn), 2);
+    await stats.flushNow();
+    const raw = stats.loadStats();
+    // Mocked nowFn fully controls the day bucket (not the real todayKey()).
+    assert.deepEqual(raw['2026-07-20'].alpha, {
+      budget: { blockedCount: 2, firstBlockedAt: '2026-07-20T04:05:06.000Z' },
+    });
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('Sprint B: recordPolicyEvent increments drift/bloat under a mocked day and returns counts', async () => {
+  const file = tmpStatsFile('policy-event');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    const nowFn = () => new Date('2026-07-20T04:05:06.000Z');
+    assert.deepEqual(stats.recordPolicyEvent('alpha', { drift: true }, nowFn), { modelDriftCount: 1, contextBloatCount: 0 });
+    assert.deepEqual(stats.recordPolicyEvent('alpha', { drift: true, bloat: true }, nowFn), { modelDriftCount: 2, contextBloatCount: 1 });
+    await stats.flushNow();
+    const raw = stats.loadStats();
+    assert.deepEqual(raw['2026-07-20'].alpha, {
+      policy: { modelDriftCount: 2, contextBloatCount: 1 },
+    });
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('Sprint B AC9c: guardrail-only project gets budget/policy nodes and NO legacy bucket fields', () => {
+  const file = tmpStatsFile('ac9c');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordBudgetBlock('guardonly');
+    stats.recordPolicyEvent('guardonly', { drift: true });
+    const result = stats.getStats('1');
+    const proj = result.perProject.guardonly;
+    assert.equal(proj.budget.blockedCount, 1);
+    assert.equal(typeof proj.budget.firstBlockedAt, 'string');
+    assert.deepEqual(proj.policy, { modelDriftCount: 1, contextBloatCount: 0 });
+    // NO fabricated legacy buckets (sparse contract).
+    for (const key of ['dedup', 'cacheHint', 'toolPrune', 'pollClass', 'usage', 'contextManagement']) {
+      assert.ok(!(key in proj), `unexpected legacy key ${key}`);
+    }
+    // perTechnique rollups untouched by guardrail-only projects.
+    assert.equal(result.perTechnique.dedup.appliedCount, 0);
+    assert.equal(result.totals.appliedCount, 0);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('Sprint B AC9a/b: usage-only and contextManagement-only projects keep legacy buckets (baseline preserved)', () => {
+  const file = tmpStatsFile('ac9ab');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('usageonly', 'anthropic', 'claude-sonnet-4', { input_tokens: 3 });
+    stats.recordAnthropicUsage('cmonly', 'anthropic', 'claude', {}, [
+      { cleared_tool_uses: 2, cleared_input_tokens: 1000 },
+    ]);
+    const result = stats.getStats('1');
+    for (const proj of ['usageonly', 'cmonly']) {
+      for (const key of ['dedup', 'cacheHint', 'toolPrune', 'pollClass']) {
+        assert.ok(key in result.perProject[proj], `${proj} missing legacy key ${key}`);
+      }
+      assert.ok(!('budget' in result.perProject[proj]));
+      assert.ok(!('policy' in result.perProject[proj]));
+    }
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('Sprint B AC9d: a no-activity (empty) project bucket is absent from perProject', () => {
+  const file = tmpStatsFile('ac9d');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    fs.writeFileSync(file, JSON.stringify({
+      [dayKey()]: {
+        empty: {},
+        active: { dedup: { inputTokensRemoved: 3, cacheBillingDelta: 0, appliedCount: 1 } },
+      },
+    }), 'utf8');
+    const stats = freshStats(file);
+    const result = stats.getStats('1');
+    assert.ok(!('empty' in result.perProject));
+    assert.ok('active' in result.perProject);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('Sprint B §2.3: multi-day aggregation sums counts and keeps the EARLIEST firstBlockedAt', () => {
+  const file = tmpStatsFile('multiday');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    fs.writeFileSync(file, JSON.stringify({
+      [dayKey(-1)]: {
+        alpha: {
+          budget: { blockedCount: 2, firstBlockedAt: '2026-07-22T08:00:00.000Z' },
+          policy: { modelDriftCount: 5, contextBloatCount: 1 },
+        },
+      },
+      [dayKey()]: {
+        alpha: {
+          budget: { blockedCount: 3, firstBlockedAt: '2026-07-23T09:00:00.000Z' },
+          policy: { modelDriftCount: 7, contextBloatCount: 0 },
+        },
+      },
+    }), 'utf8');
+    const stats = freshStats(file);
+    const proj = stats.getStats('2').perProject.alpha;
+    assert.deepEqual(proj.budget, { blockedCount: 5, firstBlockedAt: '2026-07-22T08:00:00.000Z' });
+    assert.deepEqual(proj.policy, { modelDriftCount: 12, contextBloatCount: 1 });
+    // Days filter: only today → today's numbers and today's firstBlockedAt.
+    const todayOnly = stats.getStats('1').perProject.alpha;
+    assert.deepEqual(todayOnly.budget, { blockedCount: 3, firstBlockedAt: '2026-07-23T09:00:00.000Z' });
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('Sprint B: guardrail + usage project carries both node families', () => {
+  const file = tmpStatsFile('mixed');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-4', { input_tokens: 3 });
+    stats.recordBudgetBlock('alpha');
+    const proj = stats.getStats('1').perProject.alpha;
+    assert.equal(proj.budget.blockedCount, 1);
+    assert.equal(proj.usage.anthropic['claude-sonnet-4'].input, 3);
+    assert.ok('dedup' in proj); // legacy init still fires (usage present)
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
 test('v4 M2: real pre-v4 stats fixture loads byte-compatible and usage stays absent', () => {
   const file = tmpStatsFile('legacy');
   const prevEnv = process.env.MISER_STATS_FILE;

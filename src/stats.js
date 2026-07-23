@@ -231,6 +231,44 @@ function ensureMeasuredProjectBucket(project) {
   return _stats[day][proj];
 }
 
+// Sprint B guardrail writers. Takes an EXPLICIT day string (not todayKey()) so
+// an injected nowFn fully controls the day bucket — no midnight-split risk.
+function ensureGuardrailBucket(project, dayKey) {
+  const proj = project || 'default';
+  if (!_stats[dayKey]) _stats[dayKey] = {};
+  if (!_stats[dayKey][proj]) _stats[dayKey][proj] = {};
+  return _stats[dayKey][proj];
+}
+
+// G3: sparse per-day per-project `budget` node { blockedCount, firstBlockedAt }.
+// nowFn() is captured exactly ONCE per invocation; dayKey and firstBlockedAt
+// both derive from that single capture.
+function recordBudgetBlock(project, nowFn = () => new Date()) {
+  const now = nowFn();
+  const dayKey = now.toISOString().slice(0, 10);
+  const bucket = ensureGuardrailBucket(project, dayKey);
+  if (!bucket.budget) bucket.budget = { blockedCount: 0 };
+  bucket.budget.blockedCount += 1;
+  if (!bucket.budget.firstBlockedAt) bucket.budget.firstBlockedAt = now.toISOString();
+  scheduleFlush();
+  return bucket.budget.blockedCount;
+}
+
+// B6: sparse per-day per-project `policy` node { modelDriftCount, contextBloatCount }.
+// Same single-capture nowFn pattern. Returns the updated counts (alert text
+// uses the today-count).
+function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn = () => new Date()) {
+  if (!drift && !bloat) return { modelDriftCount: 0, contextBloatCount: 0 }; // no-op: never write zero node
+  const now = nowFn();
+  const dayKey = now.toISOString().slice(0, 10);
+  const bucket = ensureGuardrailBucket(project, dayKey);
+  if (!bucket.policy) bucket.policy = { modelDriftCount: 0, contextBloatCount: 0 };
+  if (drift) bucket.policy.modelDriftCount += 1;
+  if (bloat) bucket.policy.contextBloatCount += 1;
+  scheduleFlush();
+  return { modelDriftCount: bucket.policy.modelDriftCount, contextBloatCount: bucket.policy.contextBloatCount };
+}
+
 // opts: { inputTokensRemoved, cacheBillingDelta, toolsRemoved, techniques }
 function recordStats(project, opts = {}) {
   const bucket = ensureProjectBucket(project);
@@ -397,28 +435,64 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     if (day < cutoffKey || !dayData || typeof dayData !== 'object') continue;
     for (const [proj, projData] of Object.entries(dayData)) {
       if (projectFilter && proj !== projectFilter) continue;
-      if (!perProject[proj]) {
-        perProject[proj] = {
-          dedup: emptyTechniqueBucket(),
-          cacheHint: emptyTechniqueBucket(),
-          toolPrune: { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
-          pollClass: { likely: 0, work: 0 },
-        };
+      // No-fabrication guard (Sprint B): legacy bucket init fires only for
+      // projects with usage, contextManagement, or any legacy optimizer key in
+      // the raw day data (unchanged baseline — all existing project categories
+      // preserved). Projects with EXCLUSIVELY guardrail keys (budget/policy)
+      // must not appear with fabricated zeroed legacy buckets.
+      const hasLegacy = !!(projData.usage || projData.contextManagement
+        || projData.dedup || projData.cacheHint || projData.toolPrune);
+      // Guardrail activity only counts when counts are positive (sparse contract §2.3).
+      const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
+        || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0));
+      if (!hasLegacy && !hasGuardrail) continue;
+      if (!perProject[proj]) perProject[proj] = {};
+      const target = perProject[proj];
+      if (hasLegacy && !target.dedup) {
+        target.dedup = emptyTechniqueBucket();
+        target.cacheHint = emptyTechniqueBucket();
+        target.toolPrune = { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
+        target.pollClass = { likely: 0, work: 0 };
       }
-      for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
-        if (!projData[tech]) continue;
-        perProject[proj][tech].estRemovedTokens += projData[tech].estRemovedTokens || projData[tech].inputTokensRemoved || 0;
-        perProject[proj][tech].inputTokensRemoved += projData[tech].inputTokensRemoved || 0;
-        perProject[proj][tech].cacheBillingDelta += projData[tech].cacheBillingDelta || 0;
-        perProject[proj][tech].appliedCount += projData[tech].appliedCount || 0;
-        if (tech === 'toolPrune') {
-          perProject[proj][tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
+      if (target.dedup) {
+        for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
+          if (!projData[tech]) continue;
+          target[tech].estRemovedTokens += projData[tech].estRemovedTokens || projData[tech].inputTokensRemoved || 0;
+          target[tech].inputTokensRemoved += projData[tech].inputTokensRemoved || 0;
+          target[tech].cacheBillingDelta += projData[tech].cacheBillingDelta || 0;
+          target[tech].appliedCount += projData[tech].appliedCount || 0;
+          if (tech === 'toolPrune') {
+            target[tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
+          }
+        }
+        target.pollClass.likely += projData.likelyPollCount || 0;
+        target.pollClass.work += projData.workTurnCount || 0;
+      }
+      addUsageTree(target.usage || (projData.usage ? (target.usage = {}) : {}), projData.usage);
+      addContextManagement(target, projData.contextManagement);
+      // Sprint B guardrail aggregation across the days window (sparse):
+      // blockedCount / drift / bloat counts summed; firstBlockedAt = EARLIEST
+      // ISO timestamp across all days in the window.
+      // Sparse contract (§2.3): only emit budget node when blockedCount > 0,
+      // only emit policy node when at least one count > 0. Never fabricate zeroes.
+      if (projData.budget && typeof projData.budget === 'object'
+          && (projData.budget.blockedCount || 0) > 0) {
+        if (!target.budget) target.budget = { blockedCount: 0 };
+        target.budget.blockedCount += projData.budget.blockedCount;
+        const first = projData.budget.firstBlockedAt;
+        if (typeof first === 'string' && (!target.budget.firstBlockedAt || first < target.budget.firstBlockedAt)) {
+          target.budget.firstBlockedAt = first;
         }
       }
-      perProject[proj].pollClass.likely += projData.likelyPollCount || 0;
-      perProject[proj].pollClass.work += projData.workTurnCount || 0;
-      addUsageTree(perProject[proj].usage || (projData.usage ? (perProject[proj].usage = {}) : {}), projData.usage);
-      addContextManagement(perProject[proj], projData.contextManagement);
+      if (projData.policy && typeof projData.policy === 'object') {
+        const dc = projData.policy.modelDriftCount || 0;
+        const bc = projData.policy.contextBloatCount || 0;
+        if (dc > 0 || bc > 0) {
+          if (!target.policy) target.policy = { modelDriftCount: 0, contextBloatCount: 0 };
+          target.policy.modelDriftCount += dc;
+          target.policy.contextBloatCount += bc;
+        }
+      }
     }
   }
 
@@ -428,6 +502,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     toolPrune: { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
   };
   for (const projData of Object.values(perProject)) {
+    if (!projData.dedup) continue; // guardrail-only project — no legacy buckets to roll up
     for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
       perTechnique[tech].inputTokensRemoved += projData[tech].inputTokensRemoved;
       perTechnique[tech].estRemovedTokens += projData[tech].estRemovedTokens;
@@ -538,6 +613,8 @@ function getRawStatsSnapshot() {
 module.exports = {
   recordStats,
   recordAnthropicUsage,
+  recordBudgetBlock,
+  recordPolicyEvent,
   getStats,
   getDailyTrend,
   loadStats,

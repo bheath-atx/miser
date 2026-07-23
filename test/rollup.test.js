@@ -78,6 +78,73 @@ test('rollup sparse missing days count as zero in the seven-day denominator', ()
   assert.match(buildRollupText(stats, now), /alpha 2× baseline/);
 });
 
+// ---------------------------------------------------------------------------
+// Sprint B — guardrail rollup lines (sparse, appended after existing fields)
+// ---------------------------------------------------------------------------
+
+test('Sprint B: guardrail fields append to a usage line only when nonzero', () => {
+  const now = new Date('2026-07-23T00:00:30Z');
+  const stats = {
+    [dayKey(now)]: {
+      alpha: {
+        ...usage('claude-sonnet-4-6', { input: 1_000_000 }),
+        budget: { blockedCount: 1, firstBlockedAt: '2026-07-23T00:00:01.000Z' },
+        policy: { modelDriftCount: 3, contextBloatCount: 0 },
+      },
+      beta: usage('claude-sonnet-4-6', { input: 1_000_000 }),
+    },
+  };
+  const text = buildRollupText(stats, now);
+  // Existing token fields preserved; blocked/drift appended; bloat omitted (zero).
+  assert.match(text, /alpha: \$3\.00 \(1000k input \/ 0k output \/ 0k cacheRead tokens\) blocked:1 drift:3$/m);
+  assert.doesNotMatch(text, /alpha.*bloat:/);
+  // Untouched projects keep the exact legacy line shape.
+  assert.match(text, /beta: \$3\.00 \(1000k input \/ 0k output \/ 0k cacheRead tokens\)$/m);
+});
+
+test('Sprint B: anomaly marker and guardrail fields coexist in order', () => {
+  const now = new Date('2026-07-23T00:00:30Z');
+  const stats = {
+    [dayKey(now)]: {
+      alpha: {
+        ...usage('claude-sonnet-4-6', { input: 3_000_000 }),
+        policy: { modelDriftCount: 0, contextBloatCount: 2 },
+      },
+    },
+  };
+  for (let i = -7; i <= -1; i++) {
+    stats[offsetDay(now, i)] = { alpha: usage('claude-sonnet-4-6', { input: 1_000_000 }) };
+  }
+  const text = buildRollupText(stats, now);
+  assert.match(text, /alpha: \$9\.00 .* ⚠️ alpha 2× baseline bloat:2$/m);
+});
+
+test('Sprint B: guardrail-only project emits a $0.00 line with no token fields', () => {
+  const now = new Date('2026-07-23T00:00:30Z');
+  const stats = {
+    [dayKey(now)]: {
+      blockedproj: { budget: { blockedCount: 2, firstBlockedAt: '2026-07-23T00:00:01.000Z' } },
+      driftproj: { policy: { modelDriftCount: 5, contextBloatCount: 1 } },
+      quiet: {}, // no usage, no guardrail activity → NO line
+    },
+  };
+  const text = buildRollupText(stats, now);
+  assert.match(text, /^blockedproj: \$0\.00 blocked:2$/m);
+  assert.match(text, /^driftproj: \$0\.00 drift:5 bloat:1$/m);
+  assert.doesNotMatch(text, /quiet/);
+  assert.doesNotMatch(text, /blockedproj.*tokens/); // no token fields without usage
+});
+
+test('Sprint B: zeroed guardrail nodes produce no rollup line for usage-less projects', () => {
+  const now = new Date('2026-07-23T00:00:30Z');
+  const stats = {
+    [dayKey(now)]: {
+      ghost: { policy: { modelDriftCount: 0, contextBloatCount: 0 } },
+    },
+  };
+  assert.equal(buildRollupText(stats, now), '');
+});
+
 test('emitDailyRollup no-env no-ops and HTTP failure does not throw', async () => {
   const prev = { endpoint: process.env.MISER_PKACHU_ENDPOINT, token: process.env.MISER_PKACHU_TOKEN };
   const dedupFile = tmpFile('dedup');
