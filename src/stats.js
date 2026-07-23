@@ -258,6 +258,7 @@ function recordBudgetBlock(project, nowFn = () => new Date()) {
 // Same single-capture nowFn pattern. Returns the updated counts (alert text
 // uses the today-count).
 function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn = () => new Date()) {
+  if (!drift && !bloat) return { modelDriftCount: 0, contextBloatCount: 0 }; // no-op: never write zero node
   const now = nowFn();
   const dayKey = now.toISOString().slice(0, 10);
   const bucket = ensureGuardrailBucket(project, dayKey);
@@ -441,7 +442,9 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
       // must not appear with fabricated zeroed legacy buckets.
       const hasLegacy = !!(projData.usage || projData.contextManagement
         || projData.dedup || projData.cacheHint || projData.toolPrune);
-      const hasGuardrail = !!(projData.budget || projData.policy);
+      // Guardrail activity only counts when counts are positive (sparse contract §2.3).
+      const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
+        || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0));
       if (!hasLegacy && !hasGuardrail) continue;
       if (!perProject[proj]) perProject[proj] = {};
       const target = perProject[proj];
