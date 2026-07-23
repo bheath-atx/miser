@@ -112,6 +112,30 @@ test('flushNow writes all pending records before simulated shutdown', async () =
   }
 });
 
+// Shutdown race regression: mutation arrives AFTER an initial flushNow() quiesces
+// (simulating an accepted in-flight request that records stats during server.close()).
+// The final flushNow() called after server.close() must capture it.
+test('mutation after initial flushNow quiescence is captured by a second flushNow', async () => {
+  const file = tmpStatsFile('shutdown-race');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  let stats;
+  try {
+    stats = freshStats(file);
+    // First batch: record and flush (simulates pre-server.close state)
+    stats.recordStats('alpha', { inputTokensRemoved: 1, techniques: { dedup: true } });
+    await stats.flushNow();
+    // Mutation arrives after quiescence (simulates accepted request completing during server.close)
+    stats.recordAnthropicUsage('beta', 'anthropic', 'claude-sonnet-4-6', { input_tokens: 500_000 });
+    // Final flushNow (called after server.close in shutdown sequence) must capture it
+    await stats.flushNow();
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(raw[dayKey()].alpha.dedup.inputTokensRemoved, 1);
+    assert.equal(raw[dayKey()].beta.usage.anthropic['claude-sonnet-4-6'].input, 500_000);
+  } finally {
+    cleanup(file, prevEnv, stats);
+  }
+});
+
 test('concurrent flushNow calls resolve without interleaved writes', async () => {
   const file = tmpStatsFile('concurrent');
   const prevEnv = process.env.MISER_STATS_FILE;

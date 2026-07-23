@@ -44,6 +44,14 @@ test('Anthropic pricing table pins sonnet, opus, and haiku all five axes', () =>
       cacheWrite5mPerMTok: 1.25,
       cacheWrite1hPerMTok: 2,
     });
+    // Dated API response ID must resolve to same prices (not fall through to * fallback)
+    assert.deepEqual(table['claude-haiku-4-5-20251001'], {
+      inputPerMTok: 1,
+      outputPerMTok: 5,
+      cacheReadPerMTok: 0.1,
+      cacheWrite5mPerMTok: 1.25,
+      cacheWrite1hPerMTok: 2,
+    });
   } finally {
     restoreEnv(prev);
   }
