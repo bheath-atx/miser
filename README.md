@@ -46,7 +46,8 @@ The old goal of saving billed tokens through proxy-side byte mutation is withdra
 | `POST /v1/chat/completions` | OpenAI-format passthrough with Ollama fallback on 429 |
 | `GET /api/miser/health` | Health/config surface |
 | `GET /api/miser/quota` | Legacy request-count quota view |
-| `GET /api/miser/stats?days=N&project=X` | Optimizer legacy counters plus sparse measured usage tree |
+| `GET /api/miser/stats?days=N&project=X` | Optimizer legacy counters plus sparse measured usage tree and Anthropic estimated dollars |
+| `GET /api/miser/stats/trend?days=N&project=X` | Sparse daily measured-usage trend entries, capped at 90 days |
 
 Project path names must match `[A-Za-z0-9._-]{1,80}` after one URL-decode pass. Invalid `/p/...` shapes return 404 and are not forwarded.
 
@@ -59,10 +60,22 @@ Anthropic 2xx responses are tee-parsed without buffering SSE streams. Stats incl
 - Legacy optimizer buckets for backwards compatibility.
 - Sparse `usage` buckets keyed by day, project, provider, and model.
 - Weighted token equivalents computed at read time.
+- `anthropicEstCostUSD`, computed at read time from Anthropic-leg measured tokens only.
 - `context_management.applied_edits` aggregates per project.
 - A warning if 5-minute cache writes appear, because this fleet is expected to use 1-hour cache TTL.
+- Daily pkachu rollups can post one UTC-midnight line per project when configured.
 
 Missing usage means “not measured”; v4 does not zero-fill absent usage nodes.
+
+`GET /api/miser/health` returns process vitals:
+
+- `ok`
+- `uptimeSecs`
+- `reqPerMin`
+- `perLegErrors`
+- `c1DisabledProjects`
+- `statsFlushLagMs`
+- `pendingWrites`
 
 ---
 
@@ -116,6 +129,9 @@ Relevant env vars:
 | `MISER_CONTEXT_EDIT_PROJECTS` | Per-project C1 opt-in map |
 | `MISER_STATS_FILE` | Stats file path, default `~/.miser-stats.json` |
 | `MISER_DEDUP_FORCE` | Test/emergency override for the cache-safety dedup gate |
+| `MISER_PRICING_JSON` | JSON map of model pricing overrides merged over the built-in Anthropic table |
+| `MISER_PKACHU_TOKEN` | File path containing the bearer token for daily rollup posts |
+| `MISER_PKACHU_ENDPOINT` | HTTP(S) endpoint for daily rollup JSON posts |
 
 ---
 

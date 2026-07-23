@@ -225,7 +225,7 @@ test('AC5: a client-illegal request (orphan tool_result) is FORWARDED, not miser
   }
 });
 
-test('health payload drops the deleted threshold; reports cacheHint', async () => {
+test('health payload reports process vitals', async () => {
   const echo = await startEcho(() => ({ status: 200, body: {} }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_CACHE_HINT: '' });
   try {
@@ -233,8 +233,13 @@ test('health payload drops the deleted threshold; reports cacheHint', async () =
     await drive(createProxy, fakeReq('GET', '/api/miser/health', null, {}), res);
     const payload = JSON.parse(res.body());
     assert.equal(payload.ok, true);
-    assert.ok(!('threshold' in payload));
-    assert.equal(payload.cacheHint, true);
+    for (const key of ['uptimeSecs', 'reqPerMin', 'perLegErrors', 'c1DisabledProjects', 'statsFlushLagMs', 'pendingWrites']) {
+      assert.ok(key in payload);
+    }
+    assert.equal(typeof payload.uptimeSecs, 'number');
+    assert.equal(typeof payload.reqPerMin, 'number');
+    assert.deepEqual(Object.keys(payload.perLegErrors), ['anthropic', 'codex', 'ollama']);
+    assert.ok(Array.isArray(payload.c1DisabledProjects));
   } finally {
     echo.server.close(); restoreEnv();
   }
@@ -255,7 +260,7 @@ test('/api/miser/stats returns 200 with the expected shape', async () => {
     assert.ok(payload.perTechnique.cacheHint);
     assert.ok(payload.perTechnique.toolPrune);
     assert.deepEqual(payload.perProject, {});
-    assert.deepEqual(Object.keys(payload.totals), ['inputTokensRemoved', 'estRemovedTokens', 'cacheBillingDelta', 'appliedCount', 'toolsRemovedCount']);
+    assert.deepEqual(Object.keys(payload.totals), ['inputTokensRemoved', 'estRemovedTokens', 'cacheBillingDelta', 'appliedCount', 'toolsRemovedCount', 'anthropicEstCostUSD']);
   } finally {
     echo.server.close(); restoreEnv();
   }

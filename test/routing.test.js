@@ -32,5 +32,6 @@ test('v4 P1: invalid project charset and empty project are rejected', () => {
 test('v4 P1: existing /v1/messages and exact /api/miser routes are unchanged', () => {
   assert.deepEqual(classifyRoute('POST', '/v1/messages'), { kind: 'messages', format: 'anthropic' });
   assert.deepEqual(classifyRoute('GET', '/api/miser/stats?days=1'), { kind: 'stats' });
+  assert.deepEqual(classifyRoute('GET', '/api/miser/stats/trend?days=7'), { kind: 'stats_trend' });
   assert.deepEqual(classifyRoute('GET', '/api/miser/statsXYZ'), { kind: 'not_found' });
 });
