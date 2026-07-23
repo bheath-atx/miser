@@ -12,6 +12,16 @@ const { recordAnthropicUsage } = require('./stats.js');
 const { AnthropicUsageParser } = require('./usage.js');
 const config = require('./config.js');
 
+const _legErrors = { anthropic: 0, codex: 0, ollama: 0 };
+
+function incrementLegError(leg) {
+  if (Object.prototype.hasOwnProperty.call(_legErrors, leg)) _legErrors[leg] += 1;
+}
+
+function getLegErrors() {
+  return { ..._legErrors };
+}
+
 // ---------------------------------------------------------------------------
 // Failover chain (anthropic format):
 //
@@ -49,9 +59,15 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     try {
       await transports.openaiPassthrough(messages, originalBody, incomingHeaders, res, project, savedTokens);
     } catch (err) {
+      incrementLegError('codex');
       if (err.statusCode === 429 && !res.headersSent) {
         console.log('[miser] OpenAI 429 — falling back to hard-capped Ollama');
-        await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
+        try {
+          await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
+        } catch (ollamaErr) {
+          incrementLegError('ollama');
+          throw ollamaErr;
+        }
       } else throw err;
     }
     return;
@@ -62,6 +78,7 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     await transports.anthropic(messages, originalBody, incomingHeaders, res, project, savedTokens);
     return;
   } catch (err) {
+    incrementLegError('anthropic');
     if (err.statusCode !== 429 || res.headersSent) throw err;
     console.log('[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)');
   }
@@ -86,12 +103,18 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     await transports.codex(codexReq, bearer, res, project, savedTokens);
     return;
   } catch (err) {
+    incrementLegError('codex');
     if (res.headersSent) throw err; // response already streaming — can't fail over
     console.log(`[miser] Codex/OpenAI unavailable (${err.statusCode || err.message}) — hard-capped Ollama fallback`);
   }
 
   // --- Leg 3: hard-capped Ollama ------------------------------------------
-  await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
+  try {
+    await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
+  } catch (err) {
+    incrementLegError('ollama');
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +397,8 @@ module.exports = {
   forwardToCodex,
   forwardToOllama,
   teardownResponse,
+  getLegErrors,
+  __test: { _legErrors },
   // exported so the hard-cap can be asserted end-to-end (translate → cap)
   _buildCappedOllamaBody: (messages, originalBody, cap) =>
     hardCapOllamaBody(translateToOllama(messages, originalBody, config.fallbackModels[0]), cap),

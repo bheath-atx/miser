@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { createProxy } = require('./proxy.js');
+const { flushNow, getRawStatsSnapshot } = require('./stats.js');
+const { startDailyRollupInterval } = require('./daily-rollup.js');
 const config = require('./config.js');
 
 // --- Single-instance advisory lock -----------------------------------------
@@ -44,6 +46,7 @@ try {
 } catch (_) { /* no lockfile = clean start */ }
 
 const server = http.createServer(createProxy());
+startDailyRollupInterval(getRawStatsSnapshot);
 
 server.listen(config.port, '127.0.0.1', () => {
   writeLock();
@@ -53,8 +56,10 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log(`[miser] anthropic url: ${config.anthropicUrl}`);
   console.log(`[miser] ollama url: ${config.ollamaUrl}`);
   console.log(`[miser] fallback models: ${config.fallbackModels.join(', ')}`);
+  console.log(`[miser] env: MISER_PRICING_JSON=${process.env.MISER_PRICING_JSON ? 'set' : 'unset'} MISER_PKACHU_TOKEN=${process.env.MISER_PKACHU_TOKEN ? 'set' : 'unset'} MISER_PKACHU_ENDPOINT=${process.env.MISER_PKACHU_ENDPOINT ? 'set' : 'unset'}`);
   console.log(`[miser] health: GET http://127.0.0.1:${config.port}/api/miser/health`);
   console.log(`[miser] quota:  GET http://127.0.0.1:${config.port}/api/miser/quota`);
+  console.log(`[miser] trend:  GET http://127.0.0.1:${config.port}/api/miser/stats/trend`);
 });
 
 server.on('error', (err) => {
@@ -69,11 +74,44 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-function shutdown() {
-  clearLock();
-  server.close(() => process.exit(0));
+let shuttingDown = false;
+
+function closeServer() {
+  return new Promise((resolve, reject) => {
+    server.close((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), ms)),
+  ]);
+}
+
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   // Safety net: never hang forever if in-flight connections stall close().
-  setTimeout(() => process.exit(0), 3000).unref();
+  setTimeout(() => {
+    console.error('[miser] ERROR shutdown timed out; exiting');
+    process.exit(0);
+  }, 3000).unref();
+
+  try {
+    await closeServer();
+  } catch (err) {
+    console.error('[miser] ERROR server close failed:', err.message);
+  }
+
+  try {
+    await withTimeout(flushNow(), 2500, 'stats flush');
+  } catch (err) {
+    console.error('[miser] ERROR final stats flush failed:', err.message);
+  }
+
+  clearLock();
+  process.exit(0);
 }
 
 process.on('SIGTERM', shutdown);

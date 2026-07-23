@@ -40,12 +40,13 @@ function dayKey(offsetDays = 0) {
   return d.toISOString().slice(0, 10);
 }
 
-test('recordStats persists across a simulated restart', () => {
+test('recordStats persists across a simulated restart', async () => {
   const file = tmpStatsFile('persist');
   const prevEnv = process.env.MISER_STATS_FILE;
   try {
     let stats = freshStats(file);
     stats.recordStats('alpha', { inputTokensRemoved: 12, techniques: { dedup: true } });
+    await stats.flushNow();
 
     const loaded = stats.loadStats();
     assert.equal(loaded[dayKey()].alpha.dedup.inputTokensRemoved, 12);
@@ -270,12 +271,13 @@ test('v4 M2: legacy total cache_creation_input_tokens records as cacheWrite1h wh
   }
 });
 
-test('v4 M2: pure usage writes do not persist legacy technique zero buckets', () => {
+test('v4 M2: pure usage writes do not persist legacy technique zero buckets', async () => {
   const file = tmpStatsFile('usage-no-legacy');
   const prevEnv = process.env.MISER_STATS_FILE;
   try {
     const stats = freshStats(file);
     stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-4', { output_tokens: 9 });
+    await stats.flushNow();
     const raw = stats.loadStats();
     const rawProject = raw[dayKey()].alpha;
     assert.deepEqual(rawProject, {
