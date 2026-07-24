@@ -199,20 +199,34 @@ function checkBudget(project, guardDeps = {}) {
 function buildGuardDeps(config, seams = {}) {
   const guardDeps = {};
   const budgets = config.budgets != null ? config.budgets : null;
-  const policy = config.policy != null ? config.policy : null;
-  if (budgets === null && policy === null) return guardDeps;
+  const policy  = config.policy  != null ? config.policy  : null;
+  const cap5h   = config.codex5hCap || 0;
 
+  // Early return only when ALL three features are off.
+  if (budgets === null && policy === null && cap5h <= 0) return guardDeps;
+
+  // Ledger is required by any active guardrail (dedup + alert dispatch).
   const mkLedger = seams.createLedger || require('./alert-ledger.js').createLedger;
   guardDeps.ledger = mkLedger();
-  guardDeps.nowFn = seams.nowFn || (() => new Date());
+  guardDeps.nowFn  = seams.nowFn || (() => new Date());
+
   if (budgets !== null) {
-    guardDeps.budgetsConfig = budgets;
-    guardDeps.budgetGraceConfig = config.budgetGrace || []; // always [] when budgets active
+    guardDeps.budgetsConfig     = budgets;
+    guardDeps.budgetGraceConfig = config.budgetGrace || [];
   }
   if (policy !== null) {
     guardDeps.checkContextBloat = require('./policy-watchdog.js').checkContextBloat;
-    guardDeps.policyConfig = policy;
+    guardDeps.policyConfig      = policy;
   }
+  if (cap5h > 0) {
+    const mkTracker = seams.createSubCapTracker
+      || require('./sub-cap.js').createSubCapTracker;
+    guardDeps.subCapTracker = mkTracker({
+      cap5h,
+      weeklyCap: config.codexWeeklyCap || 0,
+    });
+  }
+
   return guardDeps;
 }
 

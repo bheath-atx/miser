@@ -191,17 +191,32 @@ function reqPerMin(now = Date.now()) {
 }
 
 // `deps` is an OPTIONAL injectable seam forwarded verbatim to routeRequest()
-// (transports / getBearer / ollamaCap). Production callers pass nothing, so
-// routeRequest falls back to its real transports. The offline test harness uses
-// it to drive the full proxy→compress→routeRequest→failover chain with zero
-// sockets. Never populated on the production path.
+// (transports / getBearer / ollamaCap / breakers / guardDeps). Production callers
+// pass nothing, so routeRequest falls back to its real transports. The offline
+// test harness uses it to drive the full proxy→compress→routeRequest→failover
+// chain with zero sockets. Never populated on the production path.
 function createProxy(deps = {}) {
+  // Injectable breaker state seam — lets health tests verify states without
+  // touching the module-level singletons in router.js.
+  const getBreakersState = deps.getBreakersState || (() => {
+    const { getBreakers } = require('./router.js');
+    const bs = getBreakers();
+    const out = {};
+    for (const [name, b] of Object.entries(bs)) out[name] = b.getState();
+    return out;
+  });
+
   return async function handler(req, res) {
     trackRequest();
     const route = classifyRoute(req.method, req.url);
 
     // Health check
     if (route.kind === 'health') {
+      let subCapStatus = null;
+      const gd = deps.guardDeps;
+      if (gd && gd.subCapTracker) {
+        subCapStatus = gd.subCapTracker.getStatus(Date.now());
+      }
       json(res, 200, {
         ok: true,
         uptimeSecs: Math.floor(process.uptime()),
@@ -210,6 +225,8 @@ function createProxy(deps = {}) {
         c1DisabledProjects: [...contextDisabled],
         statsFlushLagMs: getFlushLagMs(),
         pendingWrites: getPendingWriteCount(),
+        circuitBreakers: getBreakersState(),
+        subscriptionCap: subCapStatus,
       });
       return;
     }

@@ -48,7 +48,7 @@ function fakeReq(method, url, bodyObj = null, headers = {}) {
 
 function freshModules() {
   for (const key of Object.keys(require.cache)) {
-    if (/\/src\/(proxy|router|routing|stats|pricing|config|compress|toolprune|context-management|usage|quota)\.js$/.test(key.replace(/\\/g, '/'))) {
+    if (/\/src\/(proxy|router|routing|stats|pricing|config|compress|toolprune|context-management|usage|quota|circuit-breaker|sub-cap)\.js$/.test(key.replace(/\\/g, '/'))) {
       delete require.cache[key];
     }
   }
@@ -105,6 +105,84 @@ test('health reqPerMin prunes old requests and counts current window', async () 
     assert.equal(payload.reqPerMin, 3);
   } finally {
     Date.now = realNow;
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AC6-A: circuitBreakers present in health payload with injected state
+// ---------------------------------------------------------------------------
+
+test('AC6-A: circuitBreakers in health payload matches injected getBreakersState', async () => {
+  const { proxy, cleanup } = freshModules();
+  try {
+    const breakerState = {
+      anthropic: { state: 'OPEN', failures: 5, openedAt: 123456 },
+      codex:     { state: 'CLOSED', failures: 0, openedAt: null },
+      ollama:    { state: 'HALF_OPEN', failures: 3, openedAt: 99999 },
+    };
+    const handler = proxy.createProxy({ getBreakersState: () => breakerState });
+    const { payload } = await drive(handler, fakeReq('GET', '/api/miser/health'));
+    assert.deepEqual(payload.circuitBreakers, breakerState);
+  } finally {
+    cleanup();
+  }
+});
+
+// AC6-B: safeAcquire fail-open: a throwing breaker returns true and logs warning
+test('AC6-B: safeAcquire fail-open — throwing breaker returns true, logs warning', () => {
+  const { router, cleanup } = freshModules();
+  try {
+    const { safeAcquire } = router.__test;
+    const throwingBreaker = { acquire() { throw new Error('breaker exploded'); } };
+    const warns = [];
+    const prev = console.warn;
+    console.warn = (msg) => warns.push(String(msg));
+    let result;
+    try {
+      result = safeAcquire(throwingBreaker);
+    } finally {
+      console.warn = prev;
+    }
+    assert.equal(result, true);
+    assert.ok(warns.some(w => w.includes('breaker.acquire error')));
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AC9: subscriptionCap in health payload
+// ---------------------------------------------------------------------------
+
+test('AC9-a: subscriptionCap is null when no subCapTracker in guardDeps', async () => {
+  const { proxy, cleanup } = freshModules();
+  try {
+    const handler = proxy.createProxy();
+    const { payload } = await drive(handler, fakeReq('GET', '/api/miser/health'));
+    assert.equal(payload.subscriptionCap, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test('AC9-b: subscriptionCap matches getStatus() output when subCapTracker present', async () => {
+  const { proxy, cleanup } = freshModules();
+  try {
+    const fakeStatus = {
+      requestsIn5h: 10, events429In5h: 0, cap5h: 40,
+      capFraction: 0.25, deferBackground: false,
+      weeklyRequests: 50, weeklyCap: 280, weeklyCapFraction: 0.178,
+      burnRatePerHour: 2, timeToLimitEstMs: 54_000_000, shouldAlert: false,
+    };
+    const fakeTracker = { getStatus: () => fakeStatus };
+    const handler = proxy.createProxy({ guardDeps: { subCapTracker: fakeTracker } });
+    const { payload } = await drive(handler, fakeReq('GET', '/api/miser/health'));
+    assert.ok(payload.subscriptionCap !== null);
+    assert.equal(payload.subscriptionCap.requestsIn5h, 10);
+    assert.equal(payload.subscriptionCap.deferBackground, false);
+    assert.equal(payload.subscriptionCap.cap5h, 40);
+  } finally {
     cleanup();
   }
 });

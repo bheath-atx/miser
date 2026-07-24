@@ -10,6 +10,7 @@ const { getCodexBearer } = require('./oauth.js');
 const { recordUsage } = require('./quota.js');
 const { recordAnthropicUsage } = require('./stats.js');
 const { AnthropicUsageParser } = require('./usage.js');
+const { createBreaker } = require('./circuit-breaker.js');
 const config = require('./config.js');
 
 const _legErrors = { anthropic: 0, codex: 0, ollama: 0 };
@@ -22,16 +23,108 @@ function getLegErrors() {
   return { ..._legErrors };
 }
 
+// Module-level breaker singletons — initialized once at require time from config.
+// Tests override via deps.breakers; createProxy() does NOT accept breakerOpts.
+const _breakers = {
+  anthropic: createBreaker('anthropic', { threshold: config.breakerThreshold, resetMs: config.breakerResetMs }),
+  codex:     createBreaker('codex',     { threshold: config.breakerThreshold, resetMs: config.breakerResetMs }),
+  ollama:    createBreaker('ollama',    { threshold: config.breakerThreshold, resetMs: config.breakerResetMs }),
+};
+
+function getBreakers() {
+  return _breakers;
+}
+
+// ---------------------------------------------------------------------------
+// Retry + breaker helpers
+// ---------------------------------------------------------------------------
+
+function defaultSleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Two-point res.headersSent guard (normative §2.3B):
+// 1. Top-of-loop: before any sleep — catches synchronous header-set during fn()
+// 2. Post-sleep: before next fn() call — catches async races during await sleep()
+async function retryWithBackoff(fn, res, opts = {}) {
+  const maxAttempts = opts.maxAttempts || 3;
+  const baseMs = opts.baseMs || 200;
+  const jitter = opts.jitterFn || (() => Math.random());
+  const sleep = opts.sleepFn || defaultSleep;
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (res.headersSent) throw lastErr || new Error('headers sent; retry aborted');
+    if (attempt > 0) {
+      const delay = baseMs * Math.pow(2, attempt - 1) * (0.5 + jitter() * 0.5);
+      await sleep(delay);
+      // GUARD: check again after sleep — another async path may have set headersSent
+      if (res.headersSent) throw lastErr || new Error('headers sent during backoff; retry aborted');
+    }
+    try {
+      return await fn();
+    } catch (err) {
+      if (!err.retryable) throw err; // non-retryable: propagate immediately
+      lastErr = err;
+    }
+  }
+  throw lastErr; // all attempts exhausted
+}
+
+// Fail-open wrappers — a throwing breaker defaults to CLOSED and logs a warning.
+function safeAcquire(breaker) {
+  try { return breaker.acquire(); }
+  catch (e) {
+    console.warn('[miser] breaker.acquire error (fail-open):', e.message);
+    return true;
+  }
+}
+
+function safeRecord(breaker, method) {
+  try { breaker[method](); }
+  catch (e) { console.warn(`[miser] breaker.${method} error:`, e.message); }
+}
+
+// Extract nowMs from guardDeps.nowFn (returns a Date) or fallback to new Date().
+function _nowMs(guardDeps) {
+  return ((guardDeps.nowFn || (() => new Date()))()).getTime();
+}
+
+// Fire-and-forget sub-cap alert — synchronous section wrapped in try/catch so
+// a tracker or ledger exception can never escape to the Codex success/429 path.
+function _maybeAlertSubCap(guardDeps, nowMs) {
+  if (!guardDeps || !guardDeps.subCapTracker) return;
+  let status;
+  try {
+    status = guardDeps.subCapTracker.getStatus(nowMs);
+    if (!status.shouldAlert) return;
+    if (!guardDeps.ledger || !guardDeps.ledger.shouldSend('subcap:codex:80pct')) return;
+    guardDeps.ledger.markSent('subcap:codex:80pct');
+  } catch (e) {
+    console.warn('[miser] _maybeAlertSubCap sync error (ignored):', e.message);
+    return;
+  }
+  const sendAlert = guardDeps.sendAlert || require('./daily-rollup.js').sendAlert;
+  const pctMsg = `Codex ${Math.round(status.capFraction * 100)}% of ${status.cap5h}-req 5h cap`;
+  const events429Msg = status.events429In5h > 0 ? ` — ${status.events429In5h} 429s observed` : '';
+  Promise.resolve()
+    .then(() => sendAlert(`⚠️ miser sub-cap: ${pctMsg}${events429Msg} — deferBackground=true`))
+    .catch(() => {});
+}
+
 // ---------------------------------------------------------------------------
 // Failover chain (anthropic format):
 //
-//   Anthropic          --429-->  Codex/OpenAI (subscription OAuth, translated)
-//   Codex/OpenAI       --429 or transient-->  hard-capped Ollama
+//   Anthropic          --429 or OPEN-->  Codex/OpenAI (subscription OAuth)
+//   Codex/OpenAI       --429/5xx/OPEN->  hard-capped Ollama
+//   Ollama             --OPEN--------->  503 to client
+//
+// G4 retry: 529/5xx/connect-errors are retried up to retryMaxAttempts before
+// the leg is considered exhausted. 429 is NOT retried.
+// G4 breakers: per-upstream CLOSED/OPEN/HALF_OPEN; only retryable failures count.
+// B3: Codex successes + 429s are recorded in the sub-cap tracker (when enabled).
 //
 // Every network leg goes through an injectable transport seam so the offline
-// test harness can drive the whole chain with zero sockets (no :20128, no real
-// api.anthropic.com / api.openai.com / Ollama). Production uses the real
-// https/http transports defined below.
+// test harness can drive the whole chain with zero sockets.
 // ---------------------------------------------------------------------------
 
 function defaultDeps() {
@@ -52,9 +145,17 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   const transports = { ...base.transports, ...(deps.transports || {}) };
   const getBearer = deps.getBearer || base.getBearer;
   const ollamaCap = deps.ollamaCap != null ? deps.ollamaCap : base.ollamaCap;
-  // Sprint B: guardrail deps ride along to the Anthropic leg only (B6 context
-  // bloat consumes MEASURED usage, which only the Anthropic leg captures).
   const guardDeps = deps.guardDeps;
+
+  // Merge injected breakers for tests; production uses module-level singletons.
+  const breakers = { ..._breakers, ...(deps.breakers || {}) };
+
+  const retryOpts = {
+    maxAttempts: (deps.retryOpts && deps.retryOpts.maxAttempts) || config.retryMaxAttempts,
+    baseMs:      (deps.retryOpts && deps.retryOpts.baseMs)      || config.retryBaseMs,
+    sleepFn:     deps.retryOpts && deps.retryOpts.sleepFn,  // undefined → defaultSleep
+    jitterFn:    deps.retryOpts && deps.retryOpts.jitterFn, // undefined → Math.random
+  };
 
   if (format === 'openai') {
     // Already-OpenAI-format request: passthrough, Ollama on 429. (Unchanged
@@ -77,45 +178,99 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   }
 
   // --- Anthropic path ------------------------------------------------------
-  try {
-    await transports.anthropic(messages, originalBody, incomingHeaders, res, project, savedTokens, guardDeps);
-    return;
-  } catch (err) {
-    incrementLegError('anthropic');
-    if (err.statusCode !== 429 || res.headersSent) throw err;
-    console.log('[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)');
+  if (safeAcquire(breakers.anthropic)) {
+    try {
+      await retryWithBackoff(
+        () => transports.anthropic(messages, originalBody, incomingHeaders, res, project, savedTokens, guardDeps),
+        res, retryOpts
+      );
+      safeRecord(breakers.anthropic, 'recordSuccess');
+      return;
+    } catch (err) {
+      incrementLegError('anthropic');
+      if (res.headersSent) throw err; // streaming started — cannot recover
+      if (err.retryable) safeRecord(breakers.anthropic, 'recordFailure');
+      if (err.statusCode !== 429) throw err; // non-429 (5xx after retries) → error to client
+      // is 429 + headers not sent → fall through to Codex leg
+      console.log('[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)');
+    }
+  } else {
+    console.log('[miser] Anthropic breaker OPEN — skipping to Codex');
   }
 
   // --- Leg 2: Codex via subscription OAuth ---------------------------------
-  try {
-    const bearer = await getBearer(); // fail closed: throws if no valid token
-    // Build the request in the configured Codex wire format. Default is the
-    // Responses API (Codex backend, where the subscription OAuth authenticates);
-    // 'chat' keeps the OpenAI chat/completions shape available.
-    const useChat = config.codexFormat === 'chat';
-    const codexReq = useChat
-      ? translateToOpenAI(messages, originalBody)
-      : translateToResponses(messages, originalBody);
-    const check = useChat ? validateOpenAIRequest(codexReq) : validateResponsesRequest(codexReq);
-    if (!check.valid) {
-      // Never ship a malformed request (this is what bricked the client before).
-      const e = new Error(`miser: refusing malformed Codex request: ${check.error}`);
-      e.statusCode = 400;
-      throw e;
+  if (safeAcquire(breakers.codex)) {
+    try {
+      const bearer = await getBearer(); // fail closed: throws if no valid token
+      const useChat = config.codexFormat === 'chat';
+      const codexReq = useChat
+        ? translateToOpenAI(messages, originalBody)
+        : translateToResponses(messages, originalBody);
+      const check = useChat ? validateOpenAIRequest(codexReq) : validateResponsesRequest(codexReq);
+      if (!check.valid) {
+        const e = new Error(`miser: refusing malformed Codex request: ${check.error}`);
+        e.statusCode = 400;
+        throw e;
+      }
+      await retryWithBackoff(
+        () => transports.codex(codexReq, bearer, res, project, savedTokens),
+        res, retryOpts
+      );
+      // B3: record Codex success and maybe alert on cap proximity
+      if (guardDeps && guardDeps.subCapTracker) {
+        const nowMs = _nowMs(guardDeps);
+        guardDeps.subCapTracker.recordSuccess(nowMs);
+        _maybeAlertSubCap(guardDeps, nowMs);
+      }
+      safeRecord(breakers.codex, 'recordSuccess');
+      return;
+    } catch (err) {
+      incrementLegError('codex');
+      if (res.headersSent) throw err; // response already streaming — can't fail over
+      // Normative catch ordering (R3):
+      // 1. Subscription cap (429): B3 event + alert; fall through to Ollama; no breaker record
+      if (err.statusCode === 429) {
+        if (guardDeps && guardDeps.subCapTracker) {
+          const nowMs = _nowMs(guardDeps);
+          guardDeps.subCapTracker.record429(nowMs);
+          _maybeAlertSubCap(guardDeps, nowMs);
+        }
+        console.log('[miser] Codex 429 — hard-capped Ollama fallback');
+        // fall through to Ollama
+      } else if (err.statusCode === 401 || err.statusCode === 403 || err.statusCode === 400) {
+        // Auth/client errors: NOT retried, NOT a B3 event, NOT a breaker event.
+        // Fall through to Ollama — existing contract (test/failover.test.js:90-119).
+        console.log(`[miser] Codex auth/client error (${err.statusCode}) — Ollama fallback`);
+        // fall through to Ollama
+      } else if (err.retryable) {
+        // 5xx / connect-error after retries exhausted: record breaker failure; fall through
+        safeRecord(breakers.codex, 'recordFailure');
+        console.log(`[miser] Codex/OpenAI unavailable (${err.statusCode || err.message}) — Ollama fallback`);
+        // fall through to Ollama
+      } else {
+        // Unknown error shape: propagate
+        throw err;
+      }
     }
-    await transports.codex(codexReq, bearer, res, project, savedTokens);
-    return;
-  } catch (err) {
-    incrementLegError('codex');
-    if (res.headersSent) throw err; // response already streaming — can't fail over
-    console.log(`[miser] Codex/OpenAI unavailable (${err.statusCode || err.message}) — hard-capped Ollama fallback`);
+  } else {
+    console.log('[miser] Codex breaker OPEN — skipping to Ollama');
   }
 
   // --- Leg 3: hard-capped Ollama ------------------------------------------
-  try {
-    await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
-  } catch (err) {
+  if (safeAcquire(breakers.ollama)) {
+    try {
+      await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
+      safeRecord(breakers.ollama, 'recordSuccess');
+    } catch (err) {
+      incrementLegError('ollama');
+      // Only retryable errors (connect-errors, transport failures) count against the breaker.
+      if (err.retryable) safeRecord(breakers.ollama, 'recordFailure');
+      throw err;
+    }
+  } else {
     incrementLegError('ollama');
+    const err = new Error('miser: all upstreams unavailable (ollama breaker OPEN)');
+    err.statusCode = 503;
     throw err;
   }
 }
@@ -124,10 +279,6 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
 // Production transports (real sockets). Not exercised by the offline harness.
 // ---------------------------------------------------------------------------
 
-// Once response headers are sent we can no longer emit a clean JSON error, and
-// the router/proxy cannot either (headersSent is true). If the upstream stream
-// then errors we MUST terminate the downstream response so the client sees a
-// broken stream rather than an indefinitely-hung connection.
 function teardownResponse(res, err) {
   try {
     if (res.destroyed) return;
@@ -180,11 +331,6 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, savedToken
       if (parsed && (parsed.usage || parsed.appliedEdits)) {
         recordAnthropicUsage(project, 'anthropic', model, parsed.usage || {}, parsed.appliedEdits);
       }
-      // B6 context bloat (Sprint B §2.2): fire-and-forget, exception-isolated,
-      // never delays resolve(). guardDeps.checkContextBloat is only present
-      // when MISER_POLICY is active (index.js wiring) — with G3-only or
-      // guardrails-OFF this guard is false and zero bloat code runs. Legs with
-      // no usage capture pass null and checkContextBloat returns immediately.
       if (guardDeps && guardDeps.checkContextBloat) {
         Promise.resolve()
           .then(() => guardDeps.checkContextBloat(project, model, parsed && parsed.usage, guardDeps))
@@ -198,14 +344,7 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, savedToken
 
 function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens, guardDeps) {
   return new Promise((resolve, reject) => {
-    // I6: `originalBody` here IS the reduced body compress() produced (hoisted
-    // system, optional cache hint, deduped messages). Serialize it verbatim —
-    // it already carries the authoritative `messages`; do NOT rebuild from a
-    // pre-reduction body or the top-level system hoist would not reach the wire.
     const body = JSON.stringify(originalBody);
-    // §8.3: parse host/path from config.anthropicUrl (authoritative field) rather
-    // than a hardcoded host — enables the AC10 loopback-echo canary + testability.
-    // No failover-logic change.
     const anthURL = new URL(config.anthropicUrl);
     const options = {
       hostname: anthURL.hostname,
@@ -219,14 +358,10 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
       },
     };
 
-    // Forward all auth headers — subscription uses Authorization: Bearer,
-    // API-key use x-api-key. Forward both so either auth mode works unchanged.
     if (incomingHeaders['x-api-key']) options.headers['x-api-key'] = incomingHeaders['x-api-key'];
     if (incomingHeaders['authorization']) options.headers['authorization'] = incomingHeaders['authorization'];
     if (incomingHeaders['anthropic-beta']) options.headers['anthropic-beta'] = incomingHeaders['anthropic-beta'];
 
-    // Protocol-aware transport so a loopback http:// MISER_ANTHROPIC_URL (AC10
-    // canary / tests) works; production https:// api.anthropic.com is unchanged.
     const anthTransport = anthURL.protocol === 'https:' ? https : http;
     const req = anthTransport.request(options, (upstream) => {
       if (upstream.statusCode === 429) {
@@ -236,11 +371,22 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
         reject(err);
         return;
       }
-
+      // §2.3A (M3 visual inspection): 529/5xx intercepted BEFORE proxyAnthropicResponse.
+      // upstream.resume() drains the body; proxyAnthropicResponse is never invoked;
+      // res.writeHead() is NOT called by this path (headersSent stays false → retry possible).
+      if (upstream.statusCode === 529
+          || (upstream.statusCode >= 500 && upstream.statusCode <= 599)) {
+        const err = new Error(`anthropic ${upstream.statusCode}`);
+        err.statusCode = upstream.statusCode;
+        err.retryable = true;
+        upstream.resume(); // drain body — do NOT pipe
+        reject(err);
+        return;
+      }
       proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject, guardDeps);
     });
 
-    req.on('error', reject);
+    req.on('error', (err) => { err.retryable = true; reject(err); });
     req.write(body);
     req.end();
   });
@@ -249,8 +395,6 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
 // Legacy passthrough for requests that ARRIVE already in OpenAI format.
 function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, savedTokens) {
   return new Promise((resolve, reject) => {
-    // I6: `originalBody` is the reduced body (deduped messages). Serialize it
-    // verbatim — it already carries the authoritative `messages`.
     const body = JSON.stringify(originalBody);
     const options = {
       hostname: 'api.openai.com',
@@ -289,15 +433,9 @@ function forwardToOpenAI(messages, originalBody, incomingHeaders, res, project, 
   });
 }
 
-// Codex failover transport. Driven by a TRANSLATED Codex request (Responses API
-// by default) + a subscription OAuth bearer. On ANY non-2xx it rejects BEFORE
-// writing a response header so the router can fail over to Ollama — critically
-// this includes 401/403 (expired/invalid token → fail closed, never streamed to
-// the client). On 2xx it re-emits the Codex SSE in ANTHROPIC event shape so the
-// client can parse it (raw-piping the Responses stream would brick the client,
-// exactly like a raw Ollama stream). Backend headers + SSE schema are extracted
-// from the codex CLI and flagged VERIFY-AT-CUTOVER; fully mocked in the offline
-// harness.
+// Codex failover transport. On 5xx, marks retryable so the retry wrapper fires.
+// On 401/403/400/429, retryable stays false — propagates immediately to the
+// routeRequest catch which routes each code appropriately.
 function forwardToCodex(codexReq, bearer, res, project, savedTokens) {
   return new Promise((resolve, reject) => {
     const url = new URL(config.codexUrl);
@@ -307,14 +445,11 @@ function forwardToCodex(codexReq, bearer, res, project, savedTokens) {
     const headers = {
       'content-type': 'application/json',
       'content-length': Buffer.byteLength(body),
-      // Subscription OAuth — NOT OPENAI_API_KEY.
       'authorization': `Bearer ${bearer.token}`,
       'accept': isResponses ? 'text/event-stream' : 'application/json',
     };
     if (bearer.accountId) headers['chatgpt-account-id'] = bearer.accountId;
     if (isResponses) {
-      // Client-identity headers matching the real codex HTTPS request (PINNED
-      // from a live capture). Note: NO `openai-beta` — the real request omits it.
       if (config.codexOriginator) headers['originator'] = config.codexOriginator;
       if (config.codexUserAgent) headers['user-agent'] = config.codexUserAgent;
       if (config.codexClientVersion) headers['version'] = config.codexClientVersion;
@@ -329,13 +464,12 @@ function forwardToCodex(codexReq, bearer, res, project, savedTokens) {
     };
 
     const req = transport.request(options, (upstream) => {
-      // Fail over to Ollama on ANY non-2xx. Critically this includes 401/403:
-      // an expired/invalid subscription token must NOT be streamed to the
-      // client as a "successful" Codex response — it fails closed to Ollama.
-      // We reject BEFORE writeHead so the router can still fail over.
       if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
-        const err = new Error(`codex non-2xx ${upstream.statusCode}`);
-        err.statusCode = upstream.statusCode;
+        const statusCode = upstream.statusCode;
+        const err = new Error(`codex non-2xx ${statusCode}`);
+        err.statusCode = statusCode;
+        if (statusCode >= 500 && statusCode <= 599) err.retryable = true;
+        // 401/403/400/429 → retryable stays false → immediate propagation out of retry wrapper
         upstream.resume();
         reject(err);
         return;
@@ -347,15 +481,15 @@ function forwardToCodex(codexReq, bearer, res, project, savedTokens) {
         'x-miser-saved-tokens': String(savedTokens),
       });
       if (isResponses) {
-        translateResponsesStream(upstream, res, codexReq.model || 'codex'); // Responses SSE → Anthropic SSE
+        translateResponsesStream(upstream, res, codexReq.model || 'codex');
       } else {
-        upstream.pipe(res); // chat/completions: already JSON/OpenAI shape
+        upstream.pipe(res);
       }
       upstream.on('end', () => { recordUsage(project, 'codex', codexReq.model || 'unknown'); resolve(); });
       upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
     });
 
-    req.on('error', reject);
+    req.on('error', (err) => { err.retryable = true; reject(err); });
     req.write(body);
     req.end();
   });
@@ -365,8 +499,6 @@ function forwardToOllama(messages, originalBody, res, project, savedTokens, opts
   return new Promise((resolve, reject) => {
     const model = config.fallbackModels[0];
     const translated = translateToOllama(messages, originalBody, model);
-    // Hard-cap the fully-translated body so an oversized double-fallback payload
-    // (or a single huge recent message) can never exceed the local context.
     const cap = opts.cap != null ? opts.cap : config.ollamaHardCap;
     const ollamaBody = hardCapOllamaBody(translated, cap);
     const bodyStr = JSON.stringify(ollamaBody);
@@ -396,7 +528,7 @@ function forwardToOllama(messages, originalBody, res, project, savedTokens, opts
       upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
     });
 
-    req.on('error', reject);
+    req.on('error', (err) => { err.retryable = true; reject(err); });
     req.write(bodyStr);
     req.end();
   });
@@ -411,8 +543,15 @@ module.exports = {
   forwardToOllama,
   teardownResponse,
   getLegErrors,
-  __test: { _legErrors },
-  // exported so the hard-cap can be asserted end-to-end (translate → cap)
+  getBreakers,
+  __test: {
+    _legErrors,
+    _breakers,
+    safeAcquire,
+    safeRecord,
+    retryWithBackoff,
+    _maybeAlertSubCap,
+  },
   _buildCappedOllamaBody: (messages, originalBody, cap) =>
     hardCapOllamaBody(translateToOllama(messages, originalBody, config.fallbackModels[0]), cap),
 };
