@@ -1,14 +1,22 @@
 'use strict';
 
+const os = require('node:os');
+const path = require('node:path');
+// Pin stats file before any src require
+process.env.MISER_STATS_FILE = path.join(os.tmpdir(), `miser-failover-test-${process.pid}-${Date.now()}.json`);
+
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const path = require('node:path');
 const { routeRequest, teardownResponse } = require('../src/router.js');
+const { createBreaker } = require('../src/circuit-breaker.js');
 const { compress } = require('../src/compress.js');
 const { translateToResponses } = require('../src/translate-responses.js');
 const { translateToOllama } = require('../src/translate.js');
 const { makeRes, successTransport, failTransport } = require('./_harness.js');
+
+// Injected retryOpts for tests that need instant retries (no real sleeps)
+const fastRetry = { sleepFn: () => Promise.resolve(), jitterFn: () => 0.5, maxAttempts: 1 };
 
 // Fake subscription bearer — never reads ~/.codex/auth.json.
 const fakeBearer = () => ({ token: 'FAKE-ACCESS-TOKEN', accountId: 'acct_test' });
@@ -100,7 +108,8 @@ test('Anthropic 429 → no bearer (fail closed) → Ollama IS called (Codex skip
 // REGRESSION (Codex inversion finding #1): an expired/invalid subscription
 // token yields a Codex 401/403 — that must fail closed to Ollama, NOT stream
 // the auth error to the client as a "successful" Codex response.
-for (const status of [401, 403, 400, 502]) {
+// 401/403/400 are NOT retried and fall through to Ollama immediately.
+for (const status of [401, 403, 400]) {
   test(`Anthropic 429 → Codex ${status} → fails over to Ollama (no auth error streamed)`, async () => {
     const calls = [];
     const deps = {
@@ -118,6 +127,32 @@ for (const status of [401, 403, 400, 502]) {
     assert.equal(res.headers['x-miser-provider'], 'ollama');
   });
 }
+
+// 502 (retryable 5xx): the real forwardToCodex marks 5xx as retryable=true; after
+// retries exhausted the retryable branch falls through to Ollama.
+test('Anthropic 429 → Codex 502 (retryable 5xx) → fails over to Ollama after retries', async () => {
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (...args) => {
+        calls.push({ name: 'codex' });
+        const err = new Error('codex 502');
+        err.statusCode = 502;
+        err.retryable = true; // as real forwardToCodex would set on 5xx
+        return Promise.reject(err);
+      },
+      ollama: successTransport('ollama', calls),
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+    retryOpts: fastRetry, // instant sleep, maxAttempts=1 → codex called once
+  };
+  const res = makeRes();
+  await routeRequest(ANTH_MSGS, ANTH_BODY, {}, res, 'proj', 0, 'anthropic', deps);
+  assert.deepEqual(calls.map(c => c.name), ['anthropic', 'codex', 'ollama']);
+  assert.equal(res.headers['x-miser-provider'], 'ollama');
+});
 
 test('Codex leg receives a validated Responses request + the subscription bearer', async () => {
   const captured = {};
@@ -433,4 +468,87 @@ test('server entrypoint (the only .listen on :20128) is never loaded during test
   // Sanity: index.js IS the file that binds the port (documents the invariant).
   const idx = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.js'), 'utf8');
   assert.match(idx, /server\.listen\(config\.port/, 'index.js is the port-binding entrypoint');
+});
+
+// ===========================================================================
+// AC5 — G4 circuit breaker: OPEN state skips the corresponding upstream leg
+// ===========================================================================
+
+// AC5-A: Anthropic breaker OPEN → skips Anthropic, routes to Codex
+test('AC5-A: Anthropic breaker OPEN skips Anthropic transport, routes to Codex', async () => {
+  const anthropicBreaker = createBreaker('ac5-anth', { threshold: 3 });
+  anthropicBreaker.recordFailure(); anthropicBreaker.recordFailure(); anthropicBreaker.recordFailure();
+  assert.equal(anthropicBreaker.getState().state, 'OPEN');
+
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: (...a) => { calls.push({ name: 'anthropic' }); return Promise.resolve(); },
+      codex: successTransport('codex', calls),
+      ollama: successTransport('ollama', calls),
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+    breakers: { anthropic: anthropicBreaker },
+    retryOpts: fastRetry,
+  };
+  const res = makeRes();
+  await routeRequest(ANTH_MSGS, ANTH_BODY, {}, res, 'proj', 0, 'anthropic', deps);
+  assert.ok(!calls.some(c => c.name === 'anthropic'), 'Anthropic transport must NOT be called when breaker OPEN');
+  assert.ok(calls.some(c => c.name === 'codex'), 'Codex must be called');
+  assert.equal(res.headers['x-miser-provider'], 'codex');
+});
+
+// AC5-B: Codex breaker OPEN → skips Codex transport, routes to Ollama (B1 + M1)
+test('AC5-B: Codex breaker OPEN skips Codex transport (B1), routes to Ollama (M1)', async () => {
+  const codexBreaker = createBreaker('ac5-codex', { threshold: 3 });
+  codexBreaker.recordFailure(); codexBreaker.recordFailure(); codexBreaker.recordFailure();
+  assert.equal(codexBreaker.getState().state, 'OPEN');
+
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429), // 429 → fall through to Codex leg
+      codex: (...a) => { calls.push({ name: 'codex' }); return Promise.resolve(); },
+      ollama: successTransport('ollama', calls),
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+    breakers: { codex: codexBreaker },
+    retryOpts: fastRetry,
+  };
+  const res = makeRes();
+  await routeRequest(ANTH_MSGS, ANTH_BODY, {}, res, 'proj', 0, 'anthropic', deps);
+  assert.ok(!calls.some(c => c.name === 'codex'), 'Codex transport must NOT be called when breaker OPEN');
+  assert.ok(calls.some(c => c.name === 'ollama'), 'Ollama must be called');
+  assert.equal(res.headers['x-miser-provider'], 'ollama');
+});
+
+// AC5-C: Ollama breaker OPEN → surfaces 503 to client; Ollama transport never called
+test('AC5-C: Ollama breaker OPEN surfaces 503 error; Ollama transport never called', async () => {
+  const ollamaBreaker = createBreaker('ac5-ollama', { threshold: 3 });
+  ollamaBreaker.recordFailure(); ollamaBreaker.recordFailure(); ollamaBreaker.recordFailure();
+  assert.equal(ollamaBreaker.getState().state, 'OPEN');
+
+  const calls = [];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: failTransport('codex', calls, 429),
+      ollama: (...a) => { calls.push({ name: 'ollama' }); return Promise.resolve(); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+    breakers: { ollama: ollamaBreaker },
+    retryOpts: fastRetry,
+  };
+  const res = makeRes();
+  await assert.rejects(
+    () => routeRequest(ANTH_MSGS, ANTH_BODY, {}, res, 'proj', 0, 'anthropic', deps),
+    (err) => {
+      assert.equal(err.statusCode, 503);
+      return true;
+    },
+  );
+  assert.ok(!calls.some(c => c.name === 'ollama'), 'Ollama transport must NOT be called when breaker OPEN');
 });

@@ -189,6 +189,67 @@ test('B6-only → ledger + checkContextBloat, no budgets keys', () => {
 });
 
 // ---------------------------------------------------------------------------
+// AC11 — B3 cap-only buildGuardDeps wiring
+// ---------------------------------------------------------------------------
+
+test('AC11: cap-only (budgets=null, policy=null, codex5hCap=40) → ledger + subCapTracker wired', () => {
+  const { budgets } = freshModules(tmpFile('ac11a'));
+  let ledgerCalls = 0;
+  let trackerCalls = 0;
+  const seams = {
+    createLedger: () => { ledgerCalls += 1; return { fake: 'ledger' }; },
+    createSubCapTracker: (opts) => { trackerCalls += 1; return { fake: 'tracker', opts }; },
+  };
+  const deps = budgets.buildGuardDeps(
+    { budgets: null, policy: null, codex5hCap: 40, codexWeeklyCap: 280, budgetGrace: [] },
+    seams,
+  );
+  assert.equal(ledgerCalls, 1);
+  assert.equal(trackerCalls, 1);
+  assert.ok(deps.ledger);
+  assert.ok(deps.subCapTracker);
+  assert.equal(deps.subCapTracker.opts.cap5h, 40);
+  assert.equal(deps.subCapTracker.opts.weeklyCap, 280);
+  assert.equal('budgetsConfig' in deps, false);
+  assert.equal('policyConfig' in deps, false);
+});
+
+test('AC11: all three features OFF (codex5hCap=0) → empty deps, no spies called', () => {
+  const { budgets } = freshModules(tmpFile('ac11b'));
+  let ledgerCalls = 0;
+  let trackerCalls = 0;
+  const seams = {
+    createLedger: () => { ledgerCalls += 1; return {}; },
+    createSubCapTracker: () => { trackerCalls += 1; return {}; },
+  };
+  const deps = budgets.buildGuardDeps(
+    { budgets: null, policy: null, codex5hCap: 0, budgetGrace: [] },
+    seams,
+  );
+  assert.deepEqual(deps, {});
+  assert.equal(ledgerCalls, 0);
+  assert.equal(trackerCalls, 0);
+});
+
+test('AC11: cap + budgets both active → both wired alongside each other', () => {
+  const { budgets } = freshModules(tmpFile('ac11c'));
+  let ledgerCalls = 0;
+  let trackerCalls = 0;
+  const seams = {
+    createLedger: () => { ledgerCalls += 1; return { fake: 'ledger' }; },
+    createSubCapTracker: () => { trackerCalls += 1; return { fake: 'tracker' }; },
+  };
+  const deps = budgets.buildGuardDeps(
+    { budgets: { proj: { dailyUSD: 5 } }, policy: null, codex5hCap: 40, budgetGrace: [] },
+    seams,
+  );
+  assert.equal(ledgerCalls, 1); // ledger created once only
+  assert.equal(trackerCalls, 1);
+  assert.ok(deps.budgetsConfig);
+  assert.ok(deps.subCapTracker);
+});
+
+// ---------------------------------------------------------------------------
 // AC3 — state machine: UNDER → WARNED → CAPPED, one alert each, day re-arm
 // ---------------------------------------------------------------------------
 

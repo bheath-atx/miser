@@ -88,4 +88,13 @@ module.exports = {
   codexOriginator: process.env.MISER_CODEX_ORIGINATOR || 'codex_cli_rs',
   codexUserAgent: process.env.MISER_CODEX_USER_AGENT || 'codex_cli_rs/0.144.1 (miser failover)',
   codexClientVersion: process.env.MISER_CODEX_VERSION || '0.144.1',
+  // G4 pre-stream retry with jittered backoff
+  retryMaxAttempts: parseInt(process.env.MISER_RETRY_MAX_ATTEMPTS || '3', 10),
+  retryBaseMs:      parseInt(process.env.MISER_RETRY_BASE_MS      || '200', 10),
+  // G4 per-upstream circuit breakers
+  breakerThreshold: parseInt(process.env.MISER_BREAKER_THRESHOLD || '5', 10),
+  breakerResetMs:   parseInt(process.env.MISER_BREAKER_RESET_MS  || '30000', 10),
+  // B3 Codex subscription-cap intelligence (0 = feature OFF)
+  codex5hCap:    parseInt(process.env.MISER_CODEX_5H_CAP    || '0', 10),
+  codexWeeklyCap: parseInt(process.env.MISER_CODEX_WEEKLY_CAP || '0', 10),
 };
