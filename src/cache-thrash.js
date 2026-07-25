@@ -29,7 +29,7 @@ function createCacheThrashChecker(config) {
     state.ring.push({ inputTokens, cacheWrite1h });
     if (state.ring.length > maxRing) state.ring.shift();
 
-    if (state.ring.length < minReq) {
+    if (priorEntries.length < minReq) {
       return { warm: false, insufficientBaseline: true, shouldAlert: false };
     }
 

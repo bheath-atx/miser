@@ -44,26 +44,34 @@ async function tick() {
 
 // ---- AC21: first 4 calls return warm:false ----------------------------------
 
-test('AC21: first 4 calls return warm:false regardless of usage values', () => {
+test('AC21: first 5 calls return warm:false (minRequests=5 prior samples required)', () => {
   const checker = createCacheThrashChecker(baseConfig());
   const guardDeps = makeGuardDeps();
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     const result = checker.check('proj', 'model', rawUsage(1000, 500), guardDeps);
     assert.equal(result.warm, false, `call ${i + 1} should be warm:false`);
+    assert.equal(result.insufficientBaseline, true, `call ${i + 1} should be insufficientBaseline:true`);
   }
   assert.equal(guardDeps._alertCalls.length, 0, 'no alert should fire before warm');
 });
 
 // ---- AC22: 5th call with spike triggers alert ------------------------------
 
-test('AC22: 5th call with 10× spike + normal input triggers alert', async () => {
-  const checker = createCacheThrashChecker(baseConfig());
+test('AC22: Nth call (N-1 prior samples) blocked; (N+1)th call with 10× spike triggers alert', async () => {
+  const checker = createCacheThrashChecker(baseConfig()); // minRequests=5
   const guardDeps = makeGuardDeps();
-  // Establish baseline: 4 requests with cacheWrite1h=100, inputTokens=1000
+  // Establish 4 prior baseline samples (N-1 where N=5)
   for (let i = 0; i < 4; i++) {
     checker.check('proj', 'model', rawUsage(1000, 100), guardDeps);
   }
-  // 5th: spike cacheWrite1h to 1000 (10× prior avg of 100), input stays normal
+  // 5th call (Nth): only 4 prior samples — must return insufficientBaseline:true even with spike
+  const earlyResult = checker.check('proj', 'model', rawUsage(1000, 1000), guardDeps);
+  assert.equal(earlyResult.warm, false);
+  assert.equal(earlyResult.insufficientBaseline, true);
+  assert.equal(earlyResult.shouldAlert, false);
+  // Establish 5th baseline sample (ring now has 5 prior entries including the failed spike)
+  checker.check('proj', 'model', rawUsage(1000, 100), guardDeps);
+  // 7th call: 5 prior samples (priorEntries.length >= minRequests) — spike triggers alert
   const result = checker.check('proj', 'model', rawUsage(1000, 1000), guardDeps);
   assert.equal(result.warm, true);
   assert.equal(result.shouldAlert, true);
@@ -76,7 +84,7 @@ test('AC22: 5th call with 10× spike + normal input triggers alert', async () =>
 test('AC23: input spike alongside cacheWrite spike → no alert', async () => {
   const checker = createCacheThrashChecker(baseConfig());
   const guardDeps = makeGuardDeps();
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     checker.check('proj', 'model', rawUsage(1000, 100), guardDeps);
   }
   // cacheWrite1h spikes, but input ALSO spikes beyond inputSpikeRatio (2×)
@@ -98,7 +106,7 @@ test('AC24: ledger shouldSend=false prevents duplicate alert', async () => {
     },
     sendAlert: () => { sendCount++; },
   });
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     checker.check('proj', 'model', rawUsage(1000, 100), guardDeps);
   }
   checker.check('proj', 'model', rawUsage(1000, 1000), guardDeps);
@@ -146,7 +154,7 @@ test('AC27: throwing sendAlert is isolated — console.warn fires, no crash', as
     const guardDeps = makeGuardDeps({
       sendAlert: () => { throw new Error('alert fail'); },
     });
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       checker.check('proj', 'model', rawUsage(1000, 100), guardDeps);
     }
     const result = checker.check('proj', 'model', rawUsage(1000, 1000), guardDeps);
