@@ -4,6 +4,39 @@ const { parseContextEditProjects } = require('./context-management.js');
 const { parseBudgets, parseBudgetGrace } = require('./budgets.js');
 const { parsePolicy } = require('./policy-watchdog.js');
 
+// B4 startup guard: refuse to start if any configured project name contains '--'
+// (which collides with the panel routing grammar). Exported for unit tests so
+// tests can call it with a fake config object without importing index.js.
+function validateStartupConfig(cfg) {
+  const maps = [
+    ['budgets',             cfg.budgets],
+    ['policy',              cfg.policy],
+    ['contextEditProjects', cfg.contextEditProjects],
+    ['toolAllowlists',      cfg.toolAllowlists],
+  ];
+  for (const [label, map] of maps) {
+    if (!map || typeof map !== 'object') continue;
+    for (const name of Object.keys(map)) {
+      if (name.includes('--')) {
+        throw new Error(
+          `[miser] fatal: ${label} config contains project name "${name}" ` +
+          `with "--" separator — this collides with the B4 panel routing grammar. ` +
+          `Rename the project or remove the config entry.`
+        );
+      }
+    }
+  }
+  for (const name of (cfg.budgetGrace || [])) {
+    if (typeof name === 'string' && name.includes('--')) {
+      throw new Error(
+        `[miser] fatal: budgetGrace config contains project name "${name}" ` +
+        `with "--" separator — this collides with the B4 panel routing grammar. ` +
+        `Rename the project or remove the config entry.`
+      );
+    }
+  }
+}
+
 const contextEditConfig = parseContextEditProjects(process.env.MISER_CONTEXT_EDIT_PROJECTS || '');
 
 module.exports = {
@@ -97,4 +130,11 @@ module.exports = {
   // B3 Codex subscription-cap intelligence (0 = feature OFF)
   codex5hCap:    parseInt(process.env.MISER_CODEX_5H_CAP    || '0', 10),
   codexWeeklyCap: parseInt(process.env.MISER_CODEX_WEEKLY_CAP || '0', 10),
+  // B2 cache-thrash detector knobs (0 = feature OFF)
+  cacheThrashSpikeRatio:      parseFloat(process.env.MISER_CACHE_THRASH_SPIKE_RATIO      ?? '3.0'),
+  cacheThrashInputSpikeRatio: parseFloat(process.env.MISER_CACHE_THRASH_INPUT_SPIKE_RATIO ?? '2.0'),
+  cacheThrashMinRequests:     parseInt(process.env.MISER_CACHE_THRASH_MIN_REQUESTS        || '10', 10),
+  cacheThrashRingSize:        parseInt(process.env.MISER_CACHE_THRASH_RING_SIZE            || '50', 10),
 };
+
+module.exports.validateStartupConfig = validateStartupConfig;

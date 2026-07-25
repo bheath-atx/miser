@@ -8,7 +8,9 @@ const { createProxy } = require('./proxy.js');
 const { flushNow, getRawStatsSnapshot } = require('./stats.js');
 const { startDailyRollupInterval } = require('./daily-rollup.js');
 const { buildGuardDeps } = require('./budgets.js');
+const { wireCacheThrashDeps } = require('./cache-thrash.js');
 const config = require('./config.js');
+const { validateStartupConfig } = config;
 
 // --- Single-instance advisory lock -----------------------------------------
 // The OS port bind is the AUTHORITATIVE single-instance guard (two processes
@@ -46,11 +48,19 @@ try {
   }
 } catch (_) { /* no lockfile = clean start */ }
 
+// B4 startup validation: refuse to start if any configured project name collides
+// with the panel routing grammar (contains '--'). Throws with a clear message.
+validateStartupConfig(config);
+
 // Sprint B guardrail wiring (normative §2.5, assembled by buildGuardDeps):
 // ledger creation is CONDITIONAL — when both MISER_BUDGETS and MISER_POLICY
 // are OFF, no ledger I/O happens at startup and guardDeps stays empty (zero
 // overhead). checkContextBloat is only wired when MISER_POLICY is active.
 const guardDeps = buildGuardDeps(config);
+
+// B2: wire cache-thrash detector into guardDeps (no-op when MIN_REQUESTS=0).
+wireCacheThrashDeps(config, guardDeps);
+
 const server = http.createServer(createProxy({ guardDeps }));
 startDailyRollupInterval(getRawStatsSnapshot);
 
@@ -67,6 +77,9 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log(`[miser] retry: max ${config.retryMaxAttempts} attempts, base ${config.retryBaseMs}ms jittered backoff`);
   console.log(`[miser] breaker: threshold=${config.breakerThreshold} reset=${config.breakerResetMs}ms per-upstream`);
   console.log(`[miser] sub-cap: codex 5h cap ${config.codex5hCap > 0 ? `${config.codex5hCap} req` : 'OFF'} weekly ${config.codexWeeklyCap > 0 ? `${config.codexWeeklyCap} req` : 'OFF'}`);
+  console.log(`[miser] thrash-detector: ${config.cacheThrashMinRequests > 0
+    ? `ON (warm after ${config.cacheThrashMinRequests} req, spike=${config.cacheThrashSpikeRatio}×, ring=${config.cacheThrashRingSize})`
+    : 'OFF (MISER_CACHE_THRASH_MIN_REQUESTS=0)'}`);
   console.log(`[miser] health: GET http://127.0.0.1:${config.port}/api/miser/health`);
   console.log(`[miser] quota:  GET http://127.0.0.1:${config.port}/api/miser/quota`);
   console.log(`[miser] trend:  GET http://127.0.0.1:${config.port}/api/miser/stats/trend`);
