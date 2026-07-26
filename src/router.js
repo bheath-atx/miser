@@ -9,6 +9,7 @@ const { hardCapOllamaBody } = require('./hardcap.js');
 const { getCodexBearer } = require('./oauth.js');
 const { recordUsage } = require('./quota.js');
 const { recordAnthropicUsage } = require('./stats.js');
+const { recordPanelUsage } = require('./panel-stats.js');
 const { AnthropicUsageParser } = require('./usage.js');
 const { createBreaker } = require('./circuit-breaker.js');
 const config = require('./config.js');
@@ -146,6 +147,7 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   const getBearer = deps.getBearer || base.getBearer;
   const ollamaCap = deps.ollamaCap != null ? deps.ollamaCap : base.ollamaCap;
   const guardDeps = deps.guardDeps;
+  const panel = (deps && deps.panel) || null;
 
   // Merge injected breakers for tests; production uses module-level singletons.
   const breakers = { ..._breakers, ...(deps.breakers || {}) };
@@ -181,7 +183,7 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   if (safeAcquire(breakers.anthropic)) {
     try {
       await retryWithBackoff(
-        () => transports.anthropic(messages, originalBody, incomingHeaders, res, project, savedTokens, guardDeps),
+        () => transports.anthropic(messages, originalBody, incomingHeaders, res, project, panel, savedTokens, guardDeps),
         res, retryOpts
       );
       safeRecord(breakers.anthropic, 'recordSuccess');
@@ -287,7 +289,7 @@ function teardownResponse(res, err) {
   } catch (_) { /* best effort */ }
 }
 
-function proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject, guardDeps) {
+function proxyAnthropicResponse(upstream, res, originalBody, project, panel, savedTokens, resolve, reject, guardDeps) {
   const statusCode = upstream.statusCode;
   const contentType = upstream.headers['content-type'] || 'application/json';
   const parser = new AnthropicUsageParser({
@@ -331,10 +333,18 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, savedToken
       if (parsed && (parsed.usage || parsed.appliedEdits)) {
         recordAnthropicUsage(project, 'anthropic', model, parsed.usage || {}, parsed.appliedEdits);
       }
+      if (panel) {
+        recordPanelUsage(project, panel, (parsed && parsed.usage) || {});
+      }
       if (guardDeps && guardDeps.checkContextBloat) {
         Promise.resolve()
           .then(() => guardDeps.checkContextBloat(project, model, parsed && parsed.usage, guardDeps))
           .catch(e => console.warn('[miser] bloat check error:', e.message));
+      }
+      if (guardDeps && guardDeps.checkCacheThrash && parsed) {
+        Promise.resolve()
+          .then(() => guardDeps.checkCacheThrash(project, model, parsed.usage, guardDeps))
+          .catch(e => console.warn('[miser] thrash check error:', e.message));
       }
     }
     resolve({ statusCode });
@@ -342,7 +352,7 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, savedToken
   upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
 }
 
-function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, savedTokens, guardDeps) {
+function forwardToAnthropic(messages, originalBody, incomingHeaders, res, project, panel, savedTokens, guardDeps) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(originalBody);
     const anthURL = new URL(config.anthropicUrl);
@@ -383,7 +393,7 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
         reject(err);
         return;
       }
-      proxyAnthropicResponse(upstream, res, originalBody, project, savedTokens, resolve, reject, guardDeps);
+      proxyAnthropicResponse(upstream, res, originalBody, project, panel, savedTokens, resolve, reject, guardDeps);
     });
 
     req.on('error', (err) => { err.retryable = true; reject(err); });

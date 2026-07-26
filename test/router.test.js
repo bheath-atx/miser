@@ -36,7 +36,7 @@ function run(upstreamBody, guardDeps, opts = {}) {
   return new Promise((resolve, reject) => {
     const up = fakeUpstream(status, contentType);
     const res = makeRes();
-    proxyAnthropicResponse(up, res, { model: 'claude-req' }, 'proj', 0,
+    proxyAnthropicResponse(up, res, { model: 'claude-req' }, 'proj', null, 0,
       (result) => resolve({ result, res }), reject, guardDeps);
     if (opts.chunks) {
       for (const c of opts.chunks) up.emit('data', Buffer.from(c));
@@ -138,7 +138,7 @@ test('non-2xx upstream → no usage recording and no bloat hook', async () => {
   assert.equal(calls.length, 0); // hook lives inside the 2xx block only
 });
 
-test('routeRequest threads deps.guardDeps to the anthropic transport as the 7th arg', async () => {
+test('routeRequest threads deps.guardDeps to the anthropic transport as the 8th arg', async () => {
   const calls = [];
   const guardDeps = { marker: 'sprint-b' };
   const res = makeRes();
@@ -155,15 +155,17 @@ test('routeRequest threads deps.guardDeps to the anthropic transport as the 7th 
     },
   });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][6], guardDeps);
+  assert.equal(calls[0][5], null);     // panel is null when not in deps
+  assert.equal(calls[0][6], 0);        // savedTokens
+  assert.equal(calls[0][7], guardDeps); // guardDeps at index 7
 });
 
-test('routeRequest without guardDeps stays backward-compatible (7th arg undefined)', async () => {
+test('routeRequest without guardDeps stays backward-compatible (8th arg undefined)', async () => {
   const calls = [];
   const res = makeRes();
   await routeRequest([], { model: 'm' }, {}, res, 'proj', 0, 'anthropic', {
     transports: { anthropic: successTransport('anthropic', calls) },
   });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].args[6], undefined);
+  assert.equal(calls[0].args[7], undefined);
 });

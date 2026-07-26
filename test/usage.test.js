@@ -133,7 +133,7 @@ test('v4 M1: proxyAnthropicResponse keeps piping when the usage parser throws mi
     upstream.headers = { 'content-type': 'text/event-stream' };
     const res = new CaptureRes();
     const done = new Promise((resolve, reject) => {
-      proxyAnthropicResponse(upstream, res, { model: 'claude-sonnet-4' }, 'alpha', 0, resolve, reject);
+      proxyAnthropicResponse(upstream, res, { model: 'claude-sonnet-4' }, 'alpha', null, 0, resolve, reject);
     });
 
     const first = 'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n';

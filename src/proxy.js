@@ -17,6 +17,8 @@ const { checkModelDrift } = require('./policy-watchdog.js');
 const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
 const { injectContextManagement } = require('./context-management.js');
+const { buildMetricsText } = require('./metrics.js');
+const { getPanelStats } = require('./panel-stats.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -264,6 +266,23 @@ function createProxy(deps = {}) {
       return;
     }
 
+    if (route.kind === 'metrics') {
+      const statsResult = getStats(undefined, undefined, config.weightedTokenWeights);
+      const metricsText = buildMetricsText(statsResult);
+      res.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8; version=0.0.4',
+        'cache-control': 'no-cache',
+      });
+      res.end(metricsText);
+      return;
+    }
+
+    if (route.kind === 'stats_panels') {
+      const panels = getPanelStats();
+      json(res, 200, { ok: true, note: 'in-memory; resets on restart', panels });
+      return;
+    }
+
     if (route.kind !== 'messages') {
       json(res, 404, { error: { type: 'not_found', message: `miser: unknown route ${req.url}` } });
       return;
@@ -275,6 +294,7 @@ function createProxy(deps = {}) {
       const raw = await readBody(req);
       const originalBody = JSON.parse(raw);
       project = route.project || headerProject(req.headers);
+      const panel = route.panel || null;
       const format = route.format;
 
       // --- Sprint B guardrails (pre-compress, pre-upstream) ----------------
@@ -370,7 +390,8 @@ function createProxy(deps = {}) {
 
       // Forward the REDUCED body (I6) — every leg serializes THIS body, so the
       // hoisted top-level `system` and any cache hint reach the wire on all legs.
-      await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format, deps);
+      await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format,
+        { ...deps, panel });
       if (c1Injected && (res.statusCode < 200 || res.statusCode >= 300)) {
         console.warn(`[miser] c1-injected non-2xx project=${project} status=${res.statusCode}`);
       }
