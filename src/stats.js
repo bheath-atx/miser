@@ -32,6 +32,14 @@ let _timezoneFallbackWarned = false;
 const TIME_ZONE_UNSUPPORTED_RETRY_MS = 60_000;
 const TIME_ZONE_IMMEDIATE_RETRIES = 1;
 
+const _persistence = {
+  lastLoadErrored: false,
+  lastErrorCode: null,
+  lastErrorMessage: null,
+  lastLoadAt: null,
+  pendingSince: null,
+};
+
 let _stats = loadStats();
 
 const DEFAULT_WEIGHTS = Object.freeze({
@@ -53,6 +61,7 @@ const _pendingFlush = {
   lastFlushAt: null,
   writeFailures: 0,
   lastFlushErrored: false,
+  lastErrorCode: null,
 };
 
 const _recordRejections = {
@@ -116,8 +125,22 @@ function loadStats() {
   try {
     const raw = fs.readFileSync(STATS_FILE, 'utf8');
     parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-  } catch (_) {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      const err = new Error('stats file root must be an object');
+      err.code = 'LOAD_SHAPE';
+      throw err;
+    }
+    _persistence.lastLoadErrored = false;
+    _persistence.lastErrorCode = null;
+    _persistence.lastErrorMessage = null;
+    _persistence.lastLoadAt = Date.now();
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      _persistence.lastLoadErrored = true;
+      _persistence.lastErrorCode = err.code || 'LOAD_ERROR';
+      _persistence.lastErrorMessage = err.message;
+      console.warn('[miser/stats] WARN load failed; starting empty:', err.message);
+    }
     return {};
   }
   try {
@@ -173,6 +196,7 @@ function scheduleRetry() {
 
 function scheduleFlush(countMutation = true) {
   if (countMutation) _pendingFlush.mutationCount += 1;
+  if (!_pendingFlush.dirty && !_pendingFlush.inFlight) _persistence.pendingSince = Date.now();
   _pendingFlush.dirty = true;
   clearTimer('retryTimer');
   clearTimer('timer');
@@ -194,24 +218,49 @@ function executeFlush() {
   _pendingFlush.inFlight = true;
   _pendingFlush.dirty = false;
   _pendingFlush.mutationCount = 0;
-  const snapshot = cloneStats();
 
   const promise = (async () => {
     let shouldReschedule = false;
     try {
+      if (_persistence.lastLoadErrored) {
+        const err = new Error('stats load failed; refusing to overwrite existing persisted data');
+        err.code = _persistence.lastErrorCode || 'LOAD_ERROR';
+        throw err;
+      }
+      const snapshot = cloneStats();
       await writeSnapshot(snapshot);
       _pendingFlush.lastFlushAt = Date.now();
       _pendingFlush.writeFailures = 0;
       _pendingFlush.lastFlushErrored = false;
+      _pendingFlush.lastErrorCode = null;
+      _persistence.lastErrorCode = null;
+      _persistence.lastErrorMessage = null;
       shouldReschedule = _pendingFlush.dirty;
-      return { ok: true };
+      if (!_pendingFlush.dirty) _persistence.pendingSince = null;
+      return { ok: true, file: STATS_FILE };
     } catch (err) {
       _pendingFlush.dirty = true;
-      _pendingFlush.writeFailures += 1;
-      _pendingFlush.lastFlushErrored = true;
-      console.error('[miser/stats] ERROR flush error:', err.message);
-      scheduleRetry();
-      return { ok: false, error: err };
+      if (_persistence.lastLoadErrored) {
+        _pendingFlush.lastFlushErrored = false;
+        _pendingFlush.lastErrorCode = null;
+        _persistence.lastErrorCode = err.code || _persistence.lastErrorCode || 'LOAD_ERROR';
+        _persistence.lastErrorMessage = err.message;
+        console.error('[miser/stats] ERROR refusing flush after load failure:', err.message);
+      } else {
+        _pendingFlush.writeFailures += 1;
+        _pendingFlush.lastFlushErrored = true;
+        _pendingFlush.lastErrorCode = err.code || 'WRITE_ERROR';
+        _persistence.lastErrorCode = _pendingFlush.lastErrorCode;
+        _persistence.lastErrorMessage = err.message;
+        console.error('[miser/stats] ERROR flush error:', err.message);
+        scheduleRetry();
+      }
+      return {
+        ok: false,
+        error: err,
+        errorCode: _pendingFlush.lastErrorCode || _persistence.lastErrorCode,
+        file: STATS_FILE,
+      };
     } finally {
       _pendingFlush.inFlight = false;
       _pendingFlush.currentPromise = null;
@@ -226,19 +275,20 @@ function executeFlush() {
 async function drainFlushNow() {
   _pendingFlush.dirty = true;
   clearTimer('timer');
+  clearTimer('retryTimer');
+  let lastResult = { ok: true, file: STATS_FILE };
   while (true) {
     if (_pendingFlush.inFlight) {
-      await (_pendingFlush.currentPromise || Promise.resolve());
-      if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) return;
+      lastResult = await (_pendingFlush.currentPromise || Promise.resolve(lastResult));
+      if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
       continue;
     }
     if (!_pendingFlush.dirty) {
       clearTimer('timer');
-      return;
+      return lastResult;
     }
-    if (_pendingFlush.lastFlushErrored) return;
-    await executeFlush();
-    if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) return;
+    lastResult = await executeFlush();
+    if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
   }
 }
 
@@ -256,6 +306,26 @@ function getPendingWriteCount() {
 
 function getFlushLagMs() {
   return _pendingFlush.lastFlushAt == null ? null : Date.now() - _pendingFlush.lastFlushAt;
+}
+
+function getPersistenceStatus() {
+  const pending = _pendingFlush.dirty || _pendingFlush.inFlight;
+  const degraded = _pendingFlush.lastFlushErrored || _pendingFlush.writeFailures > 0
+    || _persistence.lastLoadErrored;
+  return {
+    healthy: !degraded,
+    durable: !degraded && !pending,
+    pending,
+    dirty: _pendingFlush.dirty,
+    inFlight: _pendingFlush.inFlight,
+    pendingSince: pending ? (_persistence.pendingSince || null) : null,
+    lastFlushErrored: _pendingFlush.lastFlushErrored,
+    lastLoadErrored: _persistence.lastLoadErrored,
+    writeFailures: _pendingFlush.writeFailures,
+    lastErrorCode: _pendingFlush.lastErrorCode || _persistence.lastErrorCode,
+    lastErrorMessage: _persistence.lastErrorMessage,
+    file: STATS_FILE,
+  };
 }
 
 function todayKey() {
@@ -432,6 +502,46 @@ function validWeekKey(key) {
   return Number.isFinite(d.getTime()) && d.toISOString() === key;
 }
 
+function expectedDailyKeysForWeek(weekKey, now = new Date()) {
+  if (!validWeekKey(weekKey)) return [];
+  const weekStart = new Date(weekKey);
+  const today = todayKey();
+  const nowDay = dayKeyFromDate(now);
+  const maxDay = nowDay < today ? nowDay : today;
+  const start = new Date(Date.UTC(
+    weekStart.getUTCFullYear(),
+    weekStart.getUTCMonth(),
+    weekStart.getUTCDate(),
+    12,
+    0,
+    0,
+  ));
+  const expected = [];
+  for (let offset = 0; offset < 9; offset++) {
+    const probe = new Date(start);
+    probe.setUTCDate(probe.getUTCDate() + offset);
+    const key = dayKeyFromDate(probe);
+    if (key > maxDay) break;
+    if (subscriptionWeekKeyFromDate(probe) === weekKey) expected.push(key);
+  }
+  return expected;
+}
+
+function dailyCoverageForWeek(statsObj, weekKey) {
+  const expectedDays = expectedDailyKeysForWeek(weekKey);
+  const expected = new Set(expectedDays);
+  const presentDays = Object.keys(statsObj || {})
+    .filter(day => expected.has(day) && isValidDailyKey(day))
+    .sort();
+  return {
+    complete: expectedDays.length > 0 && presentDays.length === expectedDays.length,
+    presentDays,
+    expectedDays,
+    presentCount: presentDays.length,
+    expectedCount: expectedDays.length,
+  };
+}
+
 function pruneWeeklyRetention(statsObj, now = new Date()) {
   const weekly = statsObj && statsObj[WEEKLY_KEY];
   if (!weekly || typeof weekly !== 'object') return;
@@ -511,12 +621,20 @@ function isWeeklyContainer(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function markWeekNonAuthoritative(weekData, reason) {
+function markWeekNonAuthoritative(weekData, reason, extra = null) {
   if (!isWeeklyContainer(weekData)) return weekData;
   weekData[WEEKLY_META_KEY] = {
     authoritative: false,
     reason,
   };
+  if (extra && typeof extra === 'object') {
+    weekData[WEEKLY_META_KEY].coverage = {
+      presentDays: extra.presentDays,
+      expectedDays: extra.expectedDays,
+      presentCount: extra.presentCount,
+      expectedCount: extra.expectedCount,
+    };
+  }
   return weekData;
 }
 
@@ -537,6 +655,14 @@ function reconcileWeeklyFromDaily(statsObj) {
   const weekly = statsObj[WEEKLY_KEY];
   const reconciled = {};
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
+    const stored = weekly[weekKey];
+    if (validWeekKey(weekKey) && isWeeklyContainer(stored)) {
+      const coverage = dailyCoverageForWeek(statsObj, weekKey);
+      if (!coverage.complete) {
+        reconciled[weekKey] = markWeekNonAuthoritative(stored, 'partial_daily_coverage', coverage);
+        continue;
+      }
+    }
     reconciled[weekKey] = weekData;
   }
   for (const [weekKey, weekData] of Object.entries(weekly)) {
@@ -973,6 +1099,7 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = ne
       ...aggregatePeriod(weekData, projectFilter, weights),
     };
     if (meta && typeof meta.reason === 'string') out.nonAuthoritativeReason = meta.reason;
+    if (meta && isWeeklyContainer(meta.coverage)) out.coverage = meta.coverage;
     return out;
   };
   const priorCompleteWeeks = Object.keys(weeklyData)
@@ -1010,6 +1137,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     }
   }
   const aggregate = finalizeAggregate(perProject, weights);
+  const persistence = getPersistenceStatus();
 
   return {
     ok: true,
@@ -1017,6 +1145,9 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     since: cutoffKey,
     ...aggregate,
     recordRejections: getRecordRejectionStatus(),
+    durable: persistence.durable,
+    degraded: !persistence.healthy,
+    persistence,
     weekly: getSubscriptionWeeks(projectFilter, weights),
   };
 }
@@ -1081,6 +1212,12 @@ function __resetForTest() {
   _pendingFlush.lastFlushAt = null;
   _pendingFlush.writeFailures = 0;
   _pendingFlush.lastFlushErrored = false;
+  _pendingFlush.lastErrorCode = null;
+  _persistence.lastLoadErrored = false;
+  _persistence.lastErrorCode = null;
+  _persistence.lastErrorMessage = null;
+  _persistence.lastLoadAt = null;
+  _persistence.pendingSince = null;
   _recordRejections.total = 0;
   _recordRejections.invalidTimestamp = 0;
   _recordRejections.outOfBoundsTimestamp = 0;
@@ -1112,10 +1249,12 @@ module.exports = {
   flushNow,
   getPendingWriteCount,
   getFlushLagMs,
+  getPersistenceStatus,
   getRawStatsSnapshot,
   __resetForTest,
   __test: {
     _pendingFlush,
+    _persistence,
     subscriptionWeekKeyFromDate,
     subscriptionWeekStartDate,
     subscriptionWeekStartFallbackDate,
@@ -1123,6 +1262,7 @@ module.exports = {
     getSubscriptionTimeZoneStatus,
     getRecordRejectionStatus,
     reconcileWeeklyFromDaily,
+    dailyCoverageForWeek,
     WEEKLY_MAX_WEEKS,
     CLOCK_PAST_MS,
     CLOCK_FUTURE_MS,

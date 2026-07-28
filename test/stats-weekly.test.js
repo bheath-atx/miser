@@ -65,6 +65,19 @@ function fakeReq(url) {
   };
 }
 
+function completeJuly19WeekDaily(overrides = {}) {
+  return {
+    '2026-07-19': {},
+    '2026-07-20': {},
+    '2026-07-21': {},
+    '2026-07-22': {},
+    '2026-07-23': {},
+    '2026-07-24': {},
+    '2026-07-25': {},
+    ...overrides,
+  };
+}
+
 test('subscription week key straddles the Sunday 06:00 America/Chicago reset', () => {
   const file = tmpStatsFile('boundary');
   const prevEnv = process.env.MISER_STATS_FILE;
@@ -310,7 +323,7 @@ test('legacy daily stats are backfilled into weekly buckets on first load', () =
 test('existing empty, partial, array, and stale weekly buckets are reconciled from daily stats', () => {
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
-  const daily = {
+  const daily = completeJuly19WeekDaily({
     '2026-07-20': {
       alpha: {
         usage: { anthropic: { model: { input: 5, requests: 1 } } },
@@ -323,7 +336,7 @@ test('existing empty, partial, array, and stale weekly buckets are reconciled fr
         policy: { modelDriftCount: 1, contextBloatCount: 2 },
       },
     },
-  };
+  });
   const cases = [
     ['empty', {}],
     ['partial', {
@@ -367,7 +380,7 @@ test('weekly reconciliation uses daily-derived counters when stored weekly is hi
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
   try {
-    const stats = freshStats(file, {
+    const stats = freshStats(file, completeJuly19WeekDaily({
       '2026-07-20': {
         alpha: {
           usage: { anthropic: { model: { input: 5, output: 3, requests: 1 } } },
@@ -388,7 +401,7 @@ test('weekly reconciliation uses daily-derived counters when stored weekly is hi
           },
         },
       },
-    });
+    }));
     const weekly = stats.getRawStatsSnapshot().__weekly[weekKey].alpha;
     assert.equal(weekly.usage.anthropic.model.input, 5);
     assert.equal(weekly.usage.anthropic.model.output, 3);
@@ -414,12 +427,107 @@ test('weekly reconciliation uses daily-derived counters when stored weekly is hi
   }
 });
 
+test('partial daily coverage retains stored weekly value and marks it non-authoritative', () => {
+  const file = tmpStatsFile('migration-partial-coverage');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, {
+      '2026-07-20': {
+        alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
+      },
+      '2026-07-21': {
+        alpha: { usage: { anthropic: { model: { input: 20, requests: 1 } } } },
+      },
+      __weekly: {
+        [weekKey]: {
+          alpha: { usage: { anthropic: { model: { input: 70, requests: 7 } } } },
+        },
+      },
+    });
+
+    const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 70);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 7);
+    assert.equal(rawWeek.__meta.authoritative, false);
+    assert.equal(rawWeek.__meta.reason, 'partial_daily_coverage');
+    assert.deepEqual(rawWeek.__meta.coverage.presentDays, ['2026-07-20', '2026-07-21']);
+    assert.deepEqual(rawWeek.__meta.coverage.expectedDays, [
+      '2026-07-19',
+      '2026-07-20',
+      '2026-07-21',
+      '2026-07-22',
+      '2026-07-23',
+      '2026-07-24',
+      '2026-07-25',
+    ]);
+    assert.equal(rawWeek.__meta.coverage.presentCount, 2);
+    assert.equal(rawWeek.__meta.coverage.expectedCount, 7);
+
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.equal(exposed.authoritative, false);
+    assert.equal(exposed.degraded, true);
+    assert.equal(exposed.nonAuthoritativeReason, 'partial_daily_coverage');
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 70);
+    assert.deepEqual(exposed.coverage.presentDays, ['2026-07-20', '2026-07-21']);
+    assert.deepEqual(exposed.coverage.expectedDays, [
+      '2026-07-19',
+      '2026-07-20',
+      '2026-07-21',
+      '2026-07-22',
+      '2026-07-23',
+      '2026-07-24',
+      '2026-07-25',
+    ]);
+    assert.equal(stats.getStats('9999').weekly.authoritative, false);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('complete daily coverage replaces stored weekly value and stays authoritative', () => {
+  const file = tmpStatsFile('migration-complete-coverage');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, completeJuly19WeekDaily({
+      '2026-07-20': {
+        alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
+      },
+      '2026-07-21': {
+        alpha: { usage: { anthropic: { model: { input: 20, requests: 1 } } } },
+      },
+      __weekly: {
+        [weekKey]: {
+          alpha: { usage: { anthropic: { model: { input: 70, requests: 7 } } } },
+        },
+      },
+    }));
+
+    const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 30);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 2);
+    assert.equal(rawWeek.__meta, undefined);
+
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.equal(exposed.authoritative, true);
+    assert.equal(exposed.degraded, false);
+    assert.equal(exposed.nonAuthoritativeReason, undefined);
+    assert.equal(exposed.coverage, undefined);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 30);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
 test('weekly reconciliation removes surplus stored projects and models from authoritative weeks', () => {
   const file = tmpStatsFile('migration-surplus');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
   try {
-    const stats = freshStats(file, {
+    const stats = freshStats(file, completeJuly19WeekDaily({
       '2026-07-20': {
         alpha: {
           usage: { anthropic: { model: { input: 5, requests: 1 } } },
@@ -440,7 +548,7 @@ test('weekly reconciliation removes surplus stored projects and models from auth
           },
         },
       },
-    });
+    }));
     const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
     assert.deepEqual(Object.keys(rawWeek).sort(), ['alpha']);
     assert.deepEqual(Object.keys(rawWeek.alpha.usage.anthropic), ['model']);

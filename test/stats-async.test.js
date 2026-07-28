@@ -112,6 +112,53 @@ test('flushNow writes all pending records before simulated shutdown', async () =
   }
 });
 
+test('load failure followed by flush does not overwrite existing stats file', async () => {
+  const file = tmpStatsFile('load-failure-refuse');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const prevWarn = console.warn;
+  const prevError = console.error;
+  const corruptBody = '{not json';
+  const warnings = [];
+  const errors = [];
+  let stats;
+  try {
+    console.warn = (...args) => warnings.push(args.join(' '));
+    console.error = (...args) => errors.push(args.join(' '));
+    fs.writeFileSync(file, corruptBody, 'utf8');
+    stats = freshStats(file);
+
+    assert.equal(stats.getPersistenceStatus().lastLoadErrored, true);
+    assert.match(stats.getPersistenceStatus().lastErrorMessage, /Expected property name|Unexpected token/);
+
+    stats.recordStats('alpha', { inputTokensRemoved: 3, techniques: { dedup: true } });
+    const first = await stats.flushNow();
+
+    assert.equal(first.ok, false);
+    assert.equal(first.errorCode, 'LOAD_ERROR');
+    assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
+
+    const afterFirst = stats.getStats('1').persistence;
+    assert.equal(afterFirst.healthy, false);
+    assert.equal(afterFirst.durable, false);
+    assert.equal(afterFirst.pending, true);
+    assert.equal(afterFirst.lastLoadErrored, true);
+    assert.equal(afterFirst.lastFlushErrored, false);
+    assert.equal(afterFirst.lastErrorCode, 'LOAD_ERROR');
+    assert.match(afterFirst.lastErrorMessage, /refusing to overwrite/);
+
+    const second = await stats.flushNow();
+    assert.equal(second.ok, false);
+    assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
+    assert.equal(stats.getStats('1').persistence.lastLoadErrored, true);
+    assert.match(warnings.join('\n'), /load failed; starting empty/);
+    assert.match(errors.join('\n'), /refusing flush after load failure/);
+  } finally {
+    console.warn = prevWarn;
+    console.error = prevError;
+    cleanup(file, prevEnv, stats);
+  }
+});
+
 // Shutdown race regression: mutation arrives AFTER an initial flushNow() quiesces
 // (simulating an accepted in-flight request that records stats during server.close()).
 // The final flushNow() called after server.close() must capture it.
