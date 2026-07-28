@@ -279,7 +279,7 @@ function createProxy(deps = {}) {
 
     if (route.kind === 'stats_panels') {
       const panels = getPanelStats();
-      json(res, 200, { ok: true, note: 'in-memory; resets on restart', panels });
+      json(res, 200, { ok: true, note: 'persisted; survives restart', panels });
       return;
     }
 

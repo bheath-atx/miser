@@ -6,6 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { createProxy } = require('./proxy.js');
 const { flushNow, getRawStatsSnapshot } = require('./stats.js');
+const { flushNow: flushPanelStatsNow } = require('./panel-stats.js');
 const { startDailyRollupInterval } = require('./daily-rollup.js');
 const { buildGuardDeps } = require('./budgets.js');
 const { wireCacheThrashDeps } = require('./cache-thrash.js');
@@ -131,6 +132,12 @@ async function shutdown() {
     await withTimeout(flushNow(), 2500, 'stats flush');
   } catch (err) {
     console.error('[miser] ERROR final stats flush failed:', err.message);
+  }
+
+  try {
+    await withTimeout(flushPanelStatsNow(), 2500, 'panel stats flush');
+  } catch (err) {
+    console.error('[miser] ERROR final panel stats flush failed:', err.message);
   }
 
   clearLock();

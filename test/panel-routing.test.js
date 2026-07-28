@@ -6,6 +6,7 @@
 const os   = require('node:os');
 const path = require('node:path');
 process.env.MISER_STATS_FILE = path.join(os.tmpdir(), `miser-panel-test-${process.pid}-${Date.now()}.json`);
+process.env.MISER_PANEL_STATS_FILE = path.join(os.tmpdir(), `miser-panel-stats-test-${process.pid}-${Date.now()}.json`);
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -126,7 +127,7 @@ test('AC17: GET /api/miser/stats/panels returns correct structure', async () => 
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body());
   assert.equal(body.ok, true);
-  assert.equal(body.note, 'in-memory; resets on restart');
+  assert.equal(body.note, 'persisted; survives restart');
   assert.ok(typeof body.panels === 'object');
   assert.ok('testproj--testpanel' in body.panels);
   assert.equal(body.panels['testproj--testpanel'].input, 42);

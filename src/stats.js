@@ -10,6 +10,8 @@ const { computeCost } = require('./pricing.js');
 // Atomic write (temp+rename) so process restarts do not corrupt the file.
 const STATS_FILE = process.env.MISER_STATS_FILE
   || path.join(os.homedir(), '.miser-stats.json');
+const WEEKLY_KEY = '__weekly';
+const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
 
 let _stats = loadStats();
 
@@ -175,6 +177,86 @@ function dayKeyFromDate(date) {
   return date.toISOString().slice(0, 10);
 }
 
+function getZonedParts(date, timeZone = SUBSCRIPTION_TIME_ZONE) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const parts = {};
+  for (const part of formatter.formatToParts(date)) {
+    if (part.type !== 'literal') parts[part.type] = Number(part.value);
+  }
+  if (parts.hour === 24) parts.hour = 0;
+  return parts;
+}
+
+function utcForZonedTime(timeZone, year, month, day, hour, minute = 0, second = 0) {
+  let guess = Date.UTC(year, month - 1, day, hour, minute, second);
+  for (let i = 0; i < 4; i++) {
+    const parts = getZonedParts(new Date(guess), timeZone);
+    const observedAsUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+    const desiredAsUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+    const delta = desiredAsUtc - observedAsUtc;
+    if (delta === 0) return new Date(guess);
+    guess += delta;
+  }
+  return new Date(guess);
+}
+
+function localDatePlusDays(parts, days) {
+  const d = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days, 0, 0, 0));
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+function subscriptionWeekStartDate(date) {
+  try {
+    const local = getZonedParts(date);
+    const localDateUtc = new Date(Date.UTC(local.year, local.month - 1, local.day, 0, 0, 0));
+    const daysSinceSunday = localDateUtc.getUTCDay();
+    const thisSunday = localDatePlusDays(local, -daysSinceSunday);
+    let boundary = utcForZonedTime(
+      SUBSCRIPTION_TIME_ZONE,
+      thisSunday.year,
+      thisSunday.month,
+      thisSunday.day,
+      6,
+      0,
+      0,
+    );
+    if (date >= boundary) return boundary;
+    const priorSunday = localDatePlusDays(thisSunday, -7);
+    boundary = utcForZonedTime(
+      SUBSCRIPTION_TIME_ZONE,
+      priorSunday.year,
+      priorSunday.month,
+      priorSunday.day,
+      6,
+      0,
+      0,
+    );
+    return boundary;
+  } catch (_) {
+    // If the runtime lacks the America/Chicago zone database, preserve bounded
+    // weekly accounting with a conservative CST reset: Sunday 12:00 UTC.
+    const d = new Date(date);
+    const daysSinceSunday = d.getUTCDay();
+    const boundary = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - daysSinceSunday, 12, 0, 0));
+    if (date >= boundary) return boundary;
+    boundary.setUTCDate(boundary.getUTCDate() - 7);
+    return boundary;
+  }
+}
+
+function subscriptionWeekKeyFromDate(date) {
+  return subscriptionWeekStartDate(date).toISOString();
+}
+
 function cutoffKeyForDays(days) {
   const cutoff = new Date();
   cutoff.setUTCHours(0, 0, 0, 0);
@@ -208,13 +290,7 @@ function emptyUsageBucket() {
   return { requests: 0 };
 }
 
-function ensureProjectBucket(project) {
-  const day = todayKey();
-  const proj = project || 'default';
-  if (!_stats[day]) _stats[day] = {};
-  if (!_stats[day][proj]) _stats[day][proj] = {};
-  const bucket = _stats[day][proj];
-
+function ensureOptimizerFields(bucket) {
   if (!bucket.dedup) bucket.dedup = emptyTechniqueBucket();
   if (!bucket.cacheHint) bucket.cacheHint = emptyTechniqueBucket();
   if (!bucket.toolPrune) bucket.toolPrune = { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
@@ -223,12 +299,42 @@ function ensureProjectBucket(project) {
   return bucket;
 }
 
-function ensureMeasuredProjectBucket(project) {
-  const day = todayKey();
+function ensureProjectBucketForDay(project, day) {
+  const proj = project || 'default';
+  if (!_stats[day]) _stats[day] = {};
+  if (!_stats[day][proj]) _stats[day][proj] = {};
+  return ensureOptimizerFields(_stats[day][proj]);
+}
+
+function ensureProjectBucketForWeek(project, week) {
+  const proj = project || 'default';
+  if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
+  if (!_stats[WEEKLY_KEY][week] || typeof _stats[WEEKLY_KEY][week] !== 'object') _stats[WEEKLY_KEY][week] = {};
+  if (!_stats[WEEKLY_KEY][week][proj]) _stats[WEEKLY_KEY][week][proj] = {};
+  return ensureOptimizerFields(_stats[WEEKLY_KEY][week][proj]);
+}
+
+function ensureProjectBucket(project, now = new Date()) {
+  return ensureProjectBucketForDay(project, dayKeyFromDate(now));
+}
+
+function ensureMeasuredProjectBucketForDay(project, day) {
   const proj = project || 'default';
   if (!_stats[day]) _stats[day] = {};
   if (!_stats[day][proj]) _stats[day][proj] = {};
   return _stats[day][proj];
+}
+
+function ensureMeasuredProjectBucketForWeek(project, week) {
+  const proj = project || 'default';
+  if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
+  if (!_stats[WEEKLY_KEY][week] || typeof _stats[WEEKLY_KEY][week] !== 'object') _stats[WEEKLY_KEY][week] = {};
+  if (!_stats[WEEKLY_KEY][week][proj]) _stats[WEEKLY_KEY][week][proj] = {};
+  return _stats[WEEKLY_KEY][week][proj];
+}
+
+function ensureMeasuredProjectBucket(project, now = new Date()) {
+  return ensureMeasuredProjectBucketForDay(project, dayKeyFromDate(now));
 }
 
 // Sprint B guardrail writers. Takes an EXPLICIT day string (not todayKey()) so
@@ -240,16 +346,29 @@ function ensureGuardrailBucket(project, dayKey) {
   return _stats[dayKey][proj];
 }
 
+function ensureWeeklyGuardrailBucket(project, weekKey) {
+  const proj = project || 'default';
+  if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
+  if (!_stats[WEEKLY_KEY][weekKey] || typeof _stats[WEEKLY_KEY][weekKey] !== 'object') _stats[WEEKLY_KEY][weekKey] = {};
+  if (!_stats[WEEKLY_KEY][weekKey][proj]) _stats[WEEKLY_KEY][weekKey][proj] = {};
+  return _stats[WEEKLY_KEY][weekKey][proj];
+}
+
 // G3: sparse per-day per-project `budget` node { blockedCount, firstBlockedAt }.
 // nowFn() is captured exactly ONCE per invocation; dayKey and firstBlockedAt
 // both derive from that single capture.
 function recordBudgetBlock(project, nowFn = () => new Date()) {
   const now = nowFn();
   const dayKey = now.toISOString().slice(0, 10);
+  const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
+  const weekBucket = ensureWeeklyGuardrailBucket(project, weekKey);
   if (!bucket.budget) bucket.budget = { blockedCount: 0 };
+  if (!weekBucket.budget) weekBucket.budget = { blockedCount: 0 };
   bucket.budget.blockedCount += 1;
+  weekBucket.budget.blockedCount += 1;
   if (!bucket.budget.firstBlockedAt) bucket.budget.firstBlockedAt = now.toISOString();
+  if (!weekBucket.budget.firstBlockedAt) weekBucket.budget.firstBlockedAt = now.toISOString();
   scheduleFlush();
   return bucket.budget.blockedCount;
 }
@@ -261,17 +380,20 @@ function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn
   if (!drift && !bloat) return { modelDriftCount: 0, contextBloatCount: 0 }; // no-op: never write zero node
   const now = nowFn();
   const dayKey = now.toISOString().slice(0, 10);
+  const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
+  const weekBucket = ensureWeeklyGuardrailBucket(project, weekKey);
   if (!bucket.policy) bucket.policy = { modelDriftCount: 0, contextBloatCount: 0 };
+  if (!weekBucket.policy) weekBucket.policy = { modelDriftCount: 0, contextBloatCount: 0 };
   if (drift) bucket.policy.modelDriftCount += 1;
+  if (drift) weekBucket.policy.modelDriftCount += 1;
   if (bloat) bucket.policy.contextBloatCount += 1;
+  if (bloat) weekBucket.policy.contextBloatCount += 1;
   scheduleFlush();
   return { modelDriftCount: bucket.policy.modelDriftCount, contextBloatCount: bucket.policy.contextBloatCount };
 }
 
-// opts: { inputTokensRemoved, cacheBillingDelta, toolsRemoved, techniques }
-function recordStats(project, opts = {}) {
-  const bucket = ensureProjectBucket(project);
+function applyOptimizerStats(bucket, opts = {}) {
   const {
     inputTokensRemoved = 0,
     cacheBillingDelta = 0,
@@ -298,6 +420,16 @@ function recordStats(project, opts = {}) {
   } else if (pollClass === 'unlikely') {
     bucket.workTurnCount += 1;
   }
+}
+
+// opts: { inputTokensRemoved, cacheBillingDelta, toolsRemoved, techniques }
+function recordStats(project, opts = {}, nowFn = () => new Date()) {
+  const now = nowFn();
+  const bucket = ensureProjectBucket(project, now);
+  const weekBucket = ensureProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
+
+  applyOptimizerStats(bucket, opts);
+  applyOptimizerStats(weekBucket, opts);
 
   scheduleFlush();
 }
@@ -340,13 +472,8 @@ function normalizeAppliedEdits(appliedEdits) {
   return out;
 }
 
-function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEdits = null) {
-  const bucket = ensureMeasuredProjectBucket(project);
-  const providerKey = provider || 'anthropic';
-  const modelKey = model || 'unknown';
-  const usage = normalizeUsage(rawUsage);
+function applyMeasuredUsage(bucket, providerKey, modelKey, usage, editStats) {
   const hasMeasuredAxis = Object.keys(usage).length > 0;
-  const editStats = normalizeAppliedEdits(appliedEdits);
 
   if (hasMeasuredAxis) {
     if (!bucket.usage) bucket.usage = {};
@@ -367,6 +494,22 @@ function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEd
     bucket.contextManagement.clearedInputTokens += editStats.clearedInputTokens;
     bucket.contextManagement.editCount += editStats.editCount;
   }
+
+  return hasMeasuredAxis || !!editStats;
+}
+
+function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEdits = null, nowFn = () => new Date()) {
+  const now = nowFn();
+  const bucket = ensureMeasuredProjectBucket(project, now);
+  const weekBucket = ensureMeasuredProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
+  const providerKey = provider || 'anthropic';
+  const modelKey = model || 'unknown';
+  const usage = normalizeUsage(rawUsage);
+  const hasMeasuredAxis = Object.keys(usage).length > 0;
+  const editStats = normalizeAppliedEdits(appliedEdits);
+
+  applyMeasuredUsage(bucket, providerKey, modelKey, usage, editStats);
+  applyMeasuredUsage(weekBucket, providerKey, modelKey, usage, editStats);
 
   if (hasMeasuredAxis || editStats) scheduleFlush();
   if (usage.cacheWrite5m > 0) {
@@ -426,76 +569,69 @@ function projectHasMeasuredUsage(projData) {
   return !!(projData && projData.usage && typeof projData.usage === 'object');
 }
 
-function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
-  const days = parseDays(daysParam, 7);
-  const cutoffKey = cutoffKeyForDays(days);
-
-  const perProject = {};
-  for (const [day, dayData] of Object.entries(_stats)) {
-    if (day < cutoffKey || !dayData || typeof dayData !== 'object') continue;
-    for (const [proj, projData] of Object.entries(dayData)) {
-      if (projectFilter && proj !== projectFilter) continue;
-      // No-fabrication guard (Sprint B): legacy bucket init fires only for
-      // projects with usage, contextManagement, or any legacy optimizer key in
-      // the raw day data (unchanged baseline — all existing project categories
-      // preserved). Projects with EXCLUSIVELY guardrail keys (budget/policy)
-      // must not appear with fabricated zeroed legacy buckets.
-      const hasLegacy = !!(projData.usage || projData.contextManagement
-        || projData.dedup || projData.cacheHint || projData.toolPrune);
-      // Guardrail activity only counts when counts are positive (sparse contract §2.3).
-      const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
-        || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0));
-      if (!hasLegacy && !hasGuardrail) continue;
-      if (!perProject[proj]) perProject[proj] = {};
-      const target = perProject[proj];
-      if (hasLegacy && !target.dedup) {
-        target.dedup = emptyTechniqueBucket();
-        target.cacheHint = emptyTechniqueBucket();
-        target.toolPrune = { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
-        target.pollClass = { likely: 0, work: 0 };
-      }
-      if (target.dedup) {
-        for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
-          if (!projData[tech]) continue;
-          target[tech].estRemovedTokens += projData[tech].estRemovedTokens || projData[tech].inputTokensRemoved || 0;
-          target[tech].inputTokensRemoved += projData[tech].inputTokensRemoved || 0;
-          target[tech].cacheBillingDelta += projData[tech].cacheBillingDelta || 0;
-          target[tech].appliedCount += projData[tech].appliedCount || 0;
-          if (tech === 'toolPrune') {
-            target[tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
-          }
-        }
-        target.pollClass.likely += projData.likelyPollCount || 0;
-        target.pollClass.work += projData.workTurnCount || 0;
-      }
-      addUsageTree(target.usage || (projData.usage ? (target.usage = {}) : {}), projData.usage);
-      addContextManagement(target, projData.contextManagement);
-      // Sprint B guardrail aggregation across the days window (sparse):
-      // blockedCount / drift / bloat counts summed; firstBlockedAt = EARLIEST
-      // ISO timestamp across all days in the window.
-      // Sparse contract (§2.3): only emit budget node when blockedCount > 0,
-      // only emit policy node when at least one count > 0. Never fabricate zeroes.
-      if (projData.budget && typeof projData.budget === 'object'
-          && (projData.budget.blockedCount || 0) > 0) {
-        if (!target.budget) target.budget = { blockedCount: 0 };
-        target.budget.blockedCount += projData.budget.blockedCount;
-        const first = projData.budget.firstBlockedAt;
-        if (typeof first === 'string' && (!target.budget.firstBlockedAt || first < target.budget.firstBlockedAt)) {
-          target.budget.firstBlockedAt = first;
-        }
-      }
-      if (projData.policy && typeof projData.policy === 'object') {
-        const dc = projData.policy.modelDriftCount || 0;
-        const bc = projData.policy.contextBloatCount || 0;
-        if (dc > 0 || bc > 0) {
-          if (!target.policy) target.policy = { modelDriftCount: 0, contextBloatCount: 0 };
-          target.policy.modelDriftCount += dc;
-          target.policy.contextBloatCount += bc;
-        }
+function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
+  if (projectFilter && proj !== projectFilter) return;
+  // No-fabrication guard (Sprint B): legacy bucket init fires only for
+  // projects with usage, contextManagement, or any legacy optimizer key in
+  // the raw day data (unchanged baseline — all existing project categories
+  // preserved). Projects with EXCLUSIVELY guardrail keys (budget/policy)
+  // must not appear with fabricated zeroed legacy buckets.
+  const hasLegacy = !!(projData.usage || projData.contextManagement
+    || projData.dedup || projData.cacheHint || projData.toolPrune);
+  // Guardrail activity only counts when counts are positive (sparse contract §2.3).
+  const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
+    || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0));
+  if (!hasLegacy && !hasGuardrail) return;
+  if (!perProject[proj]) perProject[proj] = {};
+  const target = perProject[proj];
+  if (hasLegacy && !target.dedup) {
+    target.dedup = emptyTechniqueBucket();
+    target.cacheHint = emptyTechniqueBucket();
+    target.toolPrune = { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
+    target.pollClass = { likely: 0, work: 0 };
+  }
+  if (target.dedup) {
+    for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
+      if (!projData[tech]) continue;
+      target[tech].estRemovedTokens += projData[tech].estRemovedTokens || projData[tech].inputTokensRemoved || 0;
+      target[tech].inputTokensRemoved += projData[tech].inputTokensRemoved || 0;
+      target[tech].cacheBillingDelta += projData[tech].cacheBillingDelta || 0;
+      target[tech].appliedCount += projData[tech].appliedCount || 0;
+      if (tech === 'toolPrune') {
+        target[tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
       }
     }
+    target.pollClass.likely += projData.likelyPollCount || 0;
+    target.pollClass.work += projData.workTurnCount || 0;
   }
+  addUsageTree(target.usage || (projData.usage ? (target.usage = {}) : {}), projData.usage);
+  addContextManagement(target, projData.contextManagement);
+  // Sprint B guardrail aggregation across the selected window (sparse):
+  // blockedCount / drift / bloat counts summed; firstBlockedAt = EARLIEST
+  // ISO timestamp across all buckets in the window.
+  // Sparse contract (§2.3): only emit budget node when blockedCount > 0,
+  // only emit policy node when at least one count > 0. Never fabricate zeroes.
+  if (projData.budget && typeof projData.budget === 'object'
+      && (projData.budget.blockedCount || 0) > 0) {
+    if (!target.budget) target.budget = { blockedCount: 0 };
+    target.budget.blockedCount += projData.budget.blockedCount;
+    const first = projData.budget.firstBlockedAt;
+    if (typeof first === 'string' && (!target.budget.firstBlockedAt || first < target.budget.firstBlockedAt)) {
+      target.budget.firstBlockedAt = first;
+    }
+  }
+  if (projData.policy && typeof projData.policy === 'object') {
+    const dc = projData.policy.modelDriftCount || 0;
+    const bc = projData.policy.contextBloatCount || 0;
+    if (dc > 0 || bc > 0) {
+      if (!target.policy) target.policy = { modelDriftCount: 0, contextBloatCount: 0 };
+      target.policy.modelDriftCount += dc;
+      target.policy.contextBloatCount += bc;
+    }
+  }
+}
 
+function finalizeAggregate(perProject, weights = DEFAULT_WEIGHTS) {
   const perTechnique = {
     dedup: emptyTechniqueBucket(),
     cacheHint: emptyTechniqueBucket(),
@@ -533,14 +669,72 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   };
 
   return {
-    ok: true,
-    days,
-    since: cutoffKey,
     perTechnique,
     perProject,
     usage,
     weightedTokenEquivalents: weightedTokenEquivalents(usage, weights),
     totals,
+  };
+}
+
+function aggregatePeriod(periodData, projectFilter, weights = DEFAULT_WEIGHTS) {
+  const perProject = {};
+  if (periodData && typeof periodData === 'object') {
+    for (const [proj, projData] of Object.entries(periodData)) {
+      if (!projData || typeof projData !== 'object') continue;
+      accumulateProjectAggregate(perProject, proj, projData, projectFilter);
+    }
+  }
+  return finalizeAggregate(perProject, weights);
+}
+
+function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = new Date()) {
+  const weeklyData = (_stats[WEEKLY_KEY] && typeof _stats[WEEKLY_KEY] === 'object') ? _stats[WEEKLY_KEY] : {};
+  const currentWeekStart = subscriptionWeekKeyFromDate(now);
+  const priorCompleteWeeks = Object.keys(weeklyData)
+    .filter(key => key < currentWeekStart)
+    .sort()
+    .reverse()
+    .map(weekStart => ({
+      weekStart,
+      complete: true,
+      ...aggregatePeriod(weeklyData[weekStart], projectFilter, weights),
+    }));
+
+  return {
+    timeZone: SUBSCRIPTION_TIME_ZONE,
+    localReset: 'Sunday 06:00',
+    currentWeekStart,
+    currentWeekToDate: {
+      weekStart: currentWeekStart,
+      complete: false,
+      ...aggregatePeriod(weeklyData[currentWeekStart], projectFilter, weights),
+    },
+    priorCompleteWeeks,
+  };
+}
+
+function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
+  const days = parseDays(daysParam, 7);
+  const cutoffKey = cutoffKeyForDays(days);
+
+  const perProject = {};
+  for (const [day, dayData] of Object.entries(_stats)) {
+    if (day === WEEKLY_KEY) continue;
+    if (day < cutoffKey || !dayData || typeof dayData !== 'object') continue;
+    for (const [proj, projData] of Object.entries(dayData)) {
+      if (!projData || typeof projData !== 'object') continue;
+      accumulateProjectAggregate(perProject, proj, projData, projectFilter);
+    }
+  }
+  const aggregate = finalizeAggregate(perProject, weights);
+
+  return {
+    ok: true,
+    days,
+    since: cutoffKey,
+    ...aggregate,
+    weekly: getSubscriptionWeeks(projectFilter, weights),
   };
 }
 
@@ -571,7 +765,7 @@ function getDailyTrend(daysParam, projectFilter) {
   const cutoffKey = cutoffKeyForDays(days);
   const entries = [];
 
-  const dayKeys = Object.keys(_stats).filter(day => day >= cutoffKey).sort();
+  const dayKeys = Object.keys(_stats).filter(day => day !== WEEKLY_KEY && day >= cutoffKey).sort();
   for (const day of dayKeys) {
     const dayData = _stats[day];
     if (!dayData || typeof dayData !== 'object') continue;
@@ -627,5 +821,5 @@ module.exports = {
   getFlushLagMs,
   getRawStatsSnapshot,
   __resetForTest,
-  __test: { _pendingFlush },
+  __test: { _pendingFlush, subscriptionWeekKeyFromDate, subscriptionWeekStartDate, WEEKLY_KEY },
 };
