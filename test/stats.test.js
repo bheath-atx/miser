@@ -470,7 +470,7 @@ test('Sprint B: guardrail + usage project carries both node families', () => {
   }
 });
 
-test('v4 M2: real pre-v4 stats fixture loads byte-compatible and usage stays absent', () => {
+test('v4 M2: real pre-v4 stats fixture preserves daily data and backfills weekly usage-free buckets', () => {
   const file = tmpStatsFile('legacy');
   const prevEnv = process.env.MISER_STATS_FILE;
   const fixtureRaw = fs.readFileSync(preV4FixturePath, 'utf8');
@@ -478,7 +478,11 @@ test('v4 M2: real pre-v4 stats fixture loads byte-compatible and usage stays abs
   try {
     fs.writeFileSync(file, fixtureRaw, 'utf8');
     const stats = freshStats(file);
-    assert.deepEqual(stats.loadStats(), fixture);
+    const loaded = stats.loadStats();
+    const { __weekly, ...daily } = loaded;
+    assert.deepEqual(daily, fixture);
+    assert.ok(__weekly['2026-07-12T11:00:00.000Z']);
+    assert.ok(__weekly['2026-07-19T11:00:00.000Z']);
     const result = stats.getStats('9999');
     assert.equal(result.perProject.default.dedup.inputTokensRemoved, 4149);
     assert.equal(result.perProject.default.dedup.appliedCount, 294);
@@ -486,6 +490,10 @@ test('v4 M2: real pre-v4 stats fixture loads byte-compatible and usage stays abs
     assert.equal(result.perProject.default.pollClass.work, 6400);
     assert.deepEqual(result.usage, {});
     assert.ok(!('usage' in result.perProject.default));
+    const week = result.weekly.priorCompleteWeeks.find(w => w.weekStart === '2026-07-19T11:00:00.000Z');
+    assert.ok(week);
+    assert.equal(week.perProject.default.dedup.inputTokensRemoved, 3600);
+    assert.ok(!('usage' in week.perProject.default));
   } finally {
     cleanup(file, prevEnv);
   }

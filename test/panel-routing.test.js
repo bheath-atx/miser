@@ -39,6 +39,14 @@ function runGetHandler(handler, url) {
   });
 }
 
+function clearPanelEndpointModules() {
+  for (const key of Object.keys(require.cache)) {
+    if (/\/src\/(proxy|panel-stats|routing|stats|pricing|config|metrics|budgets|policy-watchdog|context-management)\.js$/.test(key.replace(/\\/g, '/'))) {
+      delete require.cache[key];
+    }
+  }
+}
+
 // ---- AC10–AC14, AC19: classifyRoute panel routing ---------------------------
 
 test('AC10: project--panel route parsed correctly', () => {
@@ -128,9 +136,37 @@ test('AC17: GET /api/miser/stats/panels returns correct structure', async () => 
   const body = JSON.parse(res.body());
   assert.equal(body.ok, true);
   assert.equal(body.note, 'persisted; survives restart');
+  assert.equal(body.durable, true);
+  assert.equal(body.degraded, false);
+  assert.equal(body.persistence.healthy, true);
   assert.ok(typeof body.panels === 'object');
   assert.ok('testproj--testpanel' in body.panels);
   assert.equal(body.panels['testproj--testpanel'].input, 42);
+});
+
+test('GET /api/miser/stats/panels reflects degraded persistence', async () => {
+  const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  const dir = require('node:fs').mkdtempSync(path.join(os.tmpdir(), `miser-panel-endpoint-dir-${process.pid}-`));
+  try {
+    process.env.MISER_PANEL_STATS_FILE = dir;
+    clearPanelEndpointModules();
+    const { createProxy: createReloadedProxy } = require('../src/proxy.js');
+    const handler = createReloadedProxy();
+    const res = await runGetHandler(handler, '/api/miser/stats/panels');
+    assert.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body());
+    assert.equal(body.ok, true);
+    assert.equal(body.durable, false);
+    assert.equal(body.degraded, true);
+    assert.equal(body.persistence.healthy, false);
+    assert.notEqual(body.note, 'persisted; survives restart');
+    assert.match(body.note, /degraded/);
+  } finally {
+    if (prevEnv === undefined) delete process.env.MISER_PANEL_STATS_FILE;
+    else process.env.MISER_PANEL_STATS_FILE = prevEnv;
+    clearPanelEndpointModules();
+    try { require('node:fs').rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+  }
 });
 
 test('routing: classifyRoute GET /api/miser/stats/panels → stats_panels kind', () => {

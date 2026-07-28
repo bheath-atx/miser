@@ -135,7 +135,10 @@ async function shutdown() {
   }
 
   try {
-    await withTimeout(flushPanelStatsNow(), 2500, 'panel stats flush');
+    const result = await withTimeout(flushPanelStatsNow(), 2500, 'panel stats flush');
+    if (result && result.ok === false) {
+      console.error(`[miser] ERROR final panel stats flush failed: ${result.errorCode || 'WRITE_ERROR'}`);
+    }
   } catch (err) {
     console.error('[miser] ERROR final panel stats flush failed:', err.message);
   }

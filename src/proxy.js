@@ -18,7 +18,7 @@ const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
 const { injectContextManagement } = require('./context-management.js');
 const { buildMetricsText } = require('./metrics.js');
-const { getPanelStats } = require('./panel-stats.js');
+const { getPanelStats, getPersistenceStatus } = require('./panel-stats.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -279,7 +279,18 @@ function createProxy(deps = {}) {
 
     if (route.kind === 'stats_panels') {
       const panels = getPanelStats();
-      json(res, 200, { ok: true, note: 'persisted; survives restart', panels });
+      const persistence = getPersistenceStatus();
+      const note = persistence.healthy
+        ? 'persisted; survives restart'
+        : 'persistence degraded; panel stats may not survive restart';
+      json(res, 200, {
+        ok: true,
+        note,
+        durable: persistence.durable,
+        degraded: !persistence.healthy,
+        persistence,
+        panels,
+      });
       return;
     }
 

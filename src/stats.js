@@ -12,6 +12,18 @@ const STATS_FILE = process.env.MISER_STATS_FILE
   || path.join(os.homedir(), '.miser-stats.json');
 const WEEKLY_KEY = '__weekly';
 const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
+// Keep two years of completed weekly buckets by default: enough for year-over-year
+// comparisons while bounding persisted __weekly growth.
+const DEFAULT_WEEKLY_MAX_WEEKS = 104;
+// Stats writers tolerate normal delayed/replayed events, but reject clock readings
+// outside this service window so one bad host clock cannot create permanent keys.
+const DEFAULT_CLOCK_PAST_DAYS = 400;
+const DEFAULT_CLOCK_FUTURE_DAYS = 7;
+const WEEKLY_MAX_WEEKS = parsePositiveInt(process.env.MISER_WEEKLY_STATS_MAX_WEEKS, DEFAULT_WEEKLY_MAX_WEEKS);
+const CLOCK_PAST_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_PAST_DAYS, DEFAULT_CLOCK_PAST_DAYS) * 24 * 60 * 60 * 1000;
+const CLOCK_FUTURE_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_FUTURE_DAYS, DEFAULT_CLOCK_FUTURE_DAYS) * 24 * 60 * 60 * 1000;
+const TIME_ZONE_STATUS = probeSubscriptionTimeZone();
+let _timezoneFallbackWarned = false;
 
 let _stats = loadStats();
 
@@ -36,11 +48,32 @@ const _pendingFlush = {
   lastFlushErrored: false,
 };
 
+function parsePositiveInt(value, fallback) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+function probeSubscriptionTimeZone() {
+  if (process.env.MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK === '1') {
+    return { supported: false, reason: 'forced by MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK' };
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: SUBSCRIPTION_TIME_ZONE }).format(new Date('2026-01-01T00:00:00.000Z'));
+    return { supported: true, reason: null };
+  } catch (err) {
+    if (err instanceof RangeError) return { supported: false, reason: err.message };
+    throw err;
+  }
+}
+
 function loadStats() {
   try {
     const raw = fs.readFileSync(STATS_FILE, 'utf8');
     const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === 'object') ? parsed : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    if (!parsed[WEEKLY_KEY]) parsed[WEEKLY_KEY] = buildWeeklyFromDaily(parsed);
+    pruneWeeklyRetention(parsed);
+    return parsed;
   } catch (_) {
     return {};
   }
@@ -54,6 +87,7 @@ function clearTimer(name) {
 }
 
 function cloneStats() {
+  pruneWeeklyRetention(_stats);
   return JSON.parse(JSON.stringify(_stats));
 }
 
@@ -215,6 +249,13 @@ function localDatePlusDays(parts, days) {
 }
 
 function subscriptionWeekStartDate(date) {
+  if (!TIME_ZONE_STATUS.supported) {
+    if (!_timezoneFallbackWarned) {
+      _timezoneFallbackWarned = true;
+      console.warn(`[miser/stats] WARN ${SUBSCRIPTION_TIME_ZONE} timezone data unavailable (${TIME_ZONE_STATUS.reason}); using Sunday 12:00 UTC weekly fallback`);
+    }
+    return subscriptionWeekStartFallbackDate(date);
+  }
   try {
     const local = getZonedParts(date);
     const localDateUtc = new Date(Date.UTC(local.year, local.month - 1, local.day, 0, 0, 0));
@@ -241,16 +282,20 @@ function subscriptionWeekStartDate(date) {
       0,
     );
     return boundary;
-  } catch (_) {
-    // If the runtime lacks the America/Chicago zone database, preserve bounded
-    // weekly accounting with a conservative CST reset: Sunday 12:00 UTC.
-    const d = new Date(date);
-    const daysSinceSunday = d.getUTCDay();
-    const boundary = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - daysSinceSunday, 12, 0, 0));
-    if (date >= boundary) return boundary;
-    boundary.setUTCDate(boundary.getUTCDate() - 7);
-    return boundary;
+  } catch (err) {
+    throw err;
   }
+}
+
+function subscriptionWeekStartFallbackDate(date) {
+  // If the runtime lacks the America/Chicago zone database, preserve bounded
+  // weekly accounting with a conservative CST reset: Sunday 12:00 UTC.
+  const d = new Date(date);
+  const daysSinceSunday = d.getUTCDay();
+  const boundary = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - daysSinceSunday, 12, 0, 0));
+  if (date >= boundary) return boundary;
+  boundary.setUTCDate(boundary.getUTCDate() - 7);
+  return boundary;
 }
 
 function subscriptionWeekKeyFromDate(date) {
@@ -280,6 +325,106 @@ function parseDays(daysParam, defaultDays, maxDays = null) {
     }
   }
   return maxDays == null ? days : Math.min(days, maxDays);
+}
+
+function isValidDailyKey(key) {
+  if (typeof key !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(key)) return false;
+  const d = new Date(`${key}T00:00:00.000Z`);
+  return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === key;
+}
+
+function isAllowedRecordTime(date, label) {
+  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
+    console.warn(`[miser/stats] WARN rejecting ${label} stats with invalid timestamp`);
+    return false;
+  }
+  const nowMs = Date.now();
+  if (date.getTime() > nowMs + CLOCK_FUTURE_MS || date.getTime() < nowMs - CLOCK_PAST_MS) {
+    console.warn(`[miser/stats] WARN rejecting ${label} stats with out-of-bounds timestamp ${date.toISOString()}`);
+    return false;
+  }
+  return true;
+}
+
+function validWeekKey(key) {
+  if (typeof key !== 'string') return false;
+  const d = new Date(key);
+  return Number.isFinite(d.getTime()) && d.toISOString() === key;
+}
+
+function pruneWeeklyRetention(statsObj, now = new Date()) {
+  const weekly = statsObj && statsObj[WEEKLY_KEY];
+  if (!weekly || typeof weekly !== 'object') return;
+  const currentWeekStart = subscriptionWeekKeyFromDate(now);
+  const prior = Object.keys(weekly)
+    .filter(key => validWeekKey(key) && key < currentWeekStart)
+    .sort()
+    .reverse();
+  const keepPrior = new Set(prior.slice(0, WEEKLY_MAX_WEEKS));
+  for (const key of Object.keys(weekly)) {
+    if (!validWeekKey(key)) {
+      delete weekly[key];
+    } else if (key < currentWeekStart && !keepPrior.has(key)) {
+      delete weekly[key];
+    }
+  }
+}
+
+function addOptimizerFields(target, source) {
+  const hasOptimizer = !!(source && (source.dedup || source.cacheHint || source.toolPrune
+    || Number.isFinite(source.likelyPollCount) || Number.isFinite(source.workTurnCount)));
+  if (!hasOptimizer) return;
+  ensureOptimizerFields(target);
+  for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
+    const src = source[tech];
+    if (!src || typeof src !== 'object') continue;
+    target[tech].estRemovedTokens += src.estRemovedTokens || 0;
+    target[tech].inputTokensRemoved += src.inputTokensRemoved || 0;
+    target[tech].cacheBillingDelta += src.cacheBillingDelta || 0;
+    target[tech].appliedCount += src.appliedCount || 0;
+    if (tech === 'toolPrune') target[tech].toolsRemovedCount += src.toolsRemovedCount || 0;
+  }
+  target.likelyPollCount += source.likelyPollCount || 0;
+  target.workTurnCount += source.workTurnCount || 0;
+}
+
+function addGuardrailFields(target, source) {
+  if (source.budget && typeof source.budget === 'object' && (source.budget.blockedCount || 0) > 0) {
+    if (!target.budget) target.budget = { blockedCount: 0 };
+    target.budget.blockedCount += source.budget.blockedCount;
+    const first = source.budget.firstBlockedAt;
+    if (typeof first === 'string' && (!target.budget.firstBlockedAt || first < target.budget.firstBlockedAt)) {
+      target.budget.firstBlockedAt = first;
+    }
+  }
+  if (source.policy && typeof source.policy === 'object') {
+    const drift = source.policy.modelDriftCount || 0;
+    const bloat = source.policy.contextBloatCount || 0;
+    if (drift > 0 || bloat > 0) {
+      if (!target.policy) target.policy = { modelDriftCount: 0, contextBloatCount: 0 };
+      target.policy.modelDriftCount += drift;
+      target.policy.contextBloatCount += bloat;
+    }
+  }
+}
+
+function buildWeeklyFromDaily(statsObj) {
+  const weekly = {};
+  for (const [day, dayData] of Object.entries(statsObj || {})) {
+    if (!isValidDailyKey(day) || !dayData || typeof dayData !== 'object') continue;
+    const weekKey = subscriptionWeekKeyFromDate(new Date(`${day}T12:00:00.000Z`));
+    if (!weekly[weekKey]) weekly[weekKey] = {};
+    for (const [project, projectData] of Object.entries(dayData)) {
+      if (!projectData || typeof projectData !== 'object') continue;
+      if (!weekly[weekKey][project]) weekly[weekKey][project] = {};
+      const target = weekly[weekKey][project];
+      addOptimizerFields(target, projectData);
+      if (projectData.usage) addUsageTree(target.usage || (target.usage = {}), projectData.usage);
+      addContextManagement(target, projectData.contextManagement);
+      addGuardrailFields(target, projectData);
+    }
+  }
+  return weekly;
 }
 
 function emptyTechniqueBucket() {
@@ -359,6 +504,7 @@ function ensureWeeklyGuardrailBucket(project, weekKey) {
 // both derive from that single capture.
 function recordBudgetBlock(project, nowFn = () => new Date()) {
   const now = nowFn();
+  if (!isAllowedRecordTime(now, 'budget')) return 0;
   const dayKey = now.toISOString().slice(0, 10);
   const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
@@ -379,6 +525,7 @@ function recordBudgetBlock(project, nowFn = () => new Date()) {
 function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn = () => new Date()) {
   if (!drift && !bloat) return { modelDriftCount: 0, contextBloatCount: 0 }; // no-op: never write zero node
   const now = nowFn();
+  if (!isAllowedRecordTime(now, 'policy')) return { modelDriftCount: 0, contextBloatCount: 0 };
   const dayKey = now.toISOString().slice(0, 10);
   const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
@@ -425,6 +572,7 @@ function applyOptimizerStats(bucket, opts = {}) {
 // opts: { inputTokensRemoved, cacheBillingDelta, toolsRemoved, techniques }
 function recordStats(project, opts = {}, nowFn = () => new Date()) {
   const now = nowFn();
+  if (!isAllowedRecordTime(now, 'optimizer')) return;
   const bucket = ensureProjectBucket(project, now);
   const weekBucket = ensureProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
 
@@ -500,6 +648,7 @@ function applyMeasuredUsage(bucket, providerKey, modelKey, usage, editStats) {
 
 function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEdits = null, nowFn = () => new Date()) {
   const now = nowFn();
+  if (!isAllowedRecordTime(now, 'usage')) return;
   const bucket = ensureMeasuredProjectBucket(project, now);
   const weekBucket = ensureMeasuredProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
   const providerKey = provider || 'anthropic';
@@ -692,9 +841,10 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = ne
   const weeklyData = (_stats[WEEKLY_KEY] && typeof _stats[WEEKLY_KEY] === 'object') ? _stats[WEEKLY_KEY] : {};
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
   const priorCompleteWeeks = Object.keys(weeklyData)
-    .filter(key => key < currentWeekStart)
+    .filter(key => validWeekKey(key) && key < currentWeekStart)
     .sort()
     .reverse()
+    .slice(0, WEEKLY_MAX_WEEKS)
     .map(weekStart => ({
       weekStart,
       complete: true,
@@ -720,7 +870,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
 
   const perProject = {};
   for (const [day, dayData] of Object.entries(_stats)) {
-    if (day === WEEKLY_KEY) continue;
+    if (!isValidDailyKey(day)) continue;
     if (day < cutoffKey || !dayData || typeof dayData !== 'object') continue;
     for (const [proj, projData] of Object.entries(dayData)) {
       if (!projData || typeof projData !== 'object') continue;
@@ -765,7 +915,7 @@ function getDailyTrend(daysParam, projectFilter) {
   const cutoffKey = cutoffKeyForDays(days);
   const entries = [];
 
-  const dayKeys = Object.keys(_stats).filter(day => day !== WEEKLY_KEY && day >= cutoffKey).sort();
+  const dayKeys = Object.keys(_stats).filter(day => isValidDailyKey(day) && day >= cutoffKey).sort();
   for (const day of dayKeys) {
     const dayData = _stats[day];
     if (!dayData || typeof dayData !== 'object') continue;
@@ -821,5 +971,12 @@ module.exports = {
   getFlushLagMs,
   getRawStatsSnapshot,
   __resetForTest,
-  __test: { _pendingFlush, subscriptionWeekKeyFromDate, subscriptionWeekStartDate, WEEKLY_KEY },
+  __test: {
+    _pendingFlush,
+    subscriptionWeekKeyFromDate,
+    subscriptionWeekStartDate,
+    subscriptionWeekStartFallbackDate,
+    isValidDailyKey,
+    WEEKLY_KEY,
+  },
 };

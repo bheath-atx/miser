@@ -20,6 +20,14 @@ function freshStats(file, seed) {
   return require('../src/stats.js');
 }
 
+function freshStatsWithEnv(file, seed, env = {}) {
+  delete require.cache[statsPath];
+  process.env.MISER_STATS_FILE = file;
+  for (const [key, value] of Object.entries(env)) process.env[key] = value;
+  if (seed) fs.writeFileSync(file, JSON.stringify(seed), 'utf8');
+  return require('../src/stats.js');
+}
+
 function cleanup(file, prevEnv) {
   delete require.cache[statsPath];
   if (prevEnv === undefined) delete process.env.MISER_STATS_FILE;
@@ -97,16 +105,59 @@ test('subscription week key handles CST boundary at Sunday 12:00 UTC', () => {
   }
 });
 
+test('subscription week key handles DST transition Sundays with hard-coded UTC instants', () => {
+  const file = tmpStatsFile('dst-transitions');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    const weekKey = stats.__test.subscriptionWeekKeyFromDate;
+
+    assert.equal(weekKey(new Date('2026-03-08T10:59:59.000Z')), '2026-03-01T12:00:00.000Z');
+    assert.equal(weekKey(new Date('2026-03-08T11:00:00.000Z')), '2026-03-08T11:00:00.000Z');
+    assert.equal(weekKey(new Date('2026-11-01T11:59:59.000Z')), '2026-10-25T11:00:00.000Z');
+    assert.equal(weekKey(new Date('2026-11-01T12:00:00.000Z')), '2026-11-01T12:00:00.000Z');
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('subscription week key logs and uses explicit fallback when zone data is unavailable', () => {
+  const file = tmpStatsFile('fallback');
+  const prevStatsEnv = process.env.MISER_STATS_FILE;
+  const prevForceEnv = process.env.MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK;
+  const warnings = [];
+  const originalWarn = console.warn;
+  try {
+    console.warn = (...args) => warnings.push(args.join(' '));
+    const stats = freshStatsWithEnv(file, null, { MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK: '1' });
+    assert.equal(
+      stats.__test.subscriptionWeekKeyFromDate(new Date('2026-07-26T11:59:59.000Z')),
+      '2026-07-19T12:00:00.000Z',
+    );
+    assert.equal(
+      stats.__test.subscriptionWeekKeyFromDate(new Date('2026-07-26T12:00:00.000Z')),
+      '2026-07-26T12:00:00.000Z',
+    );
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /timezone data unavailable/);
+    assert.match(warnings[0], /Sunday 12:00 UTC/);
+  } finally {
+    console.warn = originalWarn;
+    if (prevForceEnv === undefined) delete process.env.MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK;
+    else process.env.MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK = prevForceEnv;
+    cleanup(file, prevStatsEnv);
+  }
+});
+
 test('weekly buckets accumulate current week-to-date and prior complete weeks', () => {
   const file = tmpStatsFile('rollup');
   const prevEnv = process.env.MISER_STATS_FILE;
   try {
     const stats = freshStats(file);
-    const now = new Date();
-    const currentWeekStart = stats.__test.subscriptionWeekStartDate(now);
-    const priorWeekDate = new Date(currentWeekStart.getTime() - 60_000);
-    const currentWeekKey = stats.__test.subscriptionWeekKeyFromDate(now);
-    const priorWeekKey = stats.__test.subscriptionWeekKeyFromDate(priorWeekDate);
+    const now = new Date('2026-07-28T04:00:00.000Z');
+    const priorWeekDate = new Date('2026-07-26T10:59:00.000Z');
+    const currentWeekKey = '2026-07-26T11:00:00.000Z';
+    const priorWeekKey = '2026-07-19T11:00:00.000Z';
 
     stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-4', { input_tokens: 10 }, null, () => now);
     stats.recordStats('alpha', { inputTokensRemoved: 3, techniques: { dedup: true } }, () => now);
@@ -122,6 +173,119 @@ test('weekly buckets accumulate current week-to-date and prior complete weeks', 
     assert.ok(prior, 'prior complete week should be exposed');
     assert.equal(prior.complete, true);
     assert.equal(prior.usage.alpha.anthropic['claude-sonnet-4'].output, 2);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('weekly retention caps prior complete weeks and prunes persisted snapshots', async () => {
+  const file = tmpStatsFile('retention');
+  const prevStatsEnv = process.env.MISER_STATS_FILE;
+  const prevMaxEnv = process.env.MISER_WEEKLY_STATS_MAX_WEEKS;
+  try {
+    const stats = freshStatsWithEnv(file, {
+      __weekly: {
+        '2026-07-05T11:00:00.000Z': { alpha: { usage: { anthropic: { model: { input: 1 } } } } },
+        '2026-07-12T11:00:00.000Z': { alpha: { usage: { anthropic: { model: { input: 2 } } } } },
+        '2026-07-19T11:00:00.000Z': { alpha: { usage: { anthropic: { model: { input: 3 } } } } },
+        '2026-07-26T11:00:00.000Z': { alpha: { usage: { anthropic: { model: { input: 4 } } } } },
+      },
+    }, { MISER_WEEKLY_STATS_MAX_WEEKS: '2' });
+
+    const result = stats.getStats('30');
+    assert.deepEqual(result.weekly.priorCompleteWeeks.map(w => w.weekStart), [
+      '2026-07-19T11:00:00.000Z',
+      '2026-07-12T11:00:00.000Z',
+    ]);
+    await stats.flushNow();
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(Object.keys(raw.__weekly).sort(), [
+      '2026-07-12T11:00:00.000Z',
+      '2026-07-19T11:00:00.000Z',
+      '2026-07-26T11:00:00.000Z',
+    ]);
+  } finally {
+    if (prevMaxEnv === undefined) delete process.env.MISER_WEEKLY_STATS_MAX_WEEKS;
+    else process.env.MISER_WEEKLY_STATS_MAX_WEEKS = prevMaxEnv;
+    cleanup(file, prevStatsEnv);
+  }
+});
+
+test('legacy daily stats are backfilled into weekly buckets on first load', () => {
+  const file = tmpStatsFile('migration');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file, {
+      '2026-07-20': {
+        alpha: {
+          usage: { anthropic: { model: { input: 5, requests: 1 } } },
+          budget: { blockedCount: 2, firstBlockedAt: '2026-07-20T14:00:00.000Z' },
+        },
+      },
+      '2026-07-21': {
+        alpha: {
+          usage: { anthropic: { model: { output: 3, requests: 1 } } },
+          policy: { modelDriftCount: 1, contextBloatCount: 2 },
+        },
+      },
+    });
+    const weekly = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === '2026-07-19T11:00:00.000Z');
+    assert.ok(weekly, 'backfilled prior week should be exposed');
+    assert.equal(weekly.usage.alpha.anthropic.model.input, 5);
+    assert.equal(weekly.usage.alpha.anthropic.model.output, 3);
+    assert.deepEqual(weekly.perProject.alpha.budget, {
+      blockedCount: 2,
+      firstBlockedAt: '2026-07-20T14:00:00.000Z',
+    });
+    assert.deepEqual(weekly.perProject.alpha.policy, {
+      modelDriftCount: 1,
+      contextBloatCount: 2,
+    });
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('clock-skewed record timestamps are rejected without creating daily or weekly keys', () => {
+  const file = tmpStatsFile('clock-skew');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const warnings = [];
+  const originalWarn = console.warn;
+  try {
+    console.warn = (...args) => warnings.push(args.join(' '));
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'model', { input_tokens: 1 }, null, () => new Date('2030-01-01T00:00:00.000Z'));
+    stats.recordBudgetBlock('alpha', () => new Date('2020-01-01T00:00:00.000Z'));
+    stats.recordPolicyEvent('alpha', { drift: true }, () => new Date('2030-01-01T00:00:00.000Z'));
+    stats.recordStats('alpha', { inputTokensRemoved: 1, techniques: { dedup: true } }, () => new Date('2020-01-01T00:00:00.000Z'));
+    assert.deepEqual(stats.getRawStatsSnapshot(), {});
+    assert.equal(warnings.length, 4);
+    assert.ok(warnings.every(line => /out-of-bounds timestamp/.test(line)));
+  } finally {
+    console.warn = originalWarn;
+    cleanup(file, prevEnv);
+  }
+});
+
+test('budget and policy events are written to weekly buckets', () => {
+  const file = tmpStatsFile('guardrails-weekly');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    const now = () => new Date('2026-07-27T12:00:00.000Z');
+    stats.recordBudgetBlock('alpha', now);
+    stats.recordBudgetBlock('alpha', now);
+    stats.recordPolicyEvent('alpha', { drift: true, bloat: true }, now);
+    const week = stats.getStats('30').weekly.currentWeekToDate.perProject.alpha;
+    assert.deepEqual(week.budget, {
+      blockedCount: 2,
+      firstBlockedAt: '2026-07-27T12:00:00.000Z',
+    });
+    assert.deepEqual(week.policy, {
+      modelDriftCount: 1,
+      contextBloatCount: 1,
+    });
   } finally {
     cleanup(file, prevEnv);
   }
