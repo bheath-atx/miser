@@ -79,6 +79,50 @@ test('AC2: HELP and TYPE headers present for all three metric families', () => {
   assert.ok(!text.includes('_total'), 'No _total metric names should appear');
 });
 
+test('R8: authority and rejection gauges expose concrete stats authority state', () => {
+  const text = buildMetricsText({
+    usage: SAMPLE_USAGE,
+    authoritative: false,
+    degraded: true,
+    persistence: {
+      healthy: false,
+      durable: false,
+      pending: true,
+    },
+    weeklyAuthoritative: false,
+    nonAuthoritativeWeekCount: 2,
+    nonAuthoritativeReasons: ['pre_recording_daily_gap', 'coverage_unknown'],
+    recordRejections: {
+      total: 4,
+      invalidTimestamp: 1,
+      outOfBoundsTimestamp: 2,
+      loadFailureRefusal: 1,
+      byLabel: {
+        usage: 3,
+        optimizer: 1,
+      },
+    },
+  });
+
+  assert.ok(text.includes('# HELP miser_authoritative'));
+  assert.ok(text.includes('# TYPE miser_authoritative gauge'));
+  assert.ok(text.includes('miser_authoritative 0\n'));
+  assert.ok(text.includes('miser_degraded 1\n'));
+  assert.ok(text.includes('miser_persistence_healthy 0\n'));
+  assert.ok(text.includes('miser_persistence_durable 0\n'));
+  assert.ok(text.includes('miser_persistence_pending 1\n'));
+  assert.ok(text.includes('miser_weekly_authoritative 0\n'));
+  assert.ok(text.includes('miser_non_authoritative_weeks 2\n'));
+  assert.ok(text.includes('miser_non_authoritative_week_reasons{reason="pre_recording_daily_gap"} 1'));
+  assert.ok(text.includes('miser_non_authoritative_week_reasons{reason="coverage_unknown"} 1'));
+  assert.ok(text.includes('miser_record_rejections{reason="total"} 4'));
+  assert.ok(text.includes('miser_record_rejections{reason="invalidTimestamp"} 1'));
+  assert.ok(text.includes('miser_record_rejections{reason="outOfBoundsTimestamp"} 2'));
+  assert.ok(text.includes('miser_record_rejections{reason="loadFailureRefusal"} 1'));
+  assert.ok(text.includes('miser_record_rejections_by_label{label="optimizer"} 1'));
+  assert.ok(text.includes('miser_record_rejections_by_label{label="usage"} 3'));
+});
+
 // ---- AC3: Prometheus compliance (comprehensive) -----------------------------
 
 test('AC3: Prometheus compliance — label escaping, format, and trailing newline', () => {

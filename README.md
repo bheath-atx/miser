@@ -68,17 +68,19 @@ Anthropic 2xx responses are tee-parsed without buffering SSE streams. Stats incl
 
 Missing usage means “not measured”; v4 does not zero-fill absent usage nodes.
 
-`GET /api/miser/stats` and `GET /api/miser/stats/panels` use `ok` as a data-authority flag, not as a handler-reachability flag. They return HTTP 200 when reachable even if `ok:false`; clients must check:
+`GET /api/miser/stats` and `GET /api/miser/stats/panels` use `ok` as a data-authority flag, not as a handler-reachability flag. They return HTTP 200 when reachable even if `ok:false`. On `GET /api/miser/stats`, top-level `ok` / `authoritative` cover the rolling-window aggregate and persistence state; they do not cover per-week authority. Clients must check:
 
 - `authoritative`: true only when the returned counters are durable and not degraded.
 - `durable`: true only when there are no pending writes and persistence is healthy.
-- `degraded`: true when load/write/retention state means the counters are not authoritative.
-- `persistence`: detailed load, flush, pending, file, and retention state.
+- `degraded`: true when load/write/persistence state means the counters are not authoritative.
+- `persistence`: detailed load, flush, pending, and file state.
 - `recordRejections`: dropped/rejected record counters and `byLabel` breakdown. Main stats labels include `usage`, `budget`, `policy`, and `optimizer`; panel stats labels are `<project>--<panel>`.
+- `weeklyAuthoritative`: true only when every exposed week is authoritative.
+- `nonAuthoritativeWeekCount` / `nonAuthoritativeReasons`: top-level weekly rollup fields, so clients do not have to iterate the weekly array to detect unverified weekly data.
 
-Weekly stats in the `/api/miser/stats` response include `authoritative` / `degraded` at the weekly summary and per-week level. A non-authoritative week carries `nonAuthoritativeReason` and, when coverage is known, `coverage`. Current reasons:
+Weekly stats in the `/api/miser/stats` response include `authoritative` / `degraded` at the weekly summary and per-week level. The top-level `weeklyAuthoritative` rollup is the response-level signal for weekly authority. A non-authoritative week carries `nonAuthoritativeReason` and, when coverage is known, `coverage`. Current reasons:
 
-- `coverage_unknown`: legacy daily data exists but no recording watermark is available.
+- `coverage_unknown`: legacy daily data exists but no recording-start metadata is available.
 - `pre_recording_daily_gap`: expected days are missing before this install started recording daily buckets. Daily buckets are never pruned today.
 - `no_daily_backing`: a stored weekly bucket has no daily bucket support.
 - `migration_retention_failed`: weekly migration/retention failed, so preserved weekly data cannot be trusted as authoritative.

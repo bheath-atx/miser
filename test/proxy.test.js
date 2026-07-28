@@ -325,6 +325,41 @@ test('/api/miser/stats exposes load failure mutation drop counters', async () =>
   }
 });
 
+test('/api/miser/stats exposes top-level weekly authority rollup without lowering ok', async () => {
+  const file = path.join(os.tmpdir(), `miser-proxy-test-weekly-rollup-${process.pid}-${Date.now()}-${Math.random()}.json`);
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  fs.writeFileSync(file, JSON.stringify({
+    __meta: { recordingStartedAt: '2026-07-20' },
+    '2026-07-20': {
+      alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
+    },
+    __weekly: {
+      [weekKey]: {
+        alpha: { usage: { anthropic: { model: { input: 70, requests: 7 } } } },
+      },
+    },
+  }), 'utf8');
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_STATS_FILE: file });
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats', null, {}), res);
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 200);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.authoritative, true);
+    assert.equal(payload.weeklyAuthoritative, false);
+    assert.equal(payload.nonAuthoritativeWeekCount, 1);
+    assert.deepEqual(payload.nonAuthoritativeReasons, ['pre_recording_daily_gap']);
+    const week = payload.weekly.priorCompleteWeeks.find(item => item.weekStart === weekKey);
+    assert.equal(week.authoritative, false);
+    assert.equal(week.nonAuthoritativeReason, 'pre_recording_daily_gap');
+    assert.deepEqual(week.coverage.missingDays, ['2026-07-19']);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
 test('/api/miser/stats?days=abc returns 400', async () => {
   const echo = await startEcho(() => ({ status: 200, body: {} }));
   const { createProxy, restoreEnv } = freshProxy(echo.url);

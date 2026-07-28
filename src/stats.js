@@ -13,10 +13,13 @@ const STATS_FILE = process.env.MISER_STATS_FILE
 const WEEKLY_KEY = '__weekly';
 const WEEKLY_META_KEY = '__meta';
 const STATS_META_KEY = '__meta';
-// Historical persisted key name retained for compatibility. Daily buckets are
-// never pruned today; this stores the earliest day this install recorded after
-// the metadata was introduced, so missing earlier days are pre-recording gaps.
+// Historical persisted key name retained only for migration.
 const DAILY_RETENTION_WATERMARK_KEY = 'dailyRetentionWatermark';
+// Daily buckets are never pruned today; this records the first day this install
+// recorded after the metadata was introduced, so missing earlier days are
+// pre-recording gaps. It is write-once and never extended backward by later
+// backdated records.
+const RECORDING_STARTED_AT_KEY = 'recordingStartedAt';
 const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
 // Keep two years of completed weekly buckets by default: enough for year-over-year
 // comparisons while bounding persisted __weekly growth.
@@ -152,6 +155,7 @@ function loadStats() {
     return {};
   }
   try {
+    migrateStatsMeta(parsed);
     reconcileWeeklyFromDaily(parsed);
     pruneWeeklyRetention(parsed);
   } catch (err) {
@@ -477,17 +481,36 @@ function isValidDailyKey(key) {
   return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === key;
 }
 
-function getDailyRetentionWatermark(statsObj) {
+function migrateStatsMeta(statsObj) {
   const meta = getStatsMeta(statsObj);
-  const value = meta && meta[DAILY_RETENTION_WATERMARK_KEY];
-  return isValidDailyKey(value) ? value : null;
+  if (!meta) return;
+  const current = meta[RECORDING_STARTED_AT_KEY];
+  if (isValidDailyKey(current)) {
+    delete meta[DAILY_RETENTION_WATERMARK_KEY];
+    return;
+  }
+  const legacy = meta[DAILY_RETENTION_WATERMARK_KEY];
+  if (isValidDailyKey(legacy)) {
+    meta[RECORDING_STARTED_AT_KEY] = legacy;
+    delete meta[DAILY_RETENTION_WATERMARK_KEY];
+  }
 }
 
-function noteRetainedDailyKey(statsObj, day) {
+function getRecordingStartedAt(statsObj) {
+  const meta = getStatsMeta(statsObj);
+  if (!meta) return null;
+  const current = meta[RECORDING_STARTED_AT_KEY];
+  if (isValidDailyKey(current)) return current;
+  const legacy = meta[DAILY_RETENTION_WATERMARK_KEY];
+  return isValidDailyKey(legacy) ? legacy : null;
+}
+
+function noteRecordingStartedAt(statsObj, day) {
   if (!isValidDailyKey(day)) return;
   const meta = getStatsMeta(statsObj, true);
-  const current = getDailyRetentionWatermark(statsObj);
-  if (!current || day < current) meta[DAILY_RETENTION_WATERMARK_KEY] = day;
+  migrateStatsMeta(statsObj);
+  const current = getRecordingStartedAt(statsObj);
+  if (!current) meta[RECORDING_STARTED_AT_KEY] = day;
 }
 
 function canRetainMutationAfterLoadFailure(label) {
@@ -580,13 +603,13 @@ function expectedDailyKeysForWeek(weekKey, now = new Date()) {
 
 function dailyCoverageForWeek(statsObj, weekKey) {
   const expectedDays = expectedDailyKeysForWeek(weekKey);
-  const watermark = getDailyRetentionWatermark(statsObj);
+  const recordingStartedAt = getRecordingStartedAt(statsObj);
   const expected = new Set(expectedDays);
   const presentDays = Object.keys(statsObj || {})
     .filter(day => expected.has(day) && isValidDailyKey(day))
     .sort();
   const present = new Set(presentDays);
-  if (!watermark) {
+  if (!recordingStartedAt) {
     return {
       complete: false,
       unknown: expectedDays.length > 0,
@@ -597,9 +620,9 @@ function dailyCoverageForWeek(statsObj, weekKey) {
     };
   }
   const coveredQuietDays = expectedDays
-    .filter(day => !present.has(day) && day >= watermark);
+    .filter(day => !present.has(day) && day >= recordingStartedAt);
   const missingDays = expectedDays
-    .filter(day => !present.has(day) && day < watermark);
+    .filter(day => !present.has(day) && day < recordingStartedAt);
   return {
     complete: missingDays.length === 0,
     presentDays,
@@ -608,7 +631,7 @@ function dailyCoverageForWeek(statsObj, weekKey) {
     expectedDays,
     presentCount: presentDays.length,
     expectedCount: expectedDays.length,
-    retainedDailyWatermark: watermark,
+    recordingStartedAt,
   };
 }
 
@@ -624,6 +647,10 @@ function coverageMetadataForWeek(statsObj, weekKey) {
   const coverage = dailyCoverageForWeek(statsObj, weekKey);
   const reason = nonAuthoritativeReasonForCoverage(coverage);
   return reason ? { reason, coverage } : null;
+}
+
+function isCoverageAuthorityReason(reason) {
+  return reason === 'coverage_unknown' || reason === 'pre_recording_daily_gap';
 }
 
 function pruneWeeklyRetention(statsObj, now = new Date()) {
@@ -720,7 +747,7 @@ function markWeekNonAuthoritative(weekData, reason, extra = null) {
       expectedDays: extra.expectedDays,
       presentCount: extra.presentCount,
       expectedCount: extra.expectedCount,
-      retainedDailyWatermark: extra.retainedDailyWatermark,
+      recordingStartedAt: extra.recordingStartedAt,
     };
   }
   return weekData;
@@ -775,9 +802,13 @@ function markRuntimeWeeklyCoverageGaps(statsObj) {
   for (const [weekKey, weekData] of Object.entries(weekly)) {
     if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
     const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
-    if (meta && meta.authoritative === false) continue;
+    if (meta && meta.authoritative === false && !isCoverageAuthorityReason(meta.reason)) continue;
     const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
-    if (coverageMeta) markWeekNonAuthoritative(weekData, coverageMeta.reason, coverageMeta.coverage);
+    if (coverageMeta) {
+      markWeekNonAuthoritative(weekData, coverageMeta.reason, coverageMeta.coverage);
+    } else if (meta && meta.authoritative === false && isCoverageAuthorityReason(meta.reason)) {
+      delete weekData[WEEKLY_META_KEY];
+    }
   }
 }
 
@@ -800,7 +831,7 @@ function ensureOptimizerFields(bucket) {
 
 function ensureProjectBucketForDay(project, day) {
   const proj = project || 'default';
-  noteRetainedDailyKey(_stats, day);
+  noteRecordingStartedAt(_stats, day);
   if (!_stats[day]) _stats[day] = {};
   if (!_stats[day][proj]) _stats[day][proj] = {};
   return ensureOptimizerFields(_stats[day][proj]);
@@ -820,7 +851,7 @@ function ensureProjectBucket(project, now = new Date()) {
 
 function ensureMeasuredProjectBucketForDay(project, day) {
   const proj = project || 'default';
-  noteRetainedDailyKey(_stats, day);
+  noteRecordingStartedAt(_stats, day);
   if (!_stats[day]) _stats[day] = {};
   if (!_stats[day][proj]) _stats[day][proj] = {};
   return _stats[day][proj];
@@ -842,7 +873,7 @@ function ensureMeasuredProjectBucket(project, now = new Date()) {
 // an injected nowFn fully controls the day bucket — no midnight-split risk.
 function ensureGuardrailBucket(project, dayKey) {
   const proj = project || 'default';
-  noteRetainedDailyKey(_stats, dayKey);
+  noteRecordingStartedAt(_stats, dayKey);
   if (!_stats[dayKey]) _stats[dayKey] = {};
   if (!_stats[dayKey][proj]) _stats[dayKey][proj] = {};
   return _stats[dayKey][proj];
@@ -1206,10 +1237,11 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = ne
     const weekData = weeklyData[weekStart];
     const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
       ? weekData[WEEKLY_META_KEY] : null;
-    const coverageMeta = !isWeeklyContainer(weekData) || (storedMeta && storedMeta.authoritative === false)
+    const coverageMeta = !isWeeklyContainer(weekData)
+      || (storedMeta && storedMeta.authoritative === false && !isCoverageAuthorityReason(storedMeta.reason))
       ? null
       : coverageMetadataForWeek(_stats, weekStart);
-    const meta = (storedMeta && storedMeta.authoritative === false)
+    const meta = (storedMeta && storedMeta.authoritative === false && !isCoverageAuthorityReason(storedMeta.reason))
       ? storedMeta
       : coverageMeta && {
         authoritative: false,
@@ -1249,6 +1281,27 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = ne
   };
 }
 
+function weeklyAuthorityRollup(weekly) {
+  const weeks = [
+    weekly && weekly.currentWeekToDate,
+    ...((weekly && Array.isArray(weekly.priorCompleteWeeks)) ? weekly.priorCompleteWeeks : []),
+  ].filter(Boolean);
+  const nonAuthoritative = weeks.filter(week => week.authoritative === false);
+  const reasons = [];
+  const seen = new Set();
+  for (const week of nonAuthoritative) {
+    const reason = week.nonAuthoritativeReason;
+    if (typeof reason !== 'string' || seen.has(reason)) continue;
+    seen.add(reason);
+    reasons.push(reason);
+  }
+  return {
+    weeklyAuthoritative: nonAuthoritative.length === 0,
+    nonAuthoritativeWeekCount: nonAuthoritative.length,
+    nonAuthoritativeReasons: reasons,
+  };
+}
+
 function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   const days = parseDays(daysParam, 7);
   const cutoffKey = cutoffKeyForDays(days);
@@ -1265,6 +1318,8 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   const aggregate = finalizeAggregate(perProject, weights);
   const persistence = getPersistenceStatus();
   const authoritative = persistence.healthy && persistence.durable;
+  const weekly = getSubscriptionWeeks(projectFilter, weights);
+  const weeklyRollup = weeklyAuthorityRollup(weekly);
 
   return {
     ok: authoritative,
@@ -1276,7 +1331,8 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     degraded: !persistence.healthy,
     authoritative,
     persistence,
-    weekly: getSubscriptionWeeks(projectFilter, weights),
+    ...weeklyRollup,
+    weekly,
   };
 }
 
@@ -1392,6 +1448,8 @@ module.exports = {
     isValidDailyKey,
     getSubscriptionTimeZoneStatus,
     getRecordRejectionStatus,
+    migrateStatsMeta,
+    getRecordingStartedAt,
     reconcileWeeklyFromDaily,
     dailyCoverageForWeek,
     WEEKLY_MAX_WEEKS,
@@ -1401,5 +1459,6 @@ module.exports = {
     WEEKLY_META_KEY,
     STATS_META_KEY,
     DAILY_RETENTION_WATERMARK_KEY,
+    RECORDING_STARTED_AT_KEY,
   },
 };

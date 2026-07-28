@@ -63,6 +63,77 @@ function buildMetricsText(statsResult) {
     lines.push(`miser_cost_usd_7d{project="${labelEscape(project)}"} ${cost}`);
   }
 
+  lines.push('# HELP miser_authoritative Stats rolling-window aggregate authority state (1 authoritative, 0 non-authoritative).');
+  lines.push('# TYPE miser_authoritative gauge');
+  if (statsResult && typeof statsResult.authoritative === 'boolean') {
+    lines.push(`miser_authoritative ${statsResult.authoritative ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_degraded Stats persistence degradation state (1 degraded, 0 healthy).');
+  lines.push('# TYPE miser_degraded gauge');
+  if (statsResult && typeof statsResult.degraded === 'boolean') {
+    lines.push(`miser_degraded ${statsResult.degraded ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_persistence_healthy Stats persistence health state (1 healthy, 0 unhealthy).');
+  lines.push('# TYPE miser_persistence_healthy gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.healthy === 'boolean') {
+    lines.push(`miser_persistence_healthy ${statsResult.persistence.healthy ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_persistence_durable Stats persistence durability state (1 durable, 0 pending or degraded).');
+  lines.push('# TYPE miser_persistence_durable gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.durable === 'boolean') {
+    lines.push(`miser_persistence_durable ${statsResult.persistence.durable ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_persistence_pending Stats persistence pending-write state (1 pending, 0 not pending).');
+  lines.push('# TYPE miser_persistence_pending gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.pending === 'boolean') {
+    lines.push(`miser_persistence_pending ${statsResult.persistence.pending ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_weekly_authoritative Stats weekly payload authority state (1 all exposed weeks authoritative, 0 some weeks non-authoritative).');
+  lines.push('# TYPE miser_weekly_authoritative gauge');
+  if (statsResult && typeof statsResult.weeklyAuthoritative === 'boolean') {
+    lines.push(`miser_weekly_authoritative ${statsResult.weeklyAuthoritative ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_non_authoritative_weeks Non-authoritative week count in the stats payload.');
+  lines.push('# TYPE miser_non_authoritative_weeks gauge');
+  if (statsResult && Number.isFinite(statsResult.nonAuthoritativeWeekCount)) {
+    lines.push(`miser_non_authoritative_weeks ${statsResult.nonAuthoritativeWeekCount}`);
+  }
+
+  lines.push('# HELP miser_non_authoritative_week_reasons Non-authoritative week reason presence in the stats payload.');
+  lines.push('# TYPE miser_non_authoritative_week_reasons gauge');
+  for (const reason of (Array.isArray(statsResult && statsResult.nonAuthoritativeReasons)
+    ? statsResult.nonAuthoritativeReasons : [])) {
+    lines.push(`miser_non_authoritative_week_reasons{reason="${labelEscape(reason)}"} 1`);
+  }
+
+  const rejections = (statsResult && statsResult.recordRejections) || null;
+  lines.push('# HELP miser_record_rejections Rejected or dropped stats record count, by reason.');
+  lines.push('# TYPE miser_record_rejections gauge');
+  if (rejections && typeof rejections === 'object') {
+    for (const reason of ['total', 'invalidTimestamp', 'outOfBoundsTimestamp', 'loadFailureRefusal']) {
+      if (Number.isFinite(rejections[reason])) {
+        lines.push(`miser_record_rejections{reason="${labelEscape(reason)}"} ${rejections[reason]}`);
+      }
+    }
+  }
+
+  lines.push('# HELP miser_record_rejections_by_label Rejected or dropped stats record count, by stats label.');
+  lines.push('# TYPE miser_record_rejections_by_label gauge');
+  const byLabel = rejections && rejections.byLabel;
+  if (byLabel && typeof byLabel === 'object') {
+    for (const [label, value] of Object.entries(byLabel).sort(([a], [b]) => a.localeCompare(b))) {
+      if (Number.isFinite(value)) {
+        lines.push(`miser_record_rejections_by_label{label="${labelEscape(label)}"} ${value}`);
+      }
+    }
+  }
+
   return lines.join('\n') + '\n';
 }
 
