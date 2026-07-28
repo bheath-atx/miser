@@ -11,6 +11,7 @@ const { computeCost } = require('./pricing.js');
 const STATS_FILE = process.env.MISER_STATS_FILE
   || path.join(os.homedir(), '.miser-stats.json');
 const WEEKLY_KEY = '__weekly';
+const WEEKLY_META_KEY = '__meta';
 const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
 // Keep two years of completed weekly buckets by default: enough for year-over-year
 // comparisons while bounding persisted __weekly growth.
@@ -26,7 +27,10 @@ const WEEKLY_MAX_WEEKS = parsePositiveInt(process.env.MISER_WEEKLY_STATS_MAX_WEE
 const CLOCK_PAST_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_PAST_DAYS, DEFAULT_CLOCK_PAST_DAYS, MAX_CLOCK_PAST_DAYS, 'MISER_STATS_CLOCK_PAST_DAYS') * 24 * 60 * 60 * 1000;
 const CLOCK_FUTURE_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_FUTURE_DAYS, DEFAULT_CLOCK_FUTURE_DAYS, MAX_CLOCK_FUTURE_DAYS, 'MISER_STATS_CLOCK_FUTURE_DAYS') * 24 * 60 * 60 * 1000;
 let _timeZoneStatus = null;
+let _timeZoneUnsupportedRetries = 0;
 let _timezoneFallbackWarned = false;
+const TIME_ZONE_UNSUPPORTED_RETRY_MS = 60_000;
+const TIME_ZONE_IMMEDIATE_RETRIES = 1;
 
 let _stats = loadStats();
 
@@ -90,8 +94,20 @@ function getSubscriptionTimeZoneStatus() {
     return _timeZoneStatus;
   }
   if (_timeZoneStatus && _timeZoneStatus.supported) return _timeZoneStatus;
+  if (_timeZoneStatus && !_timeZoneStatus.supported
+      && _timeZoneStatus.nextRetryAt && Date.now() < _timeZoneStatus.nextRetryAt) {
+    return _timeZoneStatus;
+  }
   _timeZoneStatus = probeSubscriptionTimeZone();
-  if (_timeZoneStatus.supported) _timezoneFallbackWarned = false;
+  if (_timeZoneStatus.supported) {
+    _timezoneFallbackWarned = false;
+    _timeZoneUnsupportedRetries = 0;
+  } else if (_timeZoneUnsupportedRetries < TIME_ZONE_IMMEDIATE_RETRIES) {
+    _timeZoneUnsupportedRetries += 1;
+    _timeZoneStatus.nextRetryAt = 0;
+  } else {
+    _timeZoneStatus.nextRetryAt = Date.now() + TIME_ZONE_UNSUPPORTED_RETRY_MS;
+  }
   return _timeZoneStatus;
 }
 
@@ -111,6 +127,8 @@ function loadStats() {
     console.error('[miser/stats] ERROR stats migration/retention failed; preserving parsed daily stats:', err.message);
     if (!parsed[WEEKLY_KEY] || typeof parsed[WEEKLY_KEY] !== 'object' || Array.isArray(parsed[WEEKLY_KEY])) {
       delete parsed[WEEKLY_KEY];
+    } else {
+      markAllWeeklyNonAuthoritative(parsed[WEEKLY_KEY], 'migration_retention_failed');
     }
   }
   return parsed;
@@ -493,59 +511,20 @@ function isWeeklyContainer(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function maxInto(target, key, value) {
-  if (!Number.isFinite(value)) return;
-  target[key] = Math.max(Number.isFinite(target[key]) ? target[key] : 0, value);
+function markWeekNonAuthoritative(weekData, reason) {
+  if (!isWeeklyContainer(weekData)) return weekData;
+  weekData[WEEKLY_META_KEY] = {
+    authoritative: false,
+    reason,
+  };
+  return weekData;
 }
 
-function mergeUsageBucket(target, source) {
-  if (!source || typeof source !== 'object') return;
-  if (!target || typeof target !== 'object') return;
-  for (const key of ['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'requests']) {
-    maxInto(target, key, source[key]);
-  }
-}
-
-function mergeWeeklyProjectBucket(target, source) {
-  if (!source || typeof source !== 'object') return;
-  if (!target || typeof target !== 'object') return;
-  for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
-    if (!source[tech] || typeof source[tech] !== 'object') continue;
-    if (!target[tech] || typeof target[tech] !== 'object') target[tech] = {};
-    for (const [key, value] of Object.entries(source[tech])) maxInto(target[tech], key, value);
-  }
-  for (const key of ['likelyPollCount', 'workTurnCount']) maxInto(target, key, source[key]);
-  if (source.usage && typeof source.usage === 'object') {
-    if (!target.usage || typeof target.usage !== 'object') target.usage = {};
-    for (const [provider, models] of Object.entries(source.usage)) {
-      if (!models || typeof models !== 'object') continue;
-      if (!target.usage[provider] || typeof target.usage[provider] !== 'object') target.usage[provider] = {};
-      for (const [model, bucket] of Object.entries(models)) {
-        if (!bucket || typeof bucket !== 'object') continue;
-        if (!target.usage[provider][model] || typeof target.usage[provider][model] !== 'object') {
-          target.usage[provider][model] = {};
-        }
-        mergeUsageBucket(target.usage[provider][model], bucket);
-      }
-    }
-  }
-  if (source.contextManagement && typeof source.contextManagement === 'object') {
-    if (!target.contextManagement || typeof target.contextManagement !== 'object') target.contextManagement = {};
-    for (const key of ['clearedToolUses', 'clearedInputTokens', 'editCount']) {
-      maxInto(target.contextManagement, key, source.contextManagement[key]);
-    }
-  }
-  if (source.budget && typeof source.budget === 'object') {
-    if (!target.budget || typeof target.budget !== 'object') target.budget = {};
-    maxInto(target.budget, 'blockedCount', source.budget.blockedCount);
-    const first = source.budget.firstBlockedAt;
-    if (typeof first === 'string' && (!target.budget.firstBlockedAt || first < target.budget.firstBlockedAt)) {
-      target.budget.firstBlockedAt = first;
-    }
-  }
-  if (source.policy && typeof source.policy === 'object') {
-    if (!target.policy || typeof target.policy !== 'object') target.policy = {};
-    for (const key of ['modelDriftCount', 'contextBloatCount']) maxInto(target.policy, key, source.policy[key]);
+function markAllWeeklyNonAuthoritative(weekly, reason) {
+  if (!isWeeklyContainer(weekly)) return;
+  for (const [weekKey, weekData] of Object.entries(weekly)) {
+    if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
+    markWeekNonAuthoritative(weekData, reason);
   }
 }
 
@@ -556,13 +535,15 @@ function reconcileWeeklyFromDaily(statsObj) {
     return;
   }
   const weekly = statsObj[WEEKLY_KEY];
+  const reconciled = {};
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
-    if (!isWeeklyContainer(weekly[weekKey])) weekly[weekKey] = {};
-    for (const [project, projectData] of Object.entries(weekData)) {
-      if (!isWeeklyContainer(weekly[weekKey][project])) weekly[weekKey][project] = {};
-      mergeWeeklyProjectBucket(weekly[weekKey][project], projectData);
-    }
+    reconciled[weekKey] = weekData;
   }
+  for (const [weekKey, weekData] of Object.entries(weekly)) {
+    if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData) || reconciled[weekKey]) continue;
+    reconciled[weekKey] = markWeekNonAuthoritative(weekData, 'no_daily_backing');
+  }
+  statsObj[WEEKLY_KEY] = reconciled;
 }
 
 function emptyTechniqueBucket() {
@@ -857,6 +838,7 @@ function projectHasMeasuredUsage(projData) {
 }
 
 function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
+  if (proj === WEEKLY_META_KEY) return;
   if (projectFilter && proj !== projectFilter) return;
   // No-fabrication guard (Sprint B): legacy bucket init fires only for
   // projects with usage, contextManagement, or any legacy optimizer key in
@@ -978,26 +960,38 @@ function aggregatePeriod(periodData, projectFilter, weights = DEFAULT_WEIGHTS) {
 function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = new Date()) {
   const weeklyData = (_stats[WEEKLY_KEY] && typeof _stats[WEEKLY_KEY] === 'object') ? _stats[WEEKLY_KEY] : {};
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
+  const makeWeek = (weekStart, complete) => {
+    const weekData = weeklyData[weekStart];
+    const meta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
+      ? weekData[WEEKLY_META_KEY] : null;
+    const authoritative = !(meta && meta.authoritative === false);
+    const out = {
+      weekStart,
+      complete,
+      authoritative,
+      degraded: !authoritative,
+      ...aggregatePeriod(weekData, projectFilter, weights),
+    };
+    if (meta && typeof meta.reason === 'string') out.nonAuthoritativeReason = meta.reason;
+    return out;
+  };
   const priorCompleteWeeks = Object.keys(weeklyData)
     .filter(key => validWeekKey(key) && key < currentWeekStart)
     .sort()
     .reverse()
     .slice(0, WEEKLY_MAX_WEEKS)
-    .map(weekStart => ({
-      weekStart,
-      complete: true,
-      ...aggregatePeriod(weeklyData[weekStart], projectFilter, weights),
-    }));
+    .map(weekStart => makeWeek(weekStart, true));
+  const currentWeekToDate = makeWeek(currentWeekStart, false);
+  const authoritative = currentWeekToDate.authoritative
+    && priorCompleteWeeks.every(week => week.authoritative);
 
   return {
     timeZone: SUBSCRIPTION_TIME_ZONE,
     localReset: 'Sunday 06:00',
+    authoritative,
+    degraded: !authoritative,
     currentWeekStart,
-    currentWeekToDate: {
-      weekStart: currentWeekStart,
-      complete: false,
-      ...aggregatePeriod(weeklyData[currentWeekStart], projectFilter, weights),
-    },
+    currentWeekToDate,
     priorCompleteWeeks,
   };
 }
@@ -1095,6 +1089,7 @@ function __resetForTest() {
   _recordRejections.lastRejectedAt = null;
   _recordRejections.warned = false;
   _timeZoneStatus = null;
+  _timeZoneUnsupportedRetries = 0;
   _timezoneFallbackWarned = false;
 }
 
@@ -1132,5 +1127,6 @@ module.exports = {
     CLOCK_PAST_MS,
     CLOCK_FUTURE_MS,
     WEEKLY_KEY,
+    WEEKLY_META_KEY,
   },
 };

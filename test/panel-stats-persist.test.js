@@ -248,6 +248,66 @@ test('panel stats expose unflushed dirty data as pending, not durable', async ()
   }
 });
 
+test('panel stats do not overwrite existing file after load failure followed by flush', async () => {
+  const file = tmpPanelFile('load-failure-preserve');
+  const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  const corruptBody = '{not json';
+  try {
+    fs.writeFileSync(file, corruptBody, 'utf8');
+    const panels = await freshLoadedPanelStats(file);
+    assert.deepEqual(panels.getPanelStats(), {});
+    assert.equal(panels.getPersistenceStatus().lastLoadErrored, true);
+
+    panels.recordPanelUsage('alpha', 'orch', { input_tokens: 9 }, () => new Date('2026-07-27T12:00:00.000Z'));
+    const result = await panels.flushNow();
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, 'LOAD_ERROR');
+    assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
+
+    const status = panels.getPersistenceStatus();
+    assert.equal(status.healthy, false);
+    assert.equal(status.durable, false);
+    assert.equal(status.pending, true);
+    assert.equal(status.dirty, true);
+    assert.equal(status.lastLoadErrored, true);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('panel stats final flush retries after a previous write failure', async () => {
+  const file = tmpPanelFile('flush-retry');
+  const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  const originalWriteFile = fsp.writeFile;
+  let failOnce = true;
+  try {
+    const panels = await freshLoadedPanelStats(file);
+    panels.recordPanelUsage('alpha', 'orch', { input_tokens: 1 }, () => new Date('2026-07-27T12:00:00.000Z'));
+    fsp.writeFile = async (...args) => {
+      if (failOnce) {
+        failOnce = false;
+        const err = new Error('temporary write failure');
+        err.code = 'EIO';
+        throw err;
+      }
+      return originalWriteFile(...args);
+    };
+
+    const first = await panels.flushNow();
+    assert.equal(first.ok, false);
+    assert.equal(first.errorCode, 'EIO');
+
+    const second = await panels.flushNow();
+    assert.equal(second.ok, true);
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(persisted['alpha--orch'].input, 1);
+    assert.equal(panels.getPersistenceStatus().healthy, true);
+  } finally {
+    fsp.writeFile = originalWriteFile;
+    cleanup(file, prevEnv);
+  }
+});
+
 test('panel stats treat chmod failure as flush failure', async () => {
   const file = tmpPanelFile('chmod');
   const prevEnv = process.env.MISER_PANEL_STATS_FILE;

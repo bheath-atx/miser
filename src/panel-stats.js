@@ -243,6 +243,9 @@ function scheduleRetry() {
 
 function scheduleFlush(countMutation = true) {
   if (countMutation) _pendingFlush.mutationCount += 1;
+  if (!_pendingFlush.dirty && !_pendingFlush.inFlight && !_persistence.loadPending) {
+    _persistence.pendingSince = Date.now();
+  }
   _pendingFlush.dirty = true;
   clearTimer('retryTimer');
   clearTimer('timer');
@@ -269,27 +272,45 @@ function executeFlush() {
     let shouldReschedule = false;
     try {
       if (_persistence.loadPromise) await _persistence.loadPromise;
+      if (_persistence.lastLoadErrored) {
+        const err = new Error('panel stats load failed; refusing to overwrite existing persisted data');
+        err.code = _persistence.lastErrorCode || 'LOAD_ERROR';
+        throw err;
+      }
       const snapshot = clonePanels();
       await writeSnapshot(snapshot);
       _pendingFlush.lastFlushAt = Date.now();
       _pendingFlush.writeFailures = 0;
       _pendingFlush.lastFlushErrored = false;
       _pendingFlush.lastErrorCode = null;
-      _persistence.lastLoadErrored = false;
       _persistence.lastErrorCode = null;
       _persistence.lastErrorMessage = null;
       shouldReschedule = _pendingFlush.dirty;
+      if (!_pendingFlush.dirty && !_persistence.loadPending) _persistence.pendingSince = null;
       return { ok: true, file: PANEL_STATS_FILE };
     } catch (err) {
       _pendingFlush.dirty = true;
-      _pendingFlush.writeFailures += 1;
-      _pendingFlush.lastFlushErrored = true;
-      _pendingFlush.lastErrorCode = err.code || 'WRITE_ERROR';
-      _persistence.lastErrorCode = _pendingFlush.lastErrorCode;
-      _persistence.lastErrorMessage = err.message;
-      console.error('[miser/panel-stats] ERROR flush error:', err.message);
-      scheduleRetry();
-      return { ok: false, error: err, errorCode: _pendingFlush.lastErrorCode, file: PANEL_STATS_FILE };
+      if (_persistence.lastLoadErrored) {
+        _pendingFlush.lastFlushErrored = false;
+        _pendingFlush.lastErrorCode = null;
+        _persistence.lastErrorCode = err.code || _persistence.lastErrorCode || 'LOAD_ERROR';
+        _persistence.lastErrorMessage = err.message;
+        console.error('[miser/panel-stats] ERROR refusing flush after load failure:', err.message);
+      } else {
+        _pendingFlush.writeFailures += 1;
+        _pendingFlush.lastFlushErrored = true;
+        _pendingFlush.lastErrorCode = err.code || 'WRITE_ERROR';
+        _persistence.lastErrorCode = _pendingFlush.lastErrorCode;
+        _persistence.lastErrorMessage = err.message;
+        console.error('[miser/panel-stats] ERROR flush error:', err.message);
+        scheduleRetry();
+      }
+      return {
+        ok: false,
+        error: err,
+        errorCode: _pendingFlush.lastErrorCode || _persistence.lastErrorCode,
+        file: PANEL_STATS_FILE,
+      };
     } finally {
       _pendingFlush.inFlight = false;
       _pendingFlush.currentPromise = null;
@@ -304,24 +325,20 @@ function executeFlush() {
 async function drainFlushNow() {
   _pendingFlush.dirty = true;
   clearTimer('timer');
+  clearTimer('retryTimer');
   let lastResult = { ok: true, file: PANEL_STATS_FILE };
   while (true) {
     if (_pendingFlush.inFlight) {
       lastResult = await (_pendingFlush.currentPromise || Promise.resolve(lastResult));
-      if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) return lastResult;
+      if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
       continue;
     }
     if (!_pendingFlush.dirty) {
       clearTimer('timer');
       return lastResult;
     }
-    if (_pendingFlush.lastFlushErrored) return {
-      ok: false,
-      errorCode: _pendingFlush.lastErrorCode,
-      file: PANEL_STATS_FILE,
-    };
     lastResult = await executeFlush();
-    if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) return lastResult;
+    if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
   }
 }
 

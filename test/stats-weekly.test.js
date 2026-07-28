@@ -180,6 +180,35 @@ test('subscription timezone probe recovers after a transient unsupported result'
   }
 });
 
+test('subscription timezone probe backs off after permanent unsupported results', () => {
+  const file = tmpStatsFile('fallback-backoff');
+  const prevStatsEnv = process.env.MISER_STATS_FILE;
+  const originalDateTimeFormat = Intl.DateTimeFormat;
+  let calls = 0;
+  try {
+    Intl.DateTimeFormat = function DateTimeFormat(locale, options) {
+      if (options && options.timeZone === 'America/Chicago') {
+        calls += 1;
+        throw new RangeError('permanent missing timezone data');
+      }
+      return new originalDateTimeFormat(locale, options);
+    };
+    const stats = freshStats(file);
+    const weekKey = stats.__test.subscriptionWeekKeyFromDate;
+
+    for (let i = 0; i < 10; i++) {
+      assert.equal(
+        weekKey(new Date('2026-07-26T12:00:00.000Z')),
+        '2026-07-26T12:00:00.000Z',
+      );
+    }
+    assert.equal(calls, 2);
+  } finally {
+    Intl.DateTimeFormat = originalDateTimeFormat;
+    cleanup(file, prevStatsEnv);
+  }
+});
+
 test('weekly buckets accumulate current week-to-date and prior complete weeks', () => {
   const file = tmpStatsFile('rollup');
   const prevEnv = process.env.MISER_STATS_FILE;
@@ -330,6 +359,173 @@ test('existing empty, partial, array, and stale weekly buckets are reconciled fr
     } finally {
       cleanup(file, prevEnv);
     }
+  }
+});
+
+test('weekly reconciliation uses daily-derived counters when stored weekly is higher', () => {
+  const file = tmpStatsFile('migration-inflated');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, {
+      '2026-07-20': {
+        alpha: {
+          usage: { anthropic: { model: { input: 5, output: 3, requests: 1 } } },
+          dedup: { estRemovedTokens: 7, inputTokensRemoved: 7, cacheBillingDelta: 0, appliedCount: 1 },
+          likelyPollCount: 1,
+          budget: { blockedCount: 2, firstBlockedAt: '2026-07-20T14:00:00.000Z' },
+          policy: { modelDriftCount: 1, contextBloatCount: 1 },
+        },
+      },
+      __weekly: {
+        [weekKey]: {
+          alpha: {
+            usage: { anthropic: { model: { input: 999, output: 999, requests: 99 } } },
+            dedup: { estRemovedTokens: 999, inputTokensRemoved: 999, cacheBillingDelta: 0, appliedCount: 99 },
+            likelyPollCount: 99,
+            budget: { blockedCount: 99, firstBlockedAt: '2026-07-21T14:00:00.000Z' },
+            policy: { modelDriftCount: 99, contextBloatCount: 99 },
+          },
+        },
+      },
+    });
+    const weekly = stats.getRawStatsSnapshot().__weekly[weekKey].alpha;
+    assert.equal(weekly.usage.anthropic.model.input, 5);
+    assert.equal(weekly.usage.anthropic.model.output, 3);
+    assert.equal(weekly.usage.anthropic.model.requests, 1);
+    assert.equal(weekly.dedup.inputTokensRemoved, 7);
+    assert.equal(weekly.dedup.appliedCount, 1);
+    assert.equal(weekly.likelyPollCount, 1);
+    assert.deepEqual(weekly.budget, {
+      blockedCount: 2,
+      firstBlockedAt: '2026-07-20T14:00:00.000Z',
+    });
+    assert.deepEqual(weekly.policy, {
+      modelDriftCount: 1,
+      contextBloatCount: 1,
+    });
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.equal(exposed.authoritative, true);
+    assert.equal(exposed.degraded, false);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 5);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('weekly reconciliation removes surplus stored projects and models from authoritative weeks', () => {
+  const file = tmpStatsFile('migration-surplus');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, {
+      '2026-07-20': {
+        alpha: {
+          usage: { anthropic: { model: { input: 5, requests: 1 } } },
+        },
+      },
+      __weekly: {
+        [weekKey]: {
+          alpha: {
+            usage: {
+              anthropic: {
+                model: { input: 999, requests: 99 },
+                surplusModel: { input: 88, requests: 8 },
+              },
+            },
+          },
+          surplusProject: {
+            usage: { anthropic: { model: { input: 77, requests: 7 } } },
+          },
+        },
+      },
+    });
+    const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
+    assert.deepEqual(Object.keys(rawWeek).sort(), ['alpha']);
+    assert.deepEqual(Object.keys(rawWeek.alpha.usage.anthropic), ['model']);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 5);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 1);
+
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.equal(exposed.authoritative, true);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 5);
+    assert.equal(exposed.usage.alpha.anthropic.surplusModel, undefined);
+    assert.equal(exposed.usage.surplusProject, undefined);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('valid stored weekly week with no daily backing is exposed as non-authoritative', () => {
+  const file = tmpStatsFile('migration-stored-only');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-12T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, {
+      __weekly: {
+        [weekKey]: {
+          alpha: { usage: { anthropic: { model: { input: 11, requests: 1 } } } },
+        },
+      },
+    });
+    const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
+    assert.deepEqual(rawWeek.__meta, {
+      authoritative: false,
+      reason: 'no_daily_backing',
+    });
+
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.ok(exposed, 'stored-only week should still be visible');
+    assert.equal(exposed.authoritative, false);
+    assert.equal(exposed.degraded, true);
+    assert.equal(exposed.nonAuthoritativeReason, 'no_daily_backing');
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 11);
+    assert.equal(stats.getStats('9999').weekly.authoritative, false);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('loadStats migration failure marks preserved weekly data non-authoritative', () => {
+  const file = tmpStatsFile('migration-failure-nonauthoritative');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const originalDateTimeFormat = Intl.DateTimeFormat;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    Intl.DateTimeFormat = function DateTimeFormat(locale, options) {
+      if (options && options.timeZone === 'America/Chicago') {
+        throw new TypeError('timezone probe failed unexpectedly');
+      }
+      return new originalDateTimeFormat(locale, options);
+    };
+    const stats = freshStats(file, {
+      '2026-07-20': {
+        alpha: { usage: { anthropic: { model: { input: 5, requests: 1 } } } },
+      },
+      __weekly: {
+        [weekKey]: {
+          alpha: { usage: { anthropic: { model: { input: 99, requests: 9 } } } },
+        },
+      },
+    });
+    Intl.DateTimeFormat = originalDateTimeFormat;
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.equal(snapshot['2026-07-20'].alpha.usage.anthropic.model.input, 5);
+    assert.deepEqual(snapshot.__weekly[weekKey].__meta, {
+      authoritative: false,
+      reason: 'migration_retention_failed',
+    });
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.equal(exposed.authoritative, false);
+    assert.equal(exposed.nonAuthoritativeReason, 'migration_retention_failed');
+  } finally {
+    Intl.DateTimeFormat = originalDateTimeFormat;
+    cleanup(file, prevEnv);
   }
 });
 
