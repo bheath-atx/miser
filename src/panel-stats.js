@@ -15,19 +15,34 @@ const PANEL_STATS_FILE = process.env.MISER_PANEL_STATS_FILE
 const DEFAULT_MAX_KEYS = 50_000;
 const DEFAULT_MAX_AGE_DAYS = 400;
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
-const PANEL_STATS_MAX_KEYS = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_KEYS, DEFAULT_MAX_KEYS);
-const PANEL_STATS_MAX_AGE_MS = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_AGE_DAYS, DEFAULT_MAX_AGE_DAYS) * 24 * 60 * 60 * 1000;
-const PANEL_STATS_MAX_BYTES = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_BYTES, DEFAULT_MAX_BYTES);
+const MAX_ALLOWED_KEYS = 100_000;
+const MAX_ALLOWED_AGE_DAYS = 730;
+const MAX_ALLOWED_BYTES = 20 * 1024 * 1024;
+const PANEL_STATS_MAX_KEYS = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_KEYS, DEFAULT_MAX_KEYS, MAX_ALLOWED_KEYS, 'MISER_PANEL_STATS_MAX_KEYS');
+const PANEL_STATS_MAX_AGE_DAYS = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_AGE_DAYS, DEFAULT_MAX_AGE_DAYS, MAX_ALLOWED_AGE_DAYS, 'MISER_PANEL_STATS_MAX_AGE_DAYS');
+const PANEL_STATS_MAX_AGE_MS = PANEL_STATS_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+const PANEL_STATS_MAX_BYTES = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_BYTES, DEFAULT_MAX_BYTES, MAX_ALLOWED_BYTES, 'MISER_PANEL_STATS_MAX_BYTES');
 
 const _persistence = {
   lastLoadErrored: false,
   lastErrorCode: null,
   lastErrorMessage: null,
+  loadPending: true,
+  pendingSince: Date.now(),
+  lastLoadAt: null,
+  loadPromise: null,
+  evictedKeys: 0,
+  lastPrune: null,
 };
 
-function parsePositiveInt(value, fallback) {
+function parsePositiveInt(value, fallback, max, name) {
   const n = Number(value);
-  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+  if (!Number.isSafeInteger(n) || n <= 0) return fallback;
+  if (n > max) {
+    console.warn(`[miser/panel-stats] WARN clamping ${name}=${n} to ${max}`);
+    return max;
+  }
+  return n;
 }
 
 function emptyPanelBucket() {
@@ -44,16 +59,16 @@ function sanitizeBucket(raw) {
   return bucket;
 }
 
-function loadPanels() {
+async function loadPanels() {
   const map = new Map();
   try {
-    const stat = fs.statSync(PANEL_STATS_FILE);
+    const stat = await fsp.stat(PANEL_STATS_FILE);
     if (stat.size > PANEL_STATS_MAX_BYTES) {
       const err = new Error(`panel stats file exceeds ${PANEL_STATS_MAX_BYTES} byte retention guard`);
       err.code = 'E2BIG';
       throw err;
     }
-    const raw = fs.readFileSync(PANEL_STATS_FILE, 'utf8');
+    const raw = await fsp.readFile(PANEL_STATS_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return map;
     for (const [key, bucket] of Object.entries(parsed)) {
@@ -64,14 +79,15 @@ function loadPanels() {
       _persistence.lastLoadErrored = true;
       _persistence.lastErrorCode = err.code || 'LOAD_ERROR';
       _persistence.lastErrorMessage = err.message;
+      map.__loadErrored = true;
       console.warn('[miser/panel-stats] WARN load failed; starting empty:', err.message);
     }
     return map;
   }
-  return prunePanelMap(map);
+  return prunePanelMap(map, Date.now(), 'load');
 }
 
-const _panels = loadPanels();
+const _panels = new Map();
 
 const _pendingFlush = {
   dirty: false,
@@ -86,6 +102,53 @@ const _pendingFlush = {
   lastFlushErrored: false,
   lastErrorCode: null,
 };
+let _loadGeneration = 0;
+
+function mergeLoadedPanel(key, loadedBucket) {
+  const existing = _panels.get(key);
+  if (!existing) {
+    _panels.set(key, loadedBucket);
+    return;
+  }
+  for (const field of ['input', 'output', 'cacheRead', 'cacheWrite1h', 'cacheWrite5m', 'requests']) {
+    existing[field] += loadedBucket[field] || 0;
+  }
+  const loadedSeen = seenTime(loadedBucket);
+  if (!existing.lastSeenAt || loadedSeen > seenTime(existing)) existing.lastSeenAt = loadedBucket.lastSeenAt;
+}
+
+function startAsyncLoad() {
+  const generation = ++_loadGeneration;
+  _persistence.loadPending = true;
+  _persistence.pendingSince = Date.now();
+  _persistence.loadPromise = loadPanels()
+    .then((loaded) => {
+      if (generation !== _loadGeneration) return;
+      for (const [key, bucket] of loaded) mergeLoadedPanel(key, bucket);
+      if (!loaded.__loadErrored) {
+        _persistence.lastLoadErrored = false;
+        _persistence.lastErrorCode = null;
+        _persistence.lastErrorMessage = null;
+      }
+      _persistence.lastLoadAt = Date.now();
+      if (_persistence.evictedKeys > 0) scheduleFlush(false);
+    })
+    .catch((err) => {
+      if (generation !== _loadGeneration) return;
+      _persistence.lastLoadErrored = true;
+      _persistence.lastErrorCode = err.code || 'LOAD_ERROR';
+      _persistence.lastErrorMessage = err.message;
+      console.warn('[miser/panel-stats] WARN async load failed; continuing with in-memory stats:', err.message);
+    })
+    .finally(() => {
+      if (generation !== _loadGeneration) return;
+      _persistence.loadPending = false;
+      _persistence.loadPromise = null;
+    });
+  return _persistence.loadPromise;
+}
+
+startAsyncLoad();
 
 function clearTimer(name) {
   if (_pendingFlush[name]) {
@@ -106,7 +169,7 @@ async function writeSnapshot(snapshot) {
   try {
     await fsp.writeFile(tmp, JSON.stringify(snapshot, null, 2), { encoding: 'utf8', mode: 0o600 });
     await fsp.rename(tmp, PANEL_STATS_FILE);
-    try { await fsp.chmod(PANEL_STATS_FILE, 0o600); } catch (_) {}
+    await fsp.chmod(PANEL_STATS_FILE, 0o600);
   } catch (err) {
     try { await fsp.unlink(tmp); } catch (_) {}
     throw err;
@@ -119,19 +182,48 @@ function seenTime(bucket) {
   return Number.isFinite(t) ? t : 0;
 }
 
-function prunePanelMap(map, nowMs = Date.now()) {
+function notePrune(summary) {
+  const total = summary.ageEvicted + summary.maxKeysEvicted;
+  if (total <= 0) return;
+  _persistence.evictedKeys += total;
+  _persistence.lastPrune = {
+    at: new Date().toISOString(),
+    reason: summary.reason,
+    evictedKeys: total,
+    ageEvicted: summary.ageEvicted,
+    maxKeysEvicted: summary.maxKeysEvicted,
+  };
+  console.warn(`[miser/panel-stats] WARN retention pruned ${total} panel stat key(s) reason=${summary.reason} age=${summary.ageEvicted} maxKeys=${summary.maxKeysEvicted}`);
+}
+
+function comparePanelEntriesNewestFirst(a, b) {
+  const delta = seenTime(b[1]) - seenTime(a[1]);
+  if (delta !== 0) return delta;
+  return a[0].localeCompare(b[0]);
+}
+
+function prunePanelMap(map, nowMs = Date.now(), reason = 'runtime') {
   if (!(map instanceof Map) || map.size === 0) return map;
+  const summary = { reason, ageEvicted: 0, maxKeysEvicted: 0 };
   const minSeenMs = nowMs - PANEL_STATS_MAX_AGE_MS;
   for (const [key, bucket] of map) {
     const t = seenTime(bucket);
-    if (t > 0 && t < minSeenMs) map.delete(key);
+    if (t > 0 && t < minSeenMs) {
+      map.delete(key);
+      summary.ageEvicted += 1;
+    }
   }
-  if (map.size <= PANEL_STATS_MAX_KEYS) return map;
+  if (map.size <= PANEL_STATS_MAX_KEYS) {
+    notePrune(summary);
+    return map;
+  }
   const keep = [...map.entries()]
-    .sort((a, b) => seenTime(b[1]) - seenTime(a[1]))
+    .sort(comparePanelEntriesNewestFirst)
     .slice(0, PANEL_STATS_MAX_KEYS);
+  summary.maxKeysEvicted = map.size - keep.length;
   map.clear();
   for (const [key, bucket] of keep) map.set(key, bucket);
+  notePrune(summary);
   return map;
 }
 
@@ -172,11 +264,12 @@ function executeFlush() {
   _pendingFlush.inFlight = true;
   _pendingFlush.dirty = false;
   _pendingFlush.mutationCount = 0;
-  const snapshot = clonePanels();
 
   const promise = (async () => {
     let shouldReschedule = false;
     try {
+      if (_persistence.loadPromise) await _persistence.loadPromise;
+      const snapshot = clonePanels();
       await writeSnapshot(snapshot);
       _pendingFlush.lastFlushAt = Date.now();
       _pendingFlush.writeFailures = 0;
@@ -285,10 +378,17 @@ function getPanelStats() {
 }
 
 function getPersistenceStatus() {
-  const degraded = _pendingFlush.lastFlushErrored || _pendingFlush.writeFailures > 0 || _persistence.lastLoadErrored;
+  const pending = _pendingFlush.dirty || _pendingFlush.inFlight || _persistence.loadPending;
+  const degraded = _pendingFlush.lastFlushErrored || _pendingFlush.writeFailures > 0
+    || _persistence.lastLoadErrored || _persistence.evictedKeys > 0;
   return {
     healthy: !degraded,
-    durable: !degraded,
+    durable: !degraded && !pending,
+    pending,
+    dirty: _pendingFlush.dirty,
+    inFlight: _pendingFlush.inFlight,
+    loadPending: _persistence.loadPending,
+    pendingSince: pending ? (_persistence.pendingSince || null) : null,
     lastFlushErrored: _pendingFlush.lastFlushErrored,
     lastLoadErrored: _persistence.lastLoadErrored,
     writeFailures: _pendingFlush.writeFailures,
@@ -297,13 +397,16 @@ function getPersistenceStatus() {
     file: PANEL_STATS_FILE,
     retention: {
       maxKeys: PANEL_STATS_MAX_KEYS,
-      maxAgeDays: Math.round(PANEL_STATS_MAX_AGE_MS / (24 * 60 * 60 * 1000)),
+      maxAgeDays: PANEL_STATS_MAX_AGE_DAYS,
       maxBytes: PANEL_STATS_MAX_BYTES,
+      evictedKeys: _persistence.evictedKeys,
+      lastPrune: _persistence.lastPrune,
     },
   };
 }
 
 function __resetForTest() {
+  _loadGeneration += 1;
   _panels.clear();
   clearTimer('timer');
   clearTimer('retryTimer');
@@ -319,6 +422,24 @@ function __resetForTest() {
   _persistence.lastLoadErrored = false;
   _persistence.lastErrorCode = null;
   _persistence.lastErrorMessage = null;
+  _persistence.loadPending = false;
+  _persistence.pendingSince = null;
+  _persistence.lastLoadAt = null;
+  _persistence.loadPromise = null;
+  _persistence.evictedKeys = 0;
+  _persistence.lastPrune = null;
 }
 
-module.exports = { recordPanelUsage, getPanelStats, getPersistenceStatus, flushNow, loadPanels, __resetForTest };
+module.exports = {
+  recordPanelUsage,
+  getPanelStats,
+  getPersistenceStatus,
+  flushNow,
+  loadPanels,
+  __resetForTest,
+  __test: {
+    waitForLoad: () => _persistence.loadPromise || Promise.resolve(),
+    prunePanelMap,
+    comparePanelEntriesNewestFirst,
+  },
+};

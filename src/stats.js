@@ -15,14 +15,17 @@ const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
 // Keep two years of completed weekly buckets by default: enough for year-over-year
 // comparisons while bounding persisted __weekly growth.
 const DEFAULT_WEEKLY_MAX_WEEKS = 104;
+const MAX_WEEKLY_MAX_WEEKS = 260;
 // Stats writers tolerate normal delayed/replayed events, but reject clock readings
 // outside this service window so one bad host clock cannot create permanent keys.
 const DEFAULT_CLOCK_PAST_DAYS = 400;
 const DEFAULT_CLOCK_FUTURE_DAYS = 7;
-const WEEKLY_MAX_WEEKS = parsePositiveInt(process.env.MISER_WEEKLY_STATS_MAX_WEEKS, DEFAULT_WEEKLY_MAX_WEEKS);
-const CLOCK_PAST_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_PAST_DAYS, DEFAULT_CLOCK_PAST_DAYS) * 24 * 60 * 60 * 1000;
-const CLOCK_FUTURE_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_FUTURE_DAYS, DEFAULT_CLOCK_FUTURE_DAYS) * 24 * 60 * 60 * 1000;
-const TIME_ZONE_STATUS = probeSubscriptionTimeZone();
+const MAX_CLOCK_PAST_DAYS = 730;
+const MAX_CLOCK_FUTURE_DAYS = 30;
+const WEEKLY_MAX_WEEKS = parsePositiveInt(process.env.MISER_WEEKLY_STATS_MAX_WEEKS, DEFAULT_WEEKLY_MAX_WEEKS, MAX_WEEKLY_MAX_WEEKS, 'MISER_WEEKLY_STATS_MAX_WEEKS');
+const CLOCK_PAST_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_PAST_DAYS, DEFAULT_CLOCK_PAST_DAYS, MAX_CLOCK_PAST_DAYS, 'MISER_STATS_CLOCK_PAST_DAYS') * 24 * 60 * 60 * 1000;
+const CLOCK_FUTURE_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_FUTURE_DAYS, DEFAULT_CLOCK_FUTURE_DAYS, MAX_CLOCK_FUTURE_DAYS, 'MISER_STATS_CLOCK_FUTURE_DAYS') * 24 * 60 * 60 * 1000;
+let _timeZoneStatus = null;
 let _timezoneFallbackWarned = false;
 
 let _stats = loadStats();
@@ -48,9 +51,24 @@ const _pendingFlush = {
   lastFlushErrored: false,
 };
 
-function parsePositiveInt(value, fallback) {
+const _recordRejections = {
+  total: 0,
+  invalidTimestamp: 0,
+  outOfBoundsTimestamp: 0,
+  byLabel: {},
+  firstRejectedAt: null,
+  lastRejectedAt: null,
+  warned: false,
+};
+
+function parsePositiveInt(value, fallback, max, name) {
   const n = Number(value);
-  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+  if (!Number.isSafeInteger(n) || n <= 0) return fallback;
+  if (n > max) {
+    console.warn(`[miser/stats] WARN clamping ${name}=${n} to ${max}`);
+    return max;
+  }
+  return n;
 }
 
 function probeSubscriptionTimeZone() {
@@ -66,17 +84,36 @@ function probeSubscriptionTimeZone() {
   }
 }
 
+function getSubscriptionTimeZoneStatus() {
+  if (process.env.MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK === '1') {
+    _timeZoneStatus = { supported: false, reason: 'forced by MISER_FORCE_SUBSCRIPTION_TZ_FALLBACK' };
+    return _timeZoneStatus;
+  }
+  if (_timeZoneStatus && _timeZoneStatus.supported) return _timeZoneStatus;
+  _timeZoneStatus = probeSubscriptionTimeZone();
+  if (_timeZoneStatus.supported) _timezoneFallbackWarned = false;
+  return _timeZoneStatus;
+}
+
 function loadStats() {
+  let parsed;
   try {
     const raw = fs.readFileSync(STATS_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
+    parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    if (!parsed[WEEKLY_KEY]) parsed[WEEKLY_KEY] = buildWeeklyFromDaily(parsed);
-    pruneWeeklyRetention(parsed);
-    return parsed;
   } catch (_) {
     return {};
   }
+  try {
+    reconcileWeeklyFromDaily(parsed);
+    pruneWeeklyRetention(parsed);
+  } catch (err) {
+    console.error('[miser/stats] ERROR stats migration/retention failed; preserving parsed daily stats:', err.message);
+    if (!parsed[WEEKLY_KEY] || typeof parsed[WEEKLY_KEY] !== 'object' || Array.isArray(parsed[WEEKLY_KEY])) {
+      delete parsed[WEEKLY_KEY];
+    }
+  }
+  return parsed;
 }
 
 function clearTimer(name) {
@@ -249,10 +286,11 @@ function localDatePlusDays(parts, days) {
 }
 
 function subscriptionWeekStartDate(date) {
-  if (!TIME_ZONE_STATUS.supported) {
+  const timeZoneStatus = getSubscriptionTimeZoneStatus();
+  if (!timeZoneStatus.supported) {
     if (!_timezoneFallbackWarned) {
       _timezoneFallbackWarned = true;
-      console.warn(`[miser/stats] WARN ${SUBSCRIPTION_TIME_ZONE} timezone data unavailable (${TIME_ZONE_STATUS.reason}); using Sunday 12:00 UTC weekly fallback`);
+      console.warn(`[miser/stats] WARN ${SUBSCRIPTION_TIME_ZONE} timezone data unavailable (${timeZoneStatus.reason}); using Sunday 12:00 UTC weekly fallback`);
     }
     return subscriptionWeekStartFallbackDate(date);
   }
@@ -335,15 +373,39 @@ function isValidDailyKey(key) {
 
 function isAllowedRecordTime(date, label) {
   if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
-    console.warn(`[miser/stats] WARN rejecting ${label} stats with invalid timestamp`);
+    noteRecordRejection(label, 'invalidTimestamp', 'invalid timestamp');
     return false;
   }
   const nowMs = Date.now();
   if (date.getTime() > nowMs + CLOCK_FUTURE_MS || date.getTime() < nowMs - CLOCK_PAST_MS) {
-    console.warn(`[miser/stats] WARN rejecting ${label} stats with out-of-bounds timestamp ${date.toISOString()}`);
+    noteRecordRejection(label, 'outOfBoundsTimestamp', `out-of-bounds timestamp ${date.toISOString()}`);
     return false;
   }
   return true;
+}
+
+function noteRecordRejection(label, reason, detail) {
+  const nowIso = new Date().toISOString();
+  _recordRejections.total += 1;
+  _recordRejections[reason] += 1;
+  _recordRejections.byLabel[label] = (_recordRejections.byLabel[label] || 0) + 1;
+  if (!_recordRejections.firstRejectedAt) _recordRejections.firstRejectedAt = nowIso;
+  _recordRejections.lastRejectedAt = nowIso;
+  if (!_recordRejections.warned) {
+    _recordRejections.warned = true;
+    console.warn(`[miser/stats] WARN rejecting stats records; first=${label} ${detail}; further rejection logs suppressed, counters exposed in /api/miser/stats`);
+  }
+}
+
+function getRecordRejectionStatus() {
+  return {
+    total: _recordRejections.total,
+    invalidTimestamp: _recordRejections.invalidTimestamp,
+    outOfBoundsTimestamp: _recordRejections.outOfBoundsTimestamp,
+    byLabel: { ..._recordRejections.byLabel },
+    firstRejectedAt: _recordRejections.firstRejectedAt,
+    lastRejectedAt: _recordRejections.lastRejectedAt,
+  };
 }
 
 function validWeekKey(key) {
@@ -425,6 +487,82 @@ function buildWeeklyFromDaily(statsObj) {
     }
   }
   return weekly;
+}
+
+function isWeeklyContainer(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function maxInto(target, key, value) {
+  if (!Number.isFinite(value)) return;
+  target[key] = Math.max(Number.isFinite(target[key]) ? target[key] : 0, value);
+}
+
+function mergeUsageBucket(target, source) {
+  if (!source || typeof source !== 'object') return;
+  if (!target || typeof target !== 'object') return;
+  for (const key of ['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'requests']) {
+    maxInto(target, key, source[key]);
+  }
+}
+
+function mergeWeeklyProjectBucket(target, source) {
+  if (!source || typeof source !== 'object') return;
+  if (!target || typeof target !== 'object') return;
+  for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
+    if (!source[tech] || typeof source[tech] !== 'object') continue;
+    if (!target[tech] || typeof target[tech] !== 'object') target[tech] = {};
+    for (const [key, value] of Object.entries(source[tech])) maxInto(target[tech], key, value);
+  }
+  for (const key of ['likelyPollCount', 'workTurnCount']) maxInto(target, key, source[key]);
+  if (source.usage && typeof source.usage === 'object') {
+    if (!target.usage || typeof target.usage !== 'object') target.usage = {};
+    for (const [provider, models] of Object.entries(source.usage)) {
+      if (!models || typeof models !== 'object') continue;
+      if (!target.usage[provider] || typeof target.usage[provider] !== 'object') target.usage[provider] = {};
+      for (const [model, bucket] of Object.entries(models)) {
+        if (!bucket || typeof bucket !== 'object') continue;
+        if (!target.usage[provider][model] || typeof target.usage[provider][model] !== 'object') {
+          target.usage[provider][model] = {};
+        }
+        mergeUsageBucket(target.usage[provider][model], bucket);
+      }
+    }
+  }
+  if (source.contextManagement && typeof source.contextManagement === 'object') {
+    if (!target.contextManagement || typeof target.contextManagement !== 'object') target.contextManagement = {};
+    for (const key of ['clearedToolUses', 'clearedInputTokens', 'editCount']) {
+      maxInto(target.contextManagement, key, source.contextManagement[key]);
+    }
+  }
+  if (source.budget && typeof source.budget === 'object') {
+    if (!target.budget || typeof target.budget !== 'object') target.budget = {};
+    maxInto(target.budget, 'blockedCount', source.budget.blockedCount);
+    const first = source.budget.firstBlockedAt;
+    if (typeof first === 'string' && (!target.budget.firstBlockedAt || first < target.budget.firstBlockedAt)) {
+      target.budget.firstBlockedAt = first;
+    }
+  }
+  if (source.policy && typeof source.policy === 'object') {
+    if (!target.policy || typeof target.policy !== 'object') target.policy = {};
+    for (const key of ['modelDriftCount', 'contextBloatCount']) maxInto(target.policy, key, source.policy[key]);
+  }
+}
+
+function reconcileWeeklyFromDaily(statsObj) {
+  const rebuilt = buildWeeklyFromDaily(statsObj);
+  if (!isWeeklyContainer(statsObj[WEEKLY_KEY])) {
+    statsObj[WEEKLY_KEY] = rebuilt;
+    return;
+  }
+  const weekly = statsObj[WEEKLY_KEY];
+  for (const [weekKey, weekData] of Object.entries(rebuilt)) {
+    if (!isWeeklyContainer(weekly[weekKey])) weekly[weekKey] = {};
+    for (const [project, projectData] of Object.entries(weekData)) {
+      if (!isWeeklyContainer(weekly[weekKey][project])) weekly[weekKey][project] = {};
+      mergeWeeklyProjectBucket(weekly[weekKey][project], projectData);
+    }
+  }
 }
 
 function emptyTechniqueBucket() {
@@ -884,6 +1022,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     days,
     since: cutoffKey,
     ...aggregate,
+    recordRejections: getRecordRejectionStatus(),
     weekly: getSubscriptionWeeks(projectFilter, weights),
   };
 }
@@ -948,6 +1087,15 @@ function __resetForTest() {
   _pendingFlush.lastFlushAt = null;
   _pendingFlush.writeFailures = 0;
   _pendingFlush.lastFlushErrored = false;
+  _recordRejections.total = 0;
+  _recordRejections.invalidTimestamp = 0;
+  _recordRejections.outOfBoundsTimestamp = 0;
+  _recordRejections.byLabel = {};
+  _recordRejections.firstRejectedAt = null;
+  _recordRejections.lastRejectedAt = null;
+  _recordRejections.warned = false;
+  _timeZoneStatus = null;
+  _timezoneFallbackWarned = false;
 }
 
 function getRawStatsSnapshot() {
@@ -977,6 +1125,12 @@ module.exports = {
     subscriptionWeekStartDate,
     subscriptionWeekStartFallbackDate,
     isValidDailyKey,
+    getSubscriptionTimeZoneStatus,
+    getRecordRejectionStatus,
+    reconcileWeeklyFromDaily,
+    WEEKLY_MAX_WEEKS,
+    CLOCK_PAST_MS,
+    CLOCK_FUTURE_MS,
     WEEKLY_KEY,
   },
 };

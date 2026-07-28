@@ -280,14 +280,21 @@ function createProxy(deps = {}) {
     if (route.kind === 'stats_panels') {
       const panels = getPanelStats();
       const persistence = getPersistenceStatus();
-      const note = persistence.healthy
+      const authoritative = persistence.healthy && persistence.durable;
+      const note = authoritative
         ? 'persisted; survives restart'
+        : persistence.pending
+          ? 'persistence pending; panel stats may not survive restart yet'
         : 'persistence degraded; panel stats may not survive restart';
+      // Contract: ok is data-authoritative, not just HTTP handler success. The
+      // endpoint still returns panels on degraded/pending persistence so existing
+      // consumers can render partial data while checking ok/durable/degraded.
       json(res, 200, {
-        ok: true,
+        ok: authoritative,
         note,
         durable: persistence.durable,
         degraded: !persistence.healthy,
+        authoritative,
         persistence,
         panels,
       });

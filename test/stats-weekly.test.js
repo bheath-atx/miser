@@ -149,6 +149,37 @@ test('subscription week key logs and uses explicit fallback when zone data is un
   }
 });
 
+test('subscription timezone probe recovers after a transient unsupported result', () => {
+  const file = tmpStatsFile('fallback-recover');
+  const prevStatsEnv = process.env.MISER_STATS_FILE;
+  const originalDateTimeFormat = Intl.DateTimeFormat;
+  let calls = 0;
+  try {
+    Intl.DateTimeFormat = function DateTimeFormat(locale, options) {
+      if (options && options.timeZone === 'America/Chicago' && calls === 0) {
+        calls += 1;
+        throw new RangeError('transient missing timezone data');
+      }
+      calls += 1;
+      return new originalDateTimeFormat(locale, options);
+    };
+    const stats = freshStats(file);
+    const weekKey = stats.__test.subscriptionWeekKeyFromDate;
+
+    assert.equal(
+      weekKey(new Date('2026-07-26T12:00:00.000Z')),
+      '2026-07-26T12:00:00.000Z',
+    );
+    assert.equal(
+      weekKey(new Date('2026-07-26T12:00:00.000Z')),
+      '2026-07-26T11:00:00.000Z',
+    );
+  } finally {
+    Intl.DateTimeFormat = originalDateTimeFormat;
+    cleanup(file, prevStatsEnv);
+  }
+});
+
 test('weekly buckets accumulate current week-to-date and prior complete weeks', () => {
   const file = tmpStatsFile('rollup');
   const prevEnv = process.env.MISER_STATS_FILE;
@@ -247,7 +278,62 @@ test('legacy daily stats are backfilled into weekly buckets on first load', () =
   }
 });
 
-test('clock-skewed record timestamps are rejected without creating daily or weekly keys', () => {
+test('existing empty, partial, array, and stale weekly buckets are reconciled from daily stats', () => {
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  const daily = {
+    '2026-07-20': {
+      alpha: {
+        usage: { anthropic: { model: { input: 5, requests: 1 } } },
+        budget: { blockedCount: 2, firstBlockedAt: '2026-07-20T14:00:00.000Z' },
+      },
+    },
+    '2026-07-21': {
+      alpha: {
+        usage: { anthropic: { model: { output: 3, requests: 1 } } },
+        policy: { modelDriftCount: 1, contextBloatCount: 2 },
+      },
+    },
+  };
+  const cases = [
+    ['empty', {}],
+    ['partial', {
+      [weekKey]: { alpha: { usage: { anthropic: { model: { input: 5, requests: 1 } } } } },
+    }],
+    ['array', []],
+    ['stale', {
+      [weekKey]: {
+        alpha: {
+          usage: { anthropic: { model: { input: 1, requests: 1 } } },
+          budget: { blockedCount: 1, firstBlockedAt: '2026-07-21T14:00:00.000Z' },
+        },
+      },
+    }],
+  ];
+
+  for (const [name, weeklySeed] of cases) {
+    const file = tmpStatsFile(`migration-${name}`);
+    try {
+      const stats = freshStats(file, { ...daily, __weekly: weeklySeed });
+      const weekly = stats.getRawStatsSnapshot().__weekly[weekKey].alpha;
+      assert.equal(weekly.usage.anthropic.model.input, 5, name);
+      assert.equal(weekly.usage.anthropic.model.output, 3, name);
+      assert.equal(weekly.usage.anthropic.model.requests, 2, name);
+      assert.deepEqual(weekly.budget, {
+        blockedCount: 2,
+        firstBlockedAt: '2026-07-20T14:00:00.000Z',
+      }, name);
+      assert.deepEqual(weekly.policy, {
+        modelDriftCount: 1,
+        contextBloatCount: 2,
+      }, name);
+    } finally {
+      cleanup(file, prevEnv);
+    }
+  }
+});
+
+test('clock-skewed record timestamps are rejected, counted, and logged once', () => {
   const file = tmpStatsFile('clock-skew');
   const prevEnv = process.env.MISER_STATS_FILE;
   const warnings = [];
@@ -260,8 +346,17 @@ test('clock-skewed record timestamps are rejected without creating daily or week
     stats.recordPolicyEvent('alpha', { drift: true }, () => new Date('2030-01-01T00:00:00.000Z'));
     stats.recordStats('alpha', { inputTokensRemoved: 1, techniques: { dedup: true } }, () => new Date('2020-01-01T00:00:00.000Z'));
     assert.deepEqual(stats.getRawStatsSnapshot(), {});
-    assert.equal(warnings.length, 4);
-    assert.ok(warnings.every(line => /out-of-bounds timestamp/.test(line)));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /further rejection logs suppressed/);
+    const rejections = stats.getStats('30').recordRejections;
+    assert.equal(rejections.total, 4);
+    assert.equal(rejections.outOfBoundsTimestamp, 4);
+    assert.deepEqual(rejections.byLabel, {
+      usage: 1,
+      budget: 1,
+      policy: 1,
+      optimizer: 1,
+    });
   } finally {
     console.warn = originalWarn;
     cleanup(file, prevEnv);
@@ -347,5 +442,67 @@ test('/api/miser/stats/trend ignores internal weekly buckets and keeps daily sha
     assert.ok(!('weekly' in payload));
   } finally {
     cleanup(file, prevEnv);
+  }
+});
+
+test('/api/miser/stats/trend intentionally ignores legacy malformed daily keys', async () => {
+  const file = tmpStatsFile('trend-malformed');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    for (const key of Object.keys(require.cache)) {
+      if (/\/src\/(proxy|router|routing|stats|pricing|config|context-management)\.js$/.test(key.replace(/\\/g, '/'))) {
+        delete require.cache[key];
+      }
+    }
+    process.env.MISER_STATS_FILE = file;
+    fs.writeFileSync(file, JSON.stringify({
+      '2026-07-27': {
+        alpha: { usage: { anthropic: { model: { input: 1 } } } },
+      },
+      '2026-07-99': {
+        alpha: { usage: { anthropic: { model: { input: 999 } } } },
+      },
+      'not-a-date': {
+        alpha: { usage: { anthropic: { model: { input: 999 } } } },
+      },
+    }), 'utf8');
+    const { createProxy } = require('../src/proxy.js');
+    const res = new FakeRes();
+    createProxy()(fakeReq('/api/miser/stats/trend?days=9999'), res);
+    await res.whenDone();
+
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 200);
+    assert.equal(payload.ok, true);
+    assert.deepEqual(payload.entries.map(entry => entry.date), ['2026-07-27']);
+    assert.equal(payload.entries[0].input, 1);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('stats clamps abusive weekly and clock env vars', () => {
+  const file = tmpStatsFile('clamp-env');
+  const prevStatsEnv = process.env.MISER_STATS_FILE;
+  const prevWeeklyEnv = process.env.MISER_WEEKLY_STATS_MAX_WEEKS;
+  const prevPastEnv = process.env.MISER_STATS_CLOCK_PAST_DAYS;
+  const prevFutureEnv = process.env.MISER_STATS_CLOCK_FUTURE_DAYS;
+  try {
+    const stats = freshStatsWithEnv(file, null, {
+      MISER_WEEKLY_STATS_MAX_WEEKS: '9007199254740991',
+      MISER_STATS_CLOCK_PAST_DAYS: '9007199254740991',
+      MISER_STATS_CLOCK_FUTURE_DAYS: '9007199254740991',
+    });
+    assert.equal(stats.__test.WEEKLY_MAX_WEEKS, 260);
+    assert.equal(stats.__test.CLOCK_PAST_MS, 730 * 24 * 60 * 60 * 1000);
+    assert.equal(stats.__test.CLOCK_FUTURE_MS, 30 * 24 * 60 * 60 * 1000);
+  } finally {
+    if (prevWeeklyEnv === undefined) delete process.env.MISER_WEEKLY_STATS_MAX_WEEKS;
+    else process.env.MISER_WEEKLY_STATS_MAX_WEEKS = prevWeeklyEnv;
+    if (prevPastEnv === undefined) delete process.env.MISER_STATS_CLOCK_PAST_DAYS;
+    else process.env.MISER_STATS_CLOCK_PAST_DAYS = prevPastEnv;
+    if (prevFutureEnv === undefined) delete process.env.MISER_STATS_CLOCK_FUTURE_DAYS;
+    else process.env.MISER_STATS_CLOCK_FUTURE_DAYS = prevFutureEnv;
+    cleanup(file, prevStatsEnv);
   }
 });
