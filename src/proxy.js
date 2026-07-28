@@ -276,7 +276,22 @@ function createProxy(deps = {}) {
       const projectFilter = url.searchParams.get('project') || undefined;
       try {
         const result = getDailyTrend(daysParam !== null ? daysParam : undefined, projectFilter);
-        json(res, 200, { ok: true, ...result });
+        const persistence = result.persistence;
+        const authoritative = persistence.healthy && persistence.durable;
+        const note = authoritative
+          ? 'persisted; survives restart'
+          : persistence.pending
+            ? 'persistence pending; stats may not survive restart yet'
+            : 'persistence degraded; stats may not survive restart';
+        json(res, 200, {
+          ...result,
+          ok: authoritative,
+          note,
+          durable: persistence.durable,
+          degraded: !persistence.healthy,
+          authoritative,
+          persistence,
+        });
       } catch (err) {
         json(res, err.statusCode || 500, { error: { type: 'stats_error', message: err.message } });
       }

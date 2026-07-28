@@ -68,7 +68,7 @@ Anthropic 2xx responses are tee-parsed without buffering SSE streams. Stats incl
 
 Missing usage means “not measured”; v4 does not zero-fill absent usage nodes.
 
-`GET /api/miser/stats` and `GET /api/miser/stats/panels` use `ok` as a data-authority flag, not as a handler-reachability flag. They return HTTP 200 when reachable even if `ok:false`. On `GET /api/miser/stats`, top-level `ok` / `authoritative` cover the rolling-window aggregate and persistence state; they do not cover per-week authority. Clients must check:
+`GET /api/miser/stats`, `GET /api/miser/stats/trend`, and `GET /api/miser/stats/panels` use `ok` as a data-authority flag, not as a handler-reachability flag. They return HTTP 200 when reachable even if `ok:false`. On `GET /api/miser/stats`, top-level `ok` / `authoritative` cover the rolling-window aggregate and persistence state; they do not cover per-week authority. `GET /api/miser/stats/trend` mirrors the same persistence contract while returning its sparse `entries` payload. Clients must check:
 
 - `authoritative`: true only when the returned counters are durable and not degraded.
 - `durable`: true only when there are no pending writes and persistence is healthy.

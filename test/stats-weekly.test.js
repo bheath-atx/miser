@@ -35,6 +35,23 @@ function cleanup(file, prevEnv) {
   try { fs.unlinkSync(file); } catch (_) {}
 }
 
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForPersistedJson(file, predicate, label) {
+  const deadline = Date.now() + 2000;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      last = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (predicate(last)) return last;
+    } catch (_) {}
+    await delay(10);
+  }
+  assert.fail(`${label}; last=${JSON.stringify(last)}`);
+}
+
 class FakeRes extends Writable {
   constructor() {
     super();
@@ -327,9 +344,11 @@ test('daily stats with no meta derive recordingStartedAt from earliest daily key
     assert.equal(weekly.authoritative, true);
     assert.equal(weekly.nonAuthoritativeReason, undefined);
 
-    const result = await stats.flushNow();
-    assert.equal(result.ok, true);
-    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const persisted = await waitForPersistedJson(
+      file,
+      data => data && data.__meta && data.__meta.recordingStartedAt === '2026-07-19',
+      'derived recordingStartedAt should persist without explicit flushNow',
+    );
     assert.equal(persisted.__meta.recordingStartedAt, '2026-07-19');
   } finally {
     cleanup(file, prevEnv);
@@ -575,12 +594,76 @@ test('legacy-only daily retention watermark is deleted without creating a record
     assert.equal(exposed.degraded, true);
     assert.equal(exposed.nonAuthoritativeReason, 'coverage_unknown');
 
-    const result = await stats.flushNow();
-    assert.equal(result.ok, true);
-    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const persisted = await waitForPersistedJson(
+      file,
+      data => data && data.__meta && data.__meta.dailyRetentionWatermark === undefined,
+      'stale legacy boundary deletion should persist without explicit flushNow',
+    );
     assert.equal(persisted.__meta.recordingStartedAt, undefined);
     assert.equal(persisted.__meta.dailyRetentionWatermark, undefined);
   } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('clean successful load with no metadata changes does not schedule a write', async () => {
+  const file = tmpStatsFile('clean-load-no-write');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const fsp = require('node:fs/promises');
+  const originalWriteFile = fsp.writeFile;
+  const seed = {
+    __meta: { recordingStartedAt: '2026-07-20' },
+    '2026-07-20': {
+      alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
+    },
+  };
+  const originalBytes = JSON.stringify(seed);
+  let writeCalls = 0;
+  try {
+    fs.writeFileSync(file, originalBytes, 'utf8');
+    fsp.writeFile = async (...args) => {
+      writeCalls += 1;
+      return originalWriteFile.apply(fsp, args);
+    };
+    freshStats(file);
+    await delay(50);
+    assert.equal(writeCalls, 0);
+    assert.equal(fs.readFileSync(file, 'utf8'), originalBytes);
+  } finally {
+    fsp.writeFile = originalWriteFile;
+    cleanup(file, prevEnv);
+  }
+});
+
+test('failed load does not write even after a retained mutation and flush attempt', async () => {
+  const file = tmpStatsFile('failed-load-no-write');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const fsp = require('node:fs/promises');
+  const originalWriteFile = fsp.writeFile;
+  const originalBytes = '{not json';
+  let writeCalls = 0;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  try {
+    fs.writeFileSync(file, originalBytes, 'utf8');
+    fsp.writeFile = async (...args) => {
+      writeCalls += 1;
+      return originalWriteFile.apply(fsp, args);
+    };
+    console.warn = () => {};
+    console.error = () => {};
+    const stats = freshStats(file);
+    stats.recordStats('alpha', { inputTokensRemoved: 1, techniques: { dedup: true } });
+    const result = await stats.flushNow();
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, 'LOAD_ERROR');
+    assert.equal(writeCalls, 0);
+    assert.equal(fs.readFileSync(file, 'utf8'), originalBytes);
+    assert.equal(stats.getPersistenceStatus().lastLoadErrored, true);
+  } finally {
+    console.warn = originalWarn;
+    console.error = originalError;
+    fsp.writeFile = originalWriteFile;
     cleanup(file, prevEnv);
   }
 });
@@ -997,6 +1080,7 @@ test('/api/miser/stats/trend ignores internal weekly buckets and keeps daily sha
     }
     process.env.MISER_STATS_FILE = file;
     fs.writeFileSync(file, JSON.stringify({
+      __meta: { recordingStartedAt: '2026-07-27' },
       '2026-07-27': {
         alpha: { usage: { anthropic: { model: { input: 1 } } } },
       },
@@ -1034,6 +1118,7 @@ test('/api/miser/stats/trend intentionally ignores legacy malformed daily keys',
     }
     process.env.MISER_STATS_FILE = file;
     fs.writeFileSync(file, JSON.stringify({
+      __meta: { recordingStartedAt: '2026-07-27' },
       '2026-07-27': {
         alpha: { usage: { anthropic: { model: { input: 1 } } } },
       },

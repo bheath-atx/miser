@@ -48,8 +48,6 @@ const _persistence = {
   pendingSince: null,
 };
 
-let _stats = loadStats();
-
 const DEFAULT_WEIGHTS = Object.freeze({
   input: 1.0,
   cacheRead: 0.1,
@@ -71,6 +69,12 @@ const _pendingFlush = {
   lastFlushErrored: false,
   lastErrorCode: null,
 };
+
+let _loadStatsNeedsFlush = false;
+let _stats = loadStats();
+if (_loadStatsNeedsFlush) {
+  scheduleFlush(false, 0);
+}
 
 const _recordRejections = {
   total: 0,
@@ -132,6 +136,7 @@ function getSubscriptionTimeZoneStatus() {
 }
 
 function loadStats() {
+  _loadStatsNeedsFlush = false;
   let parsed;
   try {
     const raw = fs.readFileSync(STATS_FILE, 'utf8');
@@ -155,10 +160,14 @@ function loadStats() {
     return {};
   }
   try {
+    const meta = getStatsMeta(parsed);
+    const hadLegacyBoundary = !!(meta
+      && Object.prototype.hasOwnProperty.call(meta, DAILY_RETENTION_WATERMARK_KEY));
     const removedLegacyOnlyBoundary = migrateStatsMeta(parsed);
-    if (!removedLegacyOnlyBoundary) deriveRecordingStartedAtFromDaily(parsed);
+    const derivedBoundary = removedLegacyOnlyBoundary ? false : deriveRecordingStartedAtFromDaily(parsed);
     reconcileWeeklyFromDaily(parsed);
     pruneWeeklyRetention(parsed);
+    if (hadLegacyBoundary || derivedBoundary) _loadStatsNeedsFlush = true;
   } catch (err) {
     console.error('[miser/stats] ERROR stats migration/retention failed; preserving parsed daily stats:', err.message);
     if (!parsed[WEEKLY_KEY] || typeof parsed[WEEKLY_KEY] !== 'object' || Array.isArray(parsed[WEEKLY_KEY])) {
@@ -208,7 +217,7 @@ function scheduleRetry() {
   if (typeof _pendingFlush.retryTimer.unref === 'function') _pendingFlush.retryTimer.unref();
 }
 
-function scheduleFlush(countMutation = true) {
+function scheduleFlush(countMutation = true, delayMs = 5000) {
   if (countMutation) _pendingFlush.mutationCount += 1;
   if (!_pendingFlush.dirty && !_pendingFlush.inFlight) _persistence.pendingSince = Date.now();
   _pendingFlush.dirty = true;
@@ -221,7 +230,7 @@ function scheduleFlush(countMutation = true) {
   _pendingFlush.timer = setTimeout(() => {
     _pendingFlush.timer = null;
     executeFlush();
-  }, 5000);
+  }, delayMs);
   if (typeof _pendingFlush.timer.unref === 'function') _pendingFlush.timer.unref();
 }
 
@@ -498,17 +507,18 @@ function migrateStatsMeta(statsObj) {
 
 function deriveRecordingStartedAtFromDaily(statsObj) {
   const meta = getStatsMeta(statsObj);
-  if (meta && Object.prototype.hasOwnProperty.call(meta, RECORDING_STARTED_AT_KEY)) return;
+  if (meta && Object.prototype.hasOwnProperty.call(meta, RECORDING_STARTED_AT_KEY)) return false;
   const earliestDailyKey = Object.keys(statsObj || {})
     .filter(isValidDailyKey)
     .sort()[0];
-  if (!earliestDailyKey) return;
+  if (!earliestDailyKey) return false;
   // This derivation is valid only while daily buckets are never pruned: for every
   // file this code has produced so far, the earliest surviving daily key is the
   // recording start. Any future daily retention policy must revisit this because
   // pruning would make the earliest surviving key newer than the real boundary.
   const targetMeta = getStatsMeta(statsObj, true);
   targetMeta[RECORDING_STARTED_AT_KEY] = earliestDailyKey;
+  return true;
 }
 
 function getRecordingStartedAt(statsObj) {
@@ -1395,7 +1405,19 @@ function getDailyTrend(daysParam, projectFilter) {
     }
   }
 
-  return { days, since: cutoffKey, entries };
+  const persistence = getPersistenceStatus();
+  const authoritative = persistence.healthy && persistence.durable;
+  return {
+    ok: authoritative,
+    days,
+    since: cutoffKey,
+    entries,
+    recordRejections: getRecordRejectionStatus(),
+    durable: persistence.durable,
+    degraded: !persistence.healthy,
+    authoritative,
+    persistence,
+  };
 }
 
 function __resetForTest() {

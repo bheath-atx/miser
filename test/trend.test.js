@@ -138,6 +138,7 @@ test('/api/miser/stats/trend returns ok envelope and exact project filter', asyn
   const prev = process.env.MISER_STATS_FILE;
   try {
     const result = await driveTrend(file, {
+      __meta: { recordingStartedAt: dayKey() },
       [dayKey()]: {
         alpha: { usage: { anthropic: { 'claude-sonnet-4-6': { input: 10 } } } },
         beta: { usage: { anthropic: { 'claude-sonnet-4-6': { input: 20 } } } },
@@ -145,11 +146,55 @@ test('/api/miser/stats/trend returns ok envelope and exact project filter', asyn
     }, '/api/miser/stats/trend?days=7&project=beta');
     assert.equal(result.statusCode, 200);
     assert.equal(result.payload.ok, true);
+    assert.equal(result.payload.authoritative, true);
+    assert.equal(result.payload.degraded, false);
+    assert.equal(result.payload.durable, true);
+    assert.equal(result.payload.persistence.healthy, true);
+    assert.deepEqual(result.payload.recordRejections.byLabel, {});
     assert.equal(result.payload.days, 7);
     assert.equal(result.payload.entries.length, 1);
     assert.equal(result.payload.entries[0].project, 'beta');
     assert.equal(result.payload.entries[0].anthropicEstCostUSD, 0.00006);
   } finally {
+    if (prev === undefined) delete process.env.MISER_STATS_FILE;
+    else process.env.MISER_STATS_FILE = prev;
+    try { fs.unlinkSync(file); } catch (_) {}
+  }
+});
+
+test('/api/miser/stats/trend mirrors stats authority contract on degraded persistence', async () => {
+  const file = tmpStatsFile('proxy-degraded');
+  const prev = process.env.MISER_STATS_FILE;
+  const prevWarn = console.warn;
+  try {
+    for (const key of Object.keys(require.cache)) {
+      if (/\/src\/(proxy|router|routing|stats|pricing|config|context-management)\.js$/.test(key.replace(/\\/g, '/'))) {
+        delete require.cache[key];
+      }
+    }
+    fs.writeFileSync(file, '{not json', 'utf8');
+    process.env.MISER_STATS_FILE = file;
+    console.warn = () => {};
+    const { createProxy } = require('../src/proxy.js');
+    const res = new FakeRes();
+    createProxy()(fakeReq('/api/miser/stats/trend?days=7'), res);
+    await res.whenDone();
+
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 200);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.authoritative, false);
+    assert.equal(payload.durable, false);
+    assert.equal(payload.degraded, true);
+    assert.equal(payload.persistence.healthy, false);
+    assert.equal(payload.persistence.lastLoadErrored, true);
+    assert.match(payload.note, /degraded/);
+    assert.equal(payload.days, 7);
+    assert.ok(payload.since);
+    assert.deepEqual(payload.entries, []);
+    assert.deepEqual(payload.recordRejections.byLabel, {});
+  } finally {
+    console.warn = prevWarn;
     if (prev === undefined) delete process.env.MISER_STATS_FILE;
     else process.env.MISER_STATS_FILE = prev;
     try { fs.unlinkSync(file); } catch (_) {}
