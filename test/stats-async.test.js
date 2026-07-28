@@ -137,7 +137,11 @@ test('load failure followed by flush does not overwrite existing stats file', as
     assert.equal(first.errorCode, 'LOAD_ERROR');
     assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
 
-    const afterFirst = stats.getStats('1').persistence;
+    const degradedAfterFirst = stats.getStats('1');
+    assert.equal(degradedAfterFirst.ok, false);
+    assert.equal(degradedAfterFirst.authoritative, false);
+    assert.equal(degradedAfterFirst.degraded, true);
+    const afterFirst = degradedAfterFirst.persistence;
     assert.equal(afterFirst.healthy, false);
     assert.equal(afterFirst.durable, false);
     assert.equal(afterFirst.pending, true);
@@ -149,10 +153,71 @@ test('load failure followed by flush does not overwrite existing stats file', as
     const second = await stats.flushNow();
     assert.equal(second.ok, false);
     assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
-    assert.equal(stats.getStats('1').persistence.lastLoadErrored, true);
+    stats.recordStats('beta', { inputTokensRemoved: 4, techniques: { dedup: true } });
+    const afterDroppedMutation = stats.getStats('1');
+    assert.equal(afterDroppedMutation.persistence.lastLoadErrored, true);
+    assert.equal(afterDroppedMutation.perProject.beta, undefined);
     assert.match(warnings.join('\n'), /load failed; starting empty/);
     assert.match(errors.join('\n'), /refusing flush after load failure/);
   } finally {
+    console.warn = prevWarn;
+    console.error = prevError;
+    cleanup(file, prevEnv, stats);
+  }
+});
+
+test('load failure mutation drops are counted by label and warned once', async () => {
+  const file = tmpStatsFile('load-failure-drop-counts');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const prevWarn = console.warn;
+  const prevError = console.error;
+  const corruptBody = '{not json';
+  const warnings = [];
+  const errors = [];
+  let stats;
+  try {
+    console.warn = (...args) => warnings.push(args.join(' '));
+    console.error = (...args) => errors.push(args.join(' '));
+    fs.writeFileSync(file, corruptBody, 'utf8');
+    stats = freshStats(file);
+    warnings.length = 0;
+
+    stats.recordStats('seed', { inputTokensRemoved: 3, techniques: { dedup: true } });
+    await stats.flushNow();
+
+    mock.timers.enable({ apis: ['Date'], now: new Date('2026-07-28T12:00:00.000Z') });
+    stats.recordAnthropicUsage('beta', 'anthropic', 'claude-sonnet-4-6', { input_tokens: 11 });
+    mock.timers.setTime(new Date('2026-07-28T12:00:01.000Z').getTime());
+    stats.recordAnthropicUsage('gamma', 'anthropic', 'claude-sonnet-4-6', { output_tokens: 7 });
+    assert.equal(stats.recordBudgetBlock('beta'), 0);
+    assert.deepEqual(stats.recordPolicyEvent('beta', { drift: true, bloat: true }), { modelDriftCount: 0, contextBloatCount: 0 });
+    stats.recordStats('beta', { inputTokensRemoved: 5, techniques: { dedup: true } });
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.equal(snapshot['2026-07-28']?.beta, undefined);
+    assert.equal(snapshot['2026-07-28']?.gamma, undefined);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /load-failure refusal/);
+    assert.match(warnings[0], /further rejection logs suppressed/);
+    assert.match(errors.join('\n'), /refusing flush after load failure/);
+
+    const rejections = stats.getStats('30').recordRejections;
+    assert.equal(rejections.total, 5);
+    assert.equal(rejections.invalidTimestamp, 0);
+    assert.equal(rejections.outOfBoundsTimestamp, 0);
+    assert.equal(rejections.loadFailureRefusal, 5);
+    assert.deepEqual(rejections.byLabel, {
+      usage: 2,
+      budget: 1,
+      policy: 1,
+      optimizer: 1,
+    });
+    assert.equal(rejections.firstRejectedAt, '2026-07-28T12:00:00.000Z');
+    assert.equal(rejections.lastRejectedAt, '2026-07-28T12:00:01.000Z');
+    assert.equal(rejections.firstDroppedAt, '2026-07-28T12:00:00.000Z');
+    assert.equal(rejections.lastDroppedAt, '2026-07-28T12:00:01.000Z');
+  } finally {
+    mock.timers.reset();
     console.warn = prevWarn;
     console.error = prevError;
     cleanup(file, prevEnv, stats);

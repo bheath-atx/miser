@@ -65,16 +65,10 @@ function fakeReq(url) {
   };
 }
 
-function completeJuly19WeekDaily(overrides = {}) {
+function sparseStatsWithWatermark(watermark, entries = {}) {
   return {
-    '2026-07-19': {},
-    '2026-07-20': {},
-    '2026-07-21': {},
-    '2026-07-22': {},
-    '2026-07-23': {},
-    '2026-07-24': {},
-    '2026-07-25': {},
-    ...overrides,
+    __meta: { dailyRetentionWatermark: watermark },
+    ...entries,
   };
 }
 
@@ -315,6 +309,8 @@ test('legacy daily stats are backfilled into weekly buckets on first load', () =
       modelDriftCount: 1,
       contextBloatCount: 2,
     });
+    assert.equal(weekly.authoritative, false);
+    assert.equal(weekly.nonAuthoritativeReason, 'coverage_unknown');
   } finally {
     cleanup(file, prevEnv);
   }
@@ -323,7 +319,7 @@ test('legacy daily stats are backfilled into weekly buckets on first load', () =
 test('existing empty, partial, array, and stale weekly buckets are reconciled from daily stats', () => {
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
-  const daily = completeJuly19WeekDaily({
+  const daily = sparseStatsWithWatermark('2026-07-19', {
     '2026-07-20': {
       alpha: {
         usage: { anthropic: { model: { input: 5, requests: 1 } } },
@@ -380,7 +376,7 @@ test('weekly reconciliation uses daily-derived counters when stored weekly is hi
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
   try {
-    const stats = freshStats(file, completeJuly19WeekDaily({
+    const stats = freshStats(file, sparseStatsWithWatermark('2026-07-19', {
       '2026-07-20': {
         alpha: {
           usage: { anthropic: { model: { input: 5, output: 3, requests: 1 } } },
@@ -432,7 +428,7 @@ test('partial daily coverage retains stored weekly value and marks it non-author
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
   try {
-    const stats = freshStats(file, {
+    const stats = freshStats(file, sparseStatsWithWatermark('2026-07-20', {
       '2026-07-20': {
         alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
       },
@@ -444,7 +440,7 @@ test('partial daily coverage retains stored weekly value and marks it non-author
           alpha: { usage: { anthropic: { model: { input: 70, requests: 7 } } } },
         },
       },
-    });
+    }));
 
     const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
     assert.equal(rawWeek.alpha.usage.anthropic.model.input, 70);
@@ -452,6 +448,14 @@ test('partial daily coverage retains stored weekly value and marks it non-author
     assert.equal(rawWeek.__meta.authoritative, false);
     assert.equal(rawWeek.__meta.reason, 'partial_daily_coverage');
     assert.deepEqual(rawWeek.__meta.coverage.presentDays, ['2026-07-20', '2026-07-21']);
+    assert.deepEqual(rawWeek.__meta.coverage.missingDays, ['2026-07-19']);
+    assert.deepEqual(rawWeek.__meta.coverage.coveredQuietDays, [
+      '2026-07-22',
+      '2026-07-23',
+      '2026-07-24',
+      '2026-07-25',
+    ]);
+    assert.equal(rawWeek.__meta.coverage.retainedDailyWatermark, '2026-07-20');
     assert.deepEqual(rawWeek.__meta.coverage.expectedDays, [
       '2026-07-19',
       '2026-07-20',
@@ -471,6 +475,7 @@ test('partial daily coverage retains stored weekly value and marks it non-author
     assert.equal(exposed.nonAuthoritativeReason, 'partial_daily_coverage');
     assert.equal(exposed.usage.alpha.anthropic.model.input, 70);
     assert.deepEqual(exposed.coverage.presentDays, ['2026-07-20', '2026-07-21']);
+    assert.deepEqual(exposed.coverage.missingDays, ['2026-07-19']);
     assert.deepEqual(exposed.coverage.expectedDays, [
       '2026-07-19',
       '2026-07-20',
@@ -486,12 +491,12 @@ test('partial daily coverage retains stored weekly value and marks it non-author
   }
 });
 
-test('complete daily coverage replaces stored weekly value and stays authoritative', () => {
+test('sparse quiet-day coverage replaces stored weekly value and stays authoritative', () => {
   const file = tmpStatsFile('migration-complete-coverage');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
   try {
-    const stats = freshStats(file, completeJuly19WeekDaily({
+    const stats = freshStats(file, sparseStatsWithWatermark('2026-07-19', {
       '2026-07-20': {
         alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
       },
@@ -522,12 +527,41 @@ test('complete daily coverage replaces stored weekly value and stays authoritati
   }
 });
 
+test('current partially elapsed week ignores future days and stays authoritative', () => {
+  const file = tmpStatsFile('migration-current-week');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-26T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, sparseStatsWithWatermark('2026-07-19', {
+      '2026-07-27': {
+        alpha: { usage: { anthropic: { model: { input: 4, requests: 1 } } } },
+      },
+      __weekly: {
+        [weekKey]: {
+          alpha: { usage: { anthropic: { model: { input: 99, requests: 9 } } } },
+        },
+      },
+    }));
+
+    const current = stats.getStats('9999').weekly.currentWeekToDate;
+    assert.equal(current.weekStart, weekKey);
+    assert.equal(current.authoritative, true);
+    assert.equal(current.degraded, false);
+    assert.equal(current.nonAuthoritativeReason, undefined);
+    assert.equal(current.coverage, undefined);
+    assert.equal(current.usage.alpha.anthropic.model.input, 4);
+    assert.equal(current.usage.alpha.anthropic.model.requests, 1);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
 test('weekly reconciliation removes surplus stored projects and models from authoritative weeks', () => {
   const file = tmpStatsFile('migration-surplus');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
   try {
-    const stats = freshStats(file, completeJuly19WeekDaily({
+    const stats = freshStats(file, sparseStatsWithWatermark('2026-07-19', {
       '2026-07-20': {
         alpha: {
           usage: { anthropic: { model: { input: 5, requests: 1 } } },

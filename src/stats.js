@@ -12,6 +12,8 @@ const STATS_FILE = process.env.MISER_STATS_FILE
   || path.join(os.homedir(), '.miser-stats.json');
 const WEEKLY_KEY = '__weekly';
 const WEEKLY_META_KEY = '__meta';
+const STATS_META_KEY = '__meta';
+const DAILY_RETENTION_WATERMARK_KEY = 'dailyRetentionWatermark';
 const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
 // Keep two years of completed weekly buckets by default: enough for year-over-year
 // comparisons while bounding persisted __weekly growth.
@@ -68,9 +70,12 @@ const _recordRejections = {
   total: 0,
   invalidTimestamp: 0,
   outOfBoundsTimestamp: 0,
+  loadFailureRefusal: 0,
   byLabel: {},
   firstRejectedAt: null,
   lastRejectedAt: null,
+  firstDroppedAt: null,
+  lastDroppedAt: null,
   warned: false,
 };
 
@@ -328,6 +333,15 @@ function getPersistenceStatus() {
   };
 }
 
+function getStatsMeta(statsObj, create = false) {
+  if (!statsObj || typeof statsObj !== 'object' || Array.isArray(statsObj)) return null;
+  const existing = statsObj[STATS_META_KEY];
+  if (existing && typeof existing === 'object' && !Array.isArray(existing)) return existing;
+  if (!create) return null;
+  statsObj[STATS_META_KEY] = {};
+  return statsObj[STATS_META_KEY];
+}
+
 function todayKey() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -459,6 +473,29 @@ function isValidDailyKey(key) {
   return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === key;
 }
 
+function getDailyRetentionWatermark(statsObj) {
+  const meta = getStatsMeta(statsObj);
+  const value = meta && meta[DAILY_RETENTION_WATERMARK_KEY];
+  return isValidDailyKey(value) ? value : null;
+}
+
+function noteRetainedDailyKey(statsObj, day) {
+  if (!isValidDailyKey(day)) return;
+  const meta = getStatsMeta(statsObj, true);
+  const current = getDailyRetentionWatermark(statsObj);
+  if (!current || day < current) meta[DAILY_RETENTION_WATERMARK_KEY] = day;
+}
+
+function canRetainMutationAfterLoadFailure(label) {
+  if (!_persistence.lastLoadErrored) return true;
+  // Preserve at most one post-load-failure in-memory mutation for degraded
+  // visibility. Once the refusal path has pending dirty data, dropping later
+  // accounting mutations prevents unbounded growth while protecting the file.
+  const canRetain = !_pendingFlush.dirty && !_pendingFlush.inFlight;
+  if (!canRetain) noteDroppedMutationAfterLoadFailure(label);
+  return canRetain;
+}
+
 function isAllowedRecordTime(date, label) {
   if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
     noteRecordRejection(label, 'invalidTimestamp', 'invalid timestamp');
@@ -485,14 +522,24 @@ function noteRecordRejection(label, reason, detail) {
   }
 }
 
+function noteDroppedMutationAfterLoadFailure(label) {
+  noteRecordRejection(label, 'loadFailureRefusal', 'load-failure refusal');
+  const nowIso = new Date().toISOString();
+  if (!_recordRejections.firstDroppedAt) _recordRejections.firstDroppedAt = nowIso;
+  _recordRejections.lastDroppedAt = nowIso;
+}
+
 function getRecordRejectionStatus() {
   return {
     total: _recordRejections.total,
     invalidTimestamp: _recordRejections.invalidTimestamp,
     outOfBoundsTimestamp: _recordRejections.outOfBoundsTimestamp,
+    loadFailureRefusal: _recordRejections.loadFailureRefusal,
     byLabel: { ..._recordRejections.byLabel },
     firstRejectedAt: _recordRejections.firstRejectedAt,
     lastRejectedAt: _recordRejections.lastRejectedAt,
+    firstDroppedAt: _recordRejections.firstDroppedAt,
+    lastDroppedAt: _recordRejections.lastDroppedAt,
   };
 }
 
@@ -529,16 +576,35 @@ function expectedDailyKeysForWeek(weekKey, now = new Date()) {
 
 function dailyCoverageForWeek(statsObj, weekKey) {
   const expectedDays = expectedDailyKeysForWeek(weekKey);
+  const watermark = getDailyRetentionWatermark(statsObj);
   const expected = new Set(expectedDays);
   const presentDays = Object.keys(statsObj || {})
     .filter(day => expected.has(day) && isValidDailyKey(day))
     .sort();
+  const present = new Set(presentDays);
+  if (!watermark) {
+    return {
+      complete: false,
+      unknown: expectedDays.length > 0,
+      presentDays,
+      expectedDays,
+      presentCount: presentDays.length,
+      expectedCount: expectedDays.length,
+    };
+  }
+  const coveredQuietDays = expectedDays
+    .filter(day => !present.has(day) && day >= watermark);
+  const missingDays = expectedDays
+    .filter(day => !present.has(day) && day < watermark);
   return {
-    complete: expectedDays.length > 0 && presentDays.length === expectedDays.length,
+    complete: missingDays.length === 0,
     presentDays,
+    coveredQuietDays,
+    missingDays,
     expectedDays,
     presentCount: presentDays.length,
     expectedCount: expectedDays.length,
+    retainedDailyWatermark: watermark,
   };
 }
 
@@ -629,10 +695,14 @@ function markWeekNonAuthoritative(weekData, reason, extra = null) {
   };
   if (extra && typeof extra === 'object') {
     weekData[WEEKLY_META_KEY].coverage = {
+      unknown: extra.unknown === true,
       presentDays: extra.presentDays,
+      coveredQuietDays: extra.coveredQuietDays,
+      missingDays: extra.missingDays,
       expectedDays: extra.expectedDays,
       presentCount: extra.presentCount,
       expectedCount: extra.expectedCount,
+      retainedDailyWatermark: extra.retainedDailyWatermark,
     };
   }
   return weekData;
@@ -650,15 +720,28 @@ function reconcileWeeklyFromDaily(statsObj) {
   const rebuilt = buildWeeklyFromDaily(statsObj);
   if (!isWeeklyContainer(statsObj[WEEKLY_KEY])) {
     statsObj[WEEKLY_KEY] = rebuilt;
+    for (const [weekKey, weekData] of Object.entries(statsObj[WEEKLY_KEY])) {
+      if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
+      const coverage = dailyCoverageForWeek(statsObj, weekKey);
+      if (coverage.unknown) markWeekNonAuthoritative(weekData, 'coverage_unknown', coverage);
+    }
     return;
   }
   const weekly = statsObj[WEEKLY_KEY];
   const reconciled = {};
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
     const stored = weekly[weekKey];
-    if (validWeekKey(weekKey) && isWeeklyContainer(stored)) {
+    if (validWeekKey(weekKey)) {
       const coverage = dailyCoverageForWeek(statsObj, weekKey);
-      if (!coverage.complete) {
+      if (coverage.unknown) {
+        reconciled[weekKey] = markWeekNonAuthoritative(
+          isWeeklyContainer(stored) ? stored : weekData,
+          'coverage_unknown',
+          coverage,
+        );
+        continue;
+      }
+      if (isWeeklyContainer(stored) && !coverage.complete) {
         reconciled[weekKey] = markWeekNonAuthoritative(stored, 'partial_daily_coverage', coverage);
         continue;
       }
@@ -691,6 +774,7 @@ function ensureOptimizerFields(bucket) {
 
 function ensureProjectBucketForDay(project, day) {
   const proj = project || 'default';
+  noteRetainedDailyKey(_stats, day);
   if (!_stats[day]) _stats[day] = {};
   if (!_stats[day][proj]) _stats[day][proj] = {};
   return ensureOptimizerFields(_stats[day][proj]);
@@ -710,6 +794,7 @@ function ensureProjectBucket(project, now = new Date()) {
 
 function ensureMeasuredProjectBucketForDay(project, day) {
   const proj = project || 'default';
+  noteRetainedDailyKey(_stats, day);
   if (!_stats[day]) _stats[day] = {};
   if (!_stats[day][proj]) _stats[day][proj] = {};
   return _stats[day][proj];
@@ -731,6 +816,7 @@ function ensureMeasuredProjectBucket(project, now = new Date()) {
 // an injected nowFn fully controls the day bucket — no midnight-split risk.
 function ensureGuardrailBucket(project, dayKey) {
   const proj = project || 'default';
+  noteRetainedDailyKey(_stats, dayKey);
   if (!_stats[dayKey]) _stats[dayKey] = {};
   if (!_stats[dayKey][proj]) _stats[dayKey][proj] = {};
   return _stats[dayKey][proj];
@@ -750,6 +836,7 @@ function ensureWeeklyGuardrailBucket(project, weekKey) {
 function recordBudgetBlock(project, nowFn = () => new Date()) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'budget')) return 0;
+  if (!canRetainMutationAfterLoadFailure('budget')) return 0;
   const dayKey = now.toISOString().slice(0, 10);
   const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
@@ -771,6 +858,7 @@ function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn
   if (!drift && !bloat) return { modelDriftCount: 0, contextBloatCount: 0 }; // no-op: never write zero node
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'policy')) return { modelDriftCount: 0, contextBloatCount: 0 };
+  if (!canRetainMutationAfterLoadFailure('policy')) return { modelDriftCount: 0, contextBloatCount: 0 };
   const dayKey = now.toISOString().slice(0, 10);
   const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
@@ -818,6 +906,7 @@ function applyOptimizerStats(bucket, opts = {}) {
 function recordStats(project, opts = {}, nowFn = () => new Date()) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'optimizer')) return;
+  if (!canRetainMutationAfterLoadFailure('optimizer')) return;
   const bucket = ensureProjectBucket(project, now);
   const weekBucket = ensureProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
 
@@ -894,6 +983,7 @@ function applyMeasuredUsage(bucket, providerKey, modelKey, usage, editStats) {
 function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEdits = null, nowFn = () => new Date()) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'usage')) return;
+  if (!canRetainMutationAfterLoadFailure('usage')) return;
   const bucket = ensureMeasuredProjectBucket(project, now);
   const weekBucket = ensureMeasuredProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
   const providerKey = provider || 'anthropic';
@@ -1138,15 +1228,17 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   }
   const aggregate = finalizeAggregate(perProject, weights);
   const persistence = getPersistenceStatus();
+  const authoritative = persistence.healthy && persistence.durable;
 
   return {
-    ok: true,
+    ok: authoritative,
     days,
     since: cutoffKey,
     ...aggregate,
     recordRejections: getRecordRejectionStatus(),
     durable: persistence.durable,
     degraded: !persistence.healthy,
+    authoritative,
     persistence,
     weekly: getSubscriptionWeeks(projectFilter, weights),
   };
@@ -1221,9 +1313,12 @@ function __resetForTest() {
   _recordRejections.total = 0;
   _recordRejections.invalidTimestamp = 0;
   _recordRejections.outOfBoundsTimestamp = 0;
+  _recordRejections.loadFailureRefusal = 0;
   _recordRejections.byLabel = {};
   _recordRejections.firstRejectedAt = null;
   _recordRejections.lastRejectedAt = null;
+  _recordRejections.firstDroppedAt = null;
+  _recordRejections.lastDroppedAt = null;
   _recordRejections.warned = false;
   _timeZoneStatus = null;
   _timeZoneUnsupportedRetries = 0;
@@ -1268,5 +1363,7 @@ module.exports = {
     CLOCK_FUTURE_MS,
     WEEKLY_KEY,
     WEEKLY_META_KEY,
+    STATS_META_KEY,
+    DAILY_RETENTION_WATERMARK_KEY,
   },
 };

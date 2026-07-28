@@ -268,6 +268,63 @@ test('/api/miser/stats returns 200 with the expected shape', async () => {
   }
 });
 
+test('/api/miser/stats reflects degraded persistence after load failure', async () => {
+  const file = path.join(os.tmpdir(), `miser-proxy-test-corrupt-stats-${process.pid}-${Date.now()}-${Math.random()}.json`);
+  fs.writeFileSync(file, '{not json', 'utf8');
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const prevWarn = console.warn;
+  console.warn = () => {};
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_STATS_FILE: file });
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats', null, {}), res);
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 200);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.authoritative, false);
+    assert.equal(payload.durable, false);
+    assert.equal(payload.degraded, true);
+    assert.equal(payload.persistence.healthy, false);
+    assert.equal(payload.persistence.lastLoadErrored, true);
+    assert.match(payload.note, /degraded/);
+    assert.ok(payload.perTechnique.dedup);
+  } finally {
+    console.warn = prevWarn;
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('/api/miser/stats exposes load failure mutation drop counters', async () => {
+  const file = path.join(os.tmpdir(), `miser-proxy-test-corrupt-drop-stats-${process.pid}-${Date.now()}-${Math.random()}.json`);
+  fs.writeFileSync(file, '{not json', 'utf8');
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const prevWarn = console.warn;
+  const prevError = console.error;
+  console.warn = () => {};
+  console.error = () => {};
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_STATS_FILE: file });
+  try {
+    const stats = require('../src/stats.js');
+    stats.recordStats('seed', { inputTokensRemoved: 1, techniques: { dedup: true } });
+    await stats.flushNow();
+    stats.recordAnthropicUsage('dropped', 'anthropic', 'model', { input_tokens: 1 });
+
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('GET', '/api/miser/stats', null, {}), res);
+    const payload = JSON.parse(res.body());
+    assert.equal(res.statusCode, 200);
+    assert.equal(payload.recordRejections.total, 1);
+    assert.equal(payload.recordRejections.loadFailureRefusal, 1);
+    assert.deepEqual(payload.recordRejections.byLabel, { usage: 1 });
+    assert.ok(payload.recordRejections.firstDroppedAt);
+    assert.ok(payload.recordRejections.lastDroppedAt);
+  } finally {
+    console.warn = prevWarn;
+    console.error = prevError;
+    echo.server.close(); restoreEnv();
+  }
+});
+
 test('/api/miser/stats?days=abc returns 400', async () => {
   const echo = await startEcho(() => ({ status: 200, body: {} }));
   const { createProxy, restoreEnv } = freshProxy(echo.url);

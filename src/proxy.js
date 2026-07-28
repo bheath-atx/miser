@@ -246,7 +246,24 @@ function createProxy(deps = {}) {
       const projectFilter = url.searchParams.get('project') || undefined;
       try {
         const result = getStats(daysParam !== null ? daysParam : undefined, projectFilter, config.weightedTokenWeights);
-        json(res, 200, result);
+        const persistence = result.persistence;
+        const authoritative = persistence.healthy && persistence.durable;
+        const note = authoritative
+          ? 'persisted; survives restart'
+          : persistence.pending
+            ? 'persistence pending; stats may not survive restart yet'
+            : 'persistence degraded; stats may not survive restart';
+        // Contract matches panel stats: ok is data-authoritative, not just
+        // HTTP handler success. Return the payload so consumers can degrade.
+        json(res, 200, {
+          ...result,
+          ok: authoritative,
+          note,
+          durable: persistence.durable,
+          degraded: !persistence.healthy,
+          authoritative,
+          persistence,
+        });
       } catch (err) {
         json(res, err.statusCode || 500, { error: { type: 'stats_error', message: err.message } });
       }
