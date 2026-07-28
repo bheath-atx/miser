@@ -93,6 +93,43 @@ function buildMetricsText(statsResult) {
     lines.push(`miser_persistence_pending ${statsResult.persistence.pending ? 1 : 0}`);
   }
 
+  lines.push('# HELP miser_persistence_dirty Stats persistence dirty state (1 has unwritten changes, 0 clean).');
+  lines.push('# TYPE miser_persistence_dirty gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.dirty === 'boolean') {
+    lines.push(`miser_persistence_dirty ${statsResult.persistence.dirty ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_persistence_in_flight Stats persistence write-in-flight state (1 writing, 0 idle).');
+  lines.push('# TYPE miser_persistence_in_flight gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.inFlight === 'boolean') {
+    lines.push(`miser_persistence_in_flight ${statsResult.persistence.inFlight ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_persistence_last_flush_errored Stats persistence last-flush error state (1 errored, 0 clean).');
+  lines.push('# TYPE miser_persistence_last_flush_errored gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.lastFlushErrored === 'boolean') {
+    lines.push(`miser_persistence_last_flush_errored ${statsResult.persistence.lastFlushErrored ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_persistence_last_load_errored Stats persistence last-load error state (1 errored, 0 clean).');
+  lines.push('# TYPE miser_persistence_last_load_errored gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.lastLoadErrored === 'boolean') {
+    lines.push(`miser_persistence_last_load_errored ${statsResult.persistence.lastLoadErrored ? 1 : 0}`);
+  }
+
+  lines.push('# HELP miser_persistence_write_failures Consecutive stats persistence write failure count.');
+  lines.push('# TYPE miser_persistence_write_failures gauge');
+  if (statsResult && statsResult.persistence && Number.isFinite(statsResult.persistence.writeFailures)) {
+    lines.push(`miser_persistence_write_failures ${statsResult.persistence.writeFailures}`);
+  }
+
+  lines.push('# HELP miser_persistence_last_error Stats persistence last error code presence.');
+  lines.push('# TYPE miser_persistence_last_error gauge');
+  if (statsResult && statsResult.persistence && typeof statsResult.persistence.lastErrorCode === 'string'
+      && statsResult.persistence.lastErrorCode) {
+    lines.push(`miser_persistence_last_error{code="${labelEscape(statsResult.persistence.lastErrorCode)}"} 1`);
+  }
+
   lines.push('# HELP miser_weekly_authoritative Stats weekly payload authority state (1 all exposed weeks authoritative, 0 some weeks non-authoritative).');
   lines.push('# TYPE miser_weekly_authoritative gauge');
   if (statsResult && typeof statsResult.weeklyAuthoritative === 'boolean') {

@@ -13,7 +13,7 @@ const STATS_FILE = process.env.MISER_STATS_FILE
 const WEEKLY_KEY = '__weekly';
 const WEEKLY_META_KEY = '__meta';
 const STATS_META_KEY = '__meta';
-// Historical persisted key name retained only for migration.
+// Historical E3-only key name retained only so unshipped snapshots can be cleaned.
 const DAILY_RETENTION_WATERMARK_KEY = 'dailyRetentionWatermark';
 // Daily buckets are never pruned today; this records the first day this install
 // recorded after the metadata was introduced, so missing earlier days are
@@ -155,7 +155,8 @@ function loadStats() {
     return {};
   }
   try {
-    migrateStatsMeta(parsed);
+    const removedLegacyOnlyBoundary = migrateStatsMeta(parsed);
+    if (!removedLegacyOnlyBoundary) deriveRecordingStartedAtFromDaily(parsed);
     reconcileWeeklyFromDaily(parsed);
     pruneWeeklyRetention(parsed);
   } catch (err) {
@@ -483,17 +484,31 @@ function isValidDailyKey(key) {
 
 function migrateStatsMeta(statsObj) {
   const meta = getStatsMeta(statsObj);
-  if (!meta) return;
+  if (!meta) return false;
   const current = meta[RECORDING_STARTED_AT_KEY];
-  if (isValidDailyKey(current)) {
-    delete meta[DAILY_RETENTION_WATERMARK_KEY];
-    return;
-  }
-  const legacy = meta[DAILY_RETENTION_WATERMARK_KEY];
-  if (isValidDailyKey(legacy)) {
-    meta[RECORDING_STARTED_AT_KEY] = legacy;
+  const hasLegacy = Object.prototype.hasOwnProperty.call(meta, DAILY_RETENTION_WATERMARK_KEY);
+  const hasCurrent = Object.prototype.hasOwnProperty.call(meta, RECORDING_STARTED_AT_KEY);
+  if (hasLegacy) {
+    // dailyRetentionWatermark never shipped. Delete stale E3 snapshots instead of
+    // resurrecting the legacy value as a compatibility boundary.
     delete meta[DAILY_RETENTION_WATERMARK_KEY];
   }
+  return hasLegacy && !hasCurrent && !isValidDailyKey(current);
+}
+
+function deriveRecordingStartedAtFromDaily(statsObj) {
+  const meta = getStatsMeta(statsObj);
+  if (meta && Object.prototype.hasOwnProperty.call(meta, RECORDING_STARTED_AT_KEY)) return;
+  const earliestDailyKey = Object.keys(statsObj || {})
+    .filter(isValidDailyKey)
+    .sort()[0];
+  if (!earliestDailyKey) return;
+  // This derivation is valid only while daily buckets are never pruned: for every
+  // file this code has produced so far, the earliest surviving daily key is the
+  // recording start. Any future daily retention policy must revisit this because
+  // pruning would make the earliest surviving key newer than the real boundary.
+  const targetMeta = getStatsMeta(statsObj, true);
+  targetMeta[RECORDING_STARTED_AT_KEY] = earliestDailyKey;
 }
 
 function getRecordingStartedAt(statsObj) {
@@ -501,8 +516,7 @@ function getRecordingStartedAt(statsObj) {
   if (!meta) return null;
   const current = meta[RECORDING_STARTED_AT_KEY];
   if (isValidDailyKey(current)) return current;
-  const legacy = meta[DAILY_RETENTION_WATERMARK_KEY];
-  return isValidDailyKey(legacy) ? legacy : null;
+  return null;
 }
 
 function noteRecordingStartedAt(statsObj, day) {

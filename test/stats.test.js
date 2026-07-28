@@ -479,8 +479,9 @@ test('v4 M2: real pre-v4 stats fixture preserves daily data and backfills weekly
     fs.writeFileSync(file, fixtureRaw, 'utf8');
     const stats = freshStats(file);
     const loaded = stats.loadStats();
-    const { __weekly, ...daily } = loaded;
+    const { __weekly, __meta, ...daily } = loaded;
     assert.deepEqual(daily, fixture);
+    assert.deepEqual(__meta, { recordingStartedAt: '2026-07-14' });
     assert.ok(__weekly['2026-07-12T11:00:00.000Z']);
     assert.ok(__weekly['2026-07-19T11:00:00.000Z']);
     const result = stats.getStats('9999');

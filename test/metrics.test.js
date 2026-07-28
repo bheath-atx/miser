@@ -88,6 +88,13 @@ test('R8: authority and rejection gauges expose concrete stats authority state',
       healthy: false,
       durable: false,
       pending: true,
+      dirty: true,
+      inFlight: false,
+      lastFlushErrored: true,
+      lastLoadErrored: false,
+      writeFailures: 3,
+      lastErrorCode: 'WRITE_ERROR',
+      lastErrorMessage: 'disk said no',
     },
     weeklyAuthoritative: false,
     nonAuthoritativeWeekCount: 2,
@@ -111,6 +118,13 @@ test('R8: authority and rejection gauges expose concrete stats authority state',
   assert.ok(text.includes('miser_persistence_healthy 0\n'));
   assert.ok(text.includes('miser_persistence_durable 0\n'));
   assert.ok(text.includes('miser_persistence_pending 1\n'));
+  assert.ok(text.includes('miser_persistence_dirty 1\n'));
+  assert.ok(text.includes('miser_persistence_in_flight 0\n'));
+  assert.ok(text.includes('miser_persistence_last_flush_errored 1\n'));
+  assert.ok(text.includes('miser_persistence_last_load_errored 0\n'));
+  assert.ok(text.includes('miser_persistence_write_failures 3\n'));
+  assert.ok(text.includes('miser_persistence_last_error{code="WRITE_ERROR"} 1'));
+  assert.ok(!text.includes('disk said no'));
   assert.ok(text.includes('miser_weekly_authoritative 0\n'));
   assert.ok(text.includes('miser_non_authoritative_weeks 2\n'));
   assert.ok(text.includes('miser_non_authoritative_week_reasons{reason="pre_recording_daily_gap"} 1'));

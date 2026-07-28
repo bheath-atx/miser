@@ -285,11 +285,16 @@ test('weekly retention caps prior complete weeks and prunes persisted snapshots'
   }
 });
 
-test('legacy daily stats are backfilled into weekly buckets on first load', () => {
+test('daily stats with no meta derive recordingStartedAt from earliest daily key and backfill authoritative weekly buckets', async () => {
   const file = tmpStatsFile('migration');
   const prevEnv = process.env.MISER_STATS_FILE;
   try {
     const stats = freshStats(file, {
+      '2026-07-19': {
+        alpha: {
+          usage: { anthropic: { model: { cacheRead: 2, requests: 1 } } },
+        },
+      },
       '2026-07-20': {
         alpha: {
           usage: { anthropic: { model: { input: 5, requests: 1 } } },
@@ -303,9 +308,12 @@ test('legacy daily stats are backfilled into weekly buckets on first load', () =
         },
       },
     });
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.equal(snapshot.__meta.recordingStartedAt, '2026-07-19');
     const weekly = stats.getStats('9999').weekly.priorCompleteWeeks
       .find(week => week.weekStart === '2026-07-19T11:00:00.000Z');
     assert.ok(weekly, 'backfilled prior week should be exposed');
+    assert.equal(weekly.usage.alpha.anthropic.model.cacheRead, 2);
     assert.equal(weekly.usage.alpha.anthropic.model.input, 5);
     assert.equal(weekly.usage.alpha.anthropic.model.output, 3);
     assert.deepEqual(weekly.perProject.alpha.budget, {
@@ -316,8 +324,13 @@ test('legacy daily stats are backfilled into weekly buckets on first load', () =
       modelDriftCount: 1,
       contextBloatCount: 2,
     });
-    assert.equal(weekly.authoritative, false);
-    assert.equal(weekly.nonAuthoritativeReason, 'coverage_unknown');
+    assert.equal(weekly.authoritative, true);
+    assert.equal(weekly.nonAuthoritativeReason, undefined);
+
+    const result = await stats.flushNow();
+    assert.equal(result.ok, true);
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(persisted.__meta.recordingStartedAt, '2026-07-19');
   } finally {
     cleanup(file, prevEnv);
   }
@@ -540,9 +553,10 @@ test('known-incomplete coverage with no stored weekly bucket is non-authoritativ
   }
 });
 
-test('legacy daily retention watermark is migrated to recordingStartedAt without reset', async () => {
+test('legacy-only daily retention watermark is deleted without creating a recording boundary', async () => {
   const file = tmpStatsFile('legacy-recording-start-migration');
   const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
   try {
     const stats = freshStats(file, sparseStatsWithLegacyWatermark('2026-07-20', {
       '2026-07-20': {
@@ -551,15 +565,77 @@ test('legacy daily retention watermark is migrated to recordingStartedAt without
     }));
 
     const snapshot = stats.getRawStatsSnapshot();
-    assert.equal(snapshot.__meta.recordingStartedAt, '2026-07-20');
+    assert.equal(snapshot.__meta.recordingStartedAt, undefined);
     assert.equal(snapshot.__meta.dailyRetentionWatermark, undefined);
-    assert.equal(stats.__test.getRecordingStartedAt(snapshot), '2026-07-20');
+    assert.equal(stats.__test.getRecordingStartedAt(snapshot), null);
+
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.equal(exposed.authoritative, false);
+    assert.equal(exposed.degraded, true);
+    assert.equal(exposed.nonAuthoritativeReason, 'coverage_unknown');
 
     const result = await stats.flushNow();
     assert.equal(result.ok, true);
     const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
-    assert.equal(persisted.__meta.recordingStartedAt, '2026-07-20');
+    assert.equal(persisted.__meta.recordingStartedAt, undefined);
     assert.equal(persisted.__meta.dailyRetentionWatermark, undefined);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('derived recordingStartedAt is not lowered by a later older-day record', () => {
+  const file = tmpStatsFile('derived-recording-start-monotonic');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file, {
+      '2026-07-20': {
+        alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
+      },
+    });
+    assert.equal(stats.getRawStatsSnapshot().__meta.recordingStartedAt, '2026-07-20');
+
+    stats.recordAnthropicUsage(
+      'alpha',
+      'anthropic',
+      'claude-sonnet-4',
+      { output_tokens: 7 },
+      null,
+      () => new Date('2026-07-19T15:00:00.000Z'),
+    );
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.equal(snapshot.__meta.recordingStartedAt, '2026-07-20');
+    assert.equal(snapshot['2026-07-19'].alpha.usage.anthropic['claude-sonnet-4'].output, 7);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('empty daily stats derive no recording boundary and daily coverage remains unknown', () => {
+  const file = tmpStatsFile('empty-no-boundary');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, {});
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.equal(snapshot.__meta, undefined);
+    assert.equal(stats.__test.getRecordingStartedAt(snapshot), null);
+
+    const coverage = stats.__test.dailyCoverageForWeek(snapshot, weekKey);
+    assert.equal(coverage.unknown, true);
+    assert.equal(coverage.complete, false);
+    assert.deepEqual(coverage.presentDays, []);
+    assert.deepEqual(coverage.expectedDays, [
+      '2026-07-19',
+      '2026-07-20',
+      '2026-07-21',
+      '2026-07-22',
+      '2026-07-23',
+      '2026-07-24',
+      '2026-07-25',
+    ]);
   } finally {
     cleanup(file, prevEnv);
   }
