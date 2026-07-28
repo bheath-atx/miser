@@ -78,11 +78,10 @@ Missing usage means “not measured”; v4 does not zero-fill absent usage nodes
 - `weeklyAuthoritative`: true only when every exposed week is authoritative.
 - `nonAuthoritativeWeekCount` / `nonAuthoritativeReasons`: top-level weekly rollup fields, so clients do not have to iterate the weekly array to detect unverified weekly data.
 
-Weekly stats in the `/api/miser/stats` response include `authoritative` / `degraded` at the weekly summary and per-week level. The top-level `weeklyAuthoritative` rollup is the response-level signal for weekly authority. A non-authoritative week carries `nonAuthoritativeReason` and, when coverage is known, `coverage`. Current reasons:
+Weekly stats in the `/api/miser/stats` response include `authoritative` / `degraded` at the weekly summary and per-week level. A weekly total is authoritative only when persistence is healthy and durable and every expected UTC daily key for that subscription week exists in the daily map. An empty daily object `{}` means the day was observed and quiet; a missing daily key means the day was not observed. The top-level `weeklyAuthoritative` rollup is the response-level signal for weekly authority. A non-authoritative week carries `nonAuthoritativeReason` and, when daily observations are missing, `coverage`. Current reasons:
 
-- `coverage_unknown`: legacy daily data exists but no recording-start metadata is available.
-- `pre_recording_daily_gap`: expected days are missing before this install started recording daily buckets. Daily buckets are never pruned today.
-- `no_daily_backing`: a stored weekly bucket has no daily bucket support.
+- `missing_daily_observation`: at least one expected day key for the week is absent.
+- `persistence_degraded`: stats persistence is unhealthy or not durable.
 - `migration_retention_failed`: weekly migration/retention failed, so preserved weekly data cannot be trusted as authoritative.
 
 `GET /api/miser/health` returns process vitals:

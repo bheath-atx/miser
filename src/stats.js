@@ -15,12 +15,13 @@ const WEEKLY_META_KEY = '__meta';
 const STATS_META_KEY = '__meta';
 // Historical E3-only key name retained only so unshipped snapshots can be cleaned.
 const DAILY_RETENTION_WATERMARK_KEY = 'dailyRetentionWatermark';
-// Daily buckets are never pruned today; this records the first day this install
-// recorded after the metadata was introduced, so missing earlier days are
-// pre-recording gaps. It is write-once and never extended backward by later
-// backdated records.
+// Daily buckets are the observation log. __meta.recordingStartedAt is display
+// metadata only; weekly authority is based on daily key presence plus persistence.
 const RECORDING_STARTED_AT_KEY = 'recordingStartedAt';
 const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
+const DEFAULT_OBSERVATION_SEAL_INTERVAL_MS = 60_000;
+const MIN_OBSERVATION_SEAL_INTERVAL_MS = 60_000;
+const MAX_OBSERVATION_SEAL_INTERVAL_MS = 300_000;
 // Keep two years of completed weekly buckets by default: enough for year-over-year
 // comparisons while bounding persisted __weekly growth.
 const DEFAULT_WEEKLY_MAX_WEEKS = 104;
@@ -34,6 +35,12 @@ const MAX_CLOCK_FUTURE_DAYS = 30;
 const WEEKLY_MAX_WEEKS = parsePositiveInt(process.env.MISER_WEEKLY_STATS_MAX_WEEKS, DEFAULT_WEEKLY_MAX_WEEKS, MAX_WEEKLY_MAX_WEEKS, 'MISER_WEEKLY_STATS_MAX_WEEKS');
 const CLOCK_PAST_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_PAST_DAYS, DEFAULT_CLOCK_PAST_DAYS, MAX_CLOCK_PAST_DAYS, 'MISER_STATS_CLOCK_PAST_DAYS') * 24 * 60 * 60 * 1000;
 const CLOCK_FUTURE_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_FUTURE_DAYS, DEFAULT_CLOCK_FUTURE_DAYS, MAX_CLOCK_FUTURE_DAYS, 'MISER_STATS_CLOCK_FUTURE_DAYS') * 24 * 60 * 60 * 1000;
+const OBSERVATION_SEAL_INTERVAL_MS = parsePositiveInt(
+  process.env.MISER_STATS_SEAL_INTERVAL_MS,
+  DEFAULT_OBSERVATION_SEAL_INTERVAL_MS,
+  MAX_OBSERVATION_SEAL_INTERVAL_MS,
+  'MISER_STATS_SEAL_INTERVAL_MS',
+);
 let _timeZoneStatus = null;
 let _timeZoneUnsupportedRetries = 0;
 let _timezoneFallbackWarned = false;
@@ -70,11 +77,17 @@ const _pendingFlush = {
   lastErrorCode: null,
 };
 
+const _observationSeal = {
+  startupTimer: null,
+  intervalTimer: null,
+};
+
 let _loadStatsNeedsFlush = false;
 let _stats = loadStats();
 if (_loadStatsNeedsFlush) {
   scheduleFlush(false, 0);
 }
+startObservationSeal();
 
 const _recordRejections = {
   total: 0,
@@ -187,6 +200,7 @@ function clearTimer(name) {
 }
 
 function cloneStats() {
+  reconcileWeeklyFromDaily(_stats);
   pruneWeeklyRetention(_stats);
   markRuntimeWeeklyCoverageGaps(_stats);
   return JSON.parse(JSON.stringify(_stats));
@@ -537,6 +551,52 @@ function noteRecordingStartedAt(statsObj, day) {
   if (!current) meta[RECORDING_STARTED_AT_KEY] = day;
 }
 
+function ensureDayObserved(day) {
+  if (!isValidDailyKey(day)) return false;
+  noteRecordingStartedAt(_stats, day);
+  const existing = _stats[day];
+  if (existing && typeof existing === 'object' && !Array.isArray(existing)) return false;
+  _stats[day] = {};
+  return true;
+}
+
+function sealTodayObserved() {
+  try {
+    if (_persistence.lastLoadErrored) return false;
+    const changed = ensureDayObserved(todayKey());
+    if (changed) scheduleFlush(false, 0);
+    return changed;
+  } catch (err) {
+    console.error('[miser/stats] ERROR observation seal failed:', err.message);
+    return false;
+  }
+}
+
+function startObservationSeal() {
+  clearObservationSealTimers();
+  _observationSeal.startupTimer = setTimeout(() => {
+    _observationSeal.startupTimer = null;
+    sealTodayObserved();
+  }, 0);
+  if (typeof _observationSeal.startupTimer.unref === 'function') _observationSeal.startupTimer.unref();
+
+  _observationSeal.intervalTimer = setInterval(() => {
+    sealTodayObserved();
+  }, Math.max(MIN_OBSERVATION_SEAL_INTERVAL_MS, OBSERVATION_SEAL_INTERVAL_MS));
+  if (typeof _observationSeal.intervalTimer.unref === 'function') _observationSeal.intervalTimer.unref();
+}
+
+function clearObservationSealTimers() {
+  if (_observationSeal.startupTimer) {
+    clearTimeout(_observationSeal.startupTimer);
+    _observationSeal.startupTimer = null;
+  }
+  if (_observationSeal.intervalTimer) {
+    clearInterval(_observationSeal.intervalTimer);
+    _observationSeal.intervalTimer = null;
+  }
+}
+
 function canRetainMutationAfterLoadFailure(label) {
   if (!_persistence.lastLoadErrored) return true;
   // Preserve at most one post-load-failure in-memory mutation for degraded
@@ -627,42 +687,27 @@ function expectedDailyKeysForWeek(weekKey, now = new Date()) {
 
 function dailyCoverageForWeek(statsObj, weekKey) {
   const expectedDays = expectedDailyKeysForWeek(weekKey);
-  const recordingStartedAt = getRecordingStartedAt(statsObj);
-  const expected = new Set(expectedDays);
-  const presentDays = Object.keys(statsObj || {})
-    .filter(day => expected.has(day) && isValidDailyKey(day))
-    .sort();
+  const presentDays = expectedDays
+    .filter(day => {
+      const dayData = statsObj && statsObj[day];
+      return isValidDailyKey(day) && dayData && typeof dayData === 'object' && !Array.isArray(dayData);
+    });
   const present = new Set(presentDays);
-  if (!recordingStartedAt) {
-    return {
-      complete: false,
-      unknown: expectedDays.length > 0,
-      presentDays,
-      expectedDays,
-      presentCount: presentDays.length,
-      expectedCount: expectedDays.length,
-    };
-  }
-  const coveredQuietDays = expectedDays
-    .filter(day => !present.has(day) && day >= recordingStartedAt);
   const missingDays = expectedDays
-    .filter(day => !present.has(day) && day < recordingStartedAt);
+    .filter(day => !present.has(day));
   return {
     complete: missingDays.length === 0,
     presentDays,
-    coveredQuietDays,
     missingDays,
     expectedDays,
     presentCount: presentDays.length,
     expectedCount: expectedDays.length,
-    recordingStartedAt,
   };
 }
 
 function nonAuthoritativeReasonForCoverage(coverage) {
   if (!coverage) return null;
-  if (coverage.unknown) return 'coverage_unknown';
-  if (!coverage.complete) return 'pre_recording_daily_gap';
+  if (!coverage.complete) return 'missing_daily_observation';
   return null;
 }
 
@@ -674,7 +719,7 @@ function coverageMetadataForWeek(statsObj, weekKey) {
 }
 
 function isCoverageAuthorityReason(reason) {
-  return reason === 'coverage_unknown' || reason === 'pre_recording_daily_gap';
+  return reason === 'missing_daily_observation';
 }
 
 function pruneWeeklyRetention(statsObj, now = new Date()) {
@@ -764,14 +809,11 @@ function markWeekNonAuthoritative(weekData, reason, extra = null) {
   };
   if (extra && typeof extra === 'object') {
     weekData[WEEKLY_META_KEY].coverage = {
-      unknown: extra.unknown === true,
       presentDays: extra.presentDays,
-      coveredQuietDays: extra.coveredQuietDays,
       missingDays: extra.missingDays,
       expectedDays: extra.expectedDays,
       presentCount: extra.presentCount,
       expectedCount: extra.expectedCount,
-      recordingStartedAt: extra.recordingStartedAt,
     };
   }
   return weekData;
@@ -785,26 +827,26 @@ function markAllWeeklyNonAuthoritative(weekly, reason) {
   }
 }
 
+function hasHardFailedWeeklyMigration(statsObj) {
+  const weekly = statsObj && statsObj[WEEKLY_KEY];
+  if (!isWeeklyContainer(weekly)) return false;
+  return Object.entries(weekly).some(([weekKey, weekData]) => {
+    if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) return false;
+    const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
+    return meta && meta.authoritative === false && meta.reason === 'migration_retention_failed';
+  });
+}
+
 function reconcileWeeklyFromDaily(statsObj) {
+  if (hasHardFailedWeeklyMigration(statsObj)) return;
   const rebuilt = buildWeeklyFromDaily(statsObj);
-  if (!isWeeklyContainer(statsObj[WEEKLY_KEY])) {
-    statsObj[WEEKLY_KEY] = rebuilt;
-    for (const [weekKey, weekData] of Object.entries(statsObj[WEEKLY_KEY])) {
-      if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
-      const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
-      if (coverageMeta) markWeekNonAuthoritative(weekData, coverageMeta.reason, coverageMeta.coverage);
-    }
-    return;
-  }
-  const weekly = statsObj[WEEKLY_KEY];
   const reconciled = {};
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
-    const stored = weekly[weekKey];
     if (validWeekKey(weekKey)) {
       const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
       if (coverageMeta) {
         reconciled[weekKey] = markWeekNonAuthoritative(
-          isWeeklyContainer(stored) ? stored : weekData,
+          weekData,
           coverageMeta.reason,
           coverageMeta.coverage,
         );
@@ -813,11 +855,8 @@ function reconcileWeeklyFromDaily(statsObj) {
     }
     reconciled[weekKey] = weekData;
   }
-  for (const [weekKey, weekData] of Object.entries(weekly)) {
-    if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData) || reconciled[weekKey]) continue;
-    reconciled[weekKey] = markWeekNonAuthoritative(weekData, 'no_daily_backing');
-  }
-  statsObj[WEEKLY_KEY] = reconciled;
+  if (Object.keys(reconciled).length > 0) statsObj[WEEKLY_KEY] = reconciled;
+  else delete statsObj[WEEKLY_KEY];
 }
 
 function markRuntimeWeeklyCoverageGaps(statsObj) {
@@ -855,8 +894,7 @@ function ensureOptimizerFields(bucket) {
 
 function ensureProjectBucketForDay(project, day) {
   const proj = project || 'default';
-  noteRecordingStartedAt(_stats, day);
-  if (!_stats[day]) _stats[day] = {};
+  ensureDayObserved(day);
   if (!_stats[day][proj]) _stats[day][proj] = {};
   return ensureOptimizerFields(_stats[day][proj]);
 }
@@ -875,8 +913,7 @@ function ensureProjectBucket(project, now = new Date()) {
 
 function ensureMeasuredProjectBucketForDay(project, day) {
   const proj = project || 'default';
-  noteRecordingStartedAt(_stats, day);
-  if (!_stats[day]) _stats[day] = {};
+  ensureDayObserved(day);
   if (!_stats[day][proj]) _stats[day][proj] = {};
   return _stats[day][proj];
 }
@@ -897,8 +934,7 @@ function ensureMeasuredProjectBucket(project, now = new Date()) {
 // an injected nowFn fully controls the day bucket — no midnight-split risk.
 function ensureGuardrailBucket(project, dayKey) {
   const proj = project || 'default';
-  noteRecordingStartedAt(_stats, dayKey);
-  if (!_stats[dayKey]) _stats[dayKey] = {};
+  ensureDayObserved(dayKey);
   if (!_stats[dayKey][proj]) _stats[dayKey][proj] = {};
   return _stats[dayKey][proj];
 }
@@ -988,13 +1024,15 @@ function recordStats(project, opts = {}, nowFn = () => new Date()) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'optimizer')) return;
   if (!canRetainMutationAfterLoadFailure('optimizer')) return;
-  const bucket = ensureProjectBucket(project, now);
+  const day = dayKeyFromDate(now);
+  const observedChanged = ensureDayObserved(day);
+  const bucket = ensureProjectBucketForDay(project, day);
   const weekBucket = ensureProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
 
   applyOptimizerStats(bucket, opts);
   applyOptimizerStats(weekBucket, opts);
 
-  scheduleFlush();
+  scheduleFlush(true, observedChanged ? 0 : 5000);
 }
 
 function finitePositive(n) {
@@ -1065,7 +1103,9 @@ function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEd
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'usage')) return;
   if (!canRetainMutationAfterLoadFailure('usage')) return;
-  const bucket = ensureMeasuredProjectBucket(project, now);
+  const day = dayKeyFromDate(now);
+  const observedChanged = ensureDayObserved(day);
+  const bucket = ensureMeasuredProjectBucketForDay(project, day);
   const weekBucket = ensureMeasuredProjectBucketForWeek(project, subscriptionWeekKeyFromDate(now));
   const providerKey = provider || 'anthropic';
   const modelKey = model || 'unknown';
@@ -1076,7 +1116,7 @@ function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEd
   applyMeasuredUsage(bucket, providerKey, modelKey, usage, editStats);
   applyMeasuredUsage(weekBucket, providerKey, modelKey, usage, editStats);
 
-  if (hasMeasuredAxis || editStats) scheduleFlush();
+  if (hasMeasuredAxis || editStats || observedChanged) scheduleFlush(true, observedChanged ? 0 : 5000);
   if (usage.cacheWrite5m > 0) {
     console.warn(`[miser] WARN cacheWrite5m observed over 24h window project=${project || 'default'} provider=${providerKey} model=${modelKey}`);
   }
@@ -1255,8 +1295,14 @@ function aggregatePeriod(periodData, projectFilter, weights = DEFAULT_WEIGHTS) {
 }
 
 function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = new Date()) {
+  reconcileWeeklyFromDaily(_stats);
+  pruneWeeklyRetention(_stats, now);
   const weeklyData = (_stats[WEEKLY_KEY] && typeof _stats[WEEKLY_KEY] === 'object') ? _stats[WEEKLY_KEY] : {};
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
+  const persistence = getPersistenceStatus();
+  const persistenceMeta = !(persistence.healthy && persistence.durable)
+    ? { authoritative: false, reason: 'persistence_degraded' }
+    : null;
   const makeWeek = (weekStart, complete) => {
     const weekData = weeklyData[weekStart];
     const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
@@ -1272,7 +1318,8 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = ne
         reason: coverageMeta.reason,
         coverage: coverageMeta.coverage,
       };
-    const authoritative = !(meta && meta.authoritative === false);
+    const effectiveMeta = persistenceMeta || meta;
+    const authoritative = !(effectiveMeta && effectiveMeta.authoritative === false);
     const out = {
       weekStart,
       complete,
@@ -1280,7 +1327,7 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = ne
       degraded: !authoritative,
       ...aggregatePeriod(weekData, projectFilter, weights),
     };
-    if (meta && typeof meta.reason === 'string') out.nonAuthoritativeReason = meta.reason;
+    if (effectiveMeta && typeof effectiveMeta.reason === 'string') out.nonAuthoritativeReason = effectiveMeta.reason;
     if (meta && isWeeklyContainer(meta.coverage)) out.coverage = meta.coverage;
     return out;
   };
@@ -1424,6 +1471,7 @@ function __resetForTest() {
   _stats = {};
   clearTimer('timer');
   clearTimer('retryTimer');
+  clearObservationSealTimers();
   _pendingFlush.dirty = false;
   _pendingFlush.inFlight = false;
   _pendingFlush.currentPromise = null;
@@ -1486,6 +1534,9 @@ module.exports = {
     getRecordRejectionStatus,
     migrateStatsMeta,
     getRecordingStartedAt,
+    ensureDayObserved,
+    sealTodayObserved,
+    _observationSeal,
     reconcileWeeklyFromDaily,
     dailyCoverageForWeek,
     WEEKLY_MAX_WEEKS,

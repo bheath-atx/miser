@@ -98,7 +98,7 @@ test('R8: authority and rejection gauges expose concrete stats authority state',
     },
     weeklyAuthoritative: false,
     nonAuthoritativeWeekCount: 2,
-    nonAuthoritativeReasons: ['pre_recording_daily_gap', 'coverage_unknown'],
+    nonAuthoritativeReasons: ['missing_daily_observation', 'persistence_degraded'],
     recordRejections: {
       total: 4,
       invalidTimestamp: 1,
@@ -127,8 +127,8 @@ test('R8: authority and rejection gauges expose concrete stats authority state',
   assert.ok(!text.includes('disk said no'));
   assert.ok(text.includes('miser_weekly_authoritative 0\n'));
   assert.ok(text.includes('miser_non_authoritative_weeks 2\n'));
-  assert.ok(text.includes('miser_non_authoritative_week_reasons{reason="pre_recording_daily_gap"} 1'));
-  assert.ok(text.includes('miser_non_authoritative_week_reasons{reason="coverage_unknown"} 1'));
+  assert.ok(text.includes('miser_non_authoritative_week_reasons{reason="missing_daily_observation"} 1'));
+  assert.ok(text.includes('miser_non_authoritative_week_reasons{reason="persistence_degraded"} 1'));
   assert.ok(text.includes('miser_record_rejections{reason="total"} 4'));
   assert.ok(text.includes('miser_record_rejections{reason="invalidTimestamp"} 1'));
   assert.ok(text.includes('miser_record_rejections{reason="outOfBoundsTimestamp"} 2'));
