@@ -446,7 +446,7 @@ test('partial daily coverage retains stored weekly value and marks it non-author
     assert.equal(rawWeek.alpha.usage.anthropic.model.input, 70);
     assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 7);
     assert.equal(rawWeek.__meta.authoritative, false);
-    assert.equal(rawWeek.__meta.reason, 'partial_daily_coverage');
+    assert.equal(rawWeek.__meta.reason, 'pre_recording_daily_gap');
     assert.deepEqual(rawWeek.__meta.coverage.presentDays, ['2026-07-20', '2026-07-21']);
     assert.deepEqual(rawWeek.__meta.coverage.missingDays, ['2026-07-19']);
     assert.deepEqual(rawWeek.__meta.coverage.coveredQuietDays, [
@@ -472,7 +472,7 @@ test('partial daily coverage retains stored weekly value and marks it non-author
       .find(week => week.weekStart === weekKey);
     assert.equal(exposed.authoritative, false);
     assert.equal(exposed.degraded, true);
-    assert.equal(exposed.nonAuthoritativeReason, 'partial_daily_coverage');
+    assert.equal(exposed.nonAuthoritativeReason, 'pre_recording_daily_gap');
     assert.equal(exposed.usage.alpha.anthropic.model.input, 70);
     assert.deepEqual(exposed.coverage.presentDays, ['2026-07-20', '2026-07-21']);
     assert.deepEqual(exposed.coverage.missingDays, ['2026-07-19']);
@@ -486,6 +486,82 @@ test('partial daily coverage retains stored weekly value and marks it non-author
       '2026-07-25',
     ]);
     assert.equal(stats.getStats('9999').weekly.authoritative, false);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('known-incomplete coverage with no stored weekly bucket is non-authoritative', () => {
+  const file = tmpStatsFile('migration-partial-no-stored-weekly');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, sparseStatsWithWatermark('2026-07-20', {
+      '2026-07-20': {
+        alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
+      },
+      '2026-07-21': {
+        alpha: { usage: { anthropic: { model: { output: 4, requests: 1 } } } },
+      },
+    }));
+
+    const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 10);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.output, 4);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 2);
+    assert.equal(rawWeek.__meta.authoritative, false);
+    assert.equal(rawWeek.__meta.reason, 'pre_recording_daily_gap');
+    assert.deepEqual(rawWeek.__meta.coverage.presentDays, ['2026-07-20', '2026-07-21']);
+    assert.deepEqual(rawWeek.__meta.coverage.missingDays, ['2026-07-19']);
+    assert.deepEqual(rawWeek.__meta.coverage.coveredQuietDays, [
+      '2026-07-22',
+      '2026-07-23',
+      '2026-07-24',
+      '2026-07-25',
+    ]);
+    assert.equal(rawWeek.__meta.coverage.retainedDailyWatermark, '2026-07-20');
+
+    const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
+      .find(week => week.weekStart === weekKey);
+    assert.equal(exposed.authoritative, false);
+    assert.equal(exposed.degraded, true);
+    assert.equal(exposed.nonAuthoritativeReason, 'pre_recording_daily_gap');
+    assert.deepEqual(exposed.coverage.missingDays, ['2026-07-19']);
+    assert.equal(stats.getStats('9999').weekly.authoritative, false);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('fresh install first mid-week write marks earlier current-week days not covered', () => {
+  const file = tmpStatsFile('runtime-first-mid-week');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-26T11:00:00.000Z';
+  try {
+    const stats = freshStats(file);
+    stats.recordAnthropicUsage(
+      'alpha',
+      'anthropic',
+      'claude-sonnet-4',
+      { input_tokens: 12 },
+      null,
+      () => new Date('2026-07-28T15:00:00.000Z'),
+    );
+
+    const current = stats.getStats('9999').weekly.currentWeekToDate;
+    assert.equal(current.weekStart, weekKey);
+    assert.equal(current.authoritative, false);
+    assert.equal(current.degraded, true);
+    assert.equal(current.nonAuthoritativeReason, 'pre_recording_daily_gap');
+    assert.deepEqual(current.coverage.presentDays, ['2026-07-28']);
+    assert.deepEqual(current.coverage.missingDays, ['2026-07-26', '2026-07-27']);
+    assert.equal(current.coverage.retainedDailyWatermark, '2026-07-28');
+    assert.equal(current.usage.alpha.anthropic['claude-sonnet-4'].input, 12);
+    assert.equal(stats.getStats('9999').weekly.authoritative, false);
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.equal(snapshot.__weekly[weekKey].__meta.authoritative, false);
+    assert.equal(snapshot.__weekly[weekKey].__meta.reason, 'pre_recording_daily_gap');
   } finally {
     cleanup(file, prevEnv);
   }

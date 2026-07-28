@@ -13,6 +13,9 @@ const STATS_FILE = process.env.MISER_STATS_FILE
 const WEEKLY_KEY = '__weekly';
 const WEEKLY_META_KEY = '__meta';
 const STATS_META_KEY = '__meta';
+// Historical persisted key name retained for compatibility. Daily buckets are
+// never pruned today; this stores the earliest day this install recorded after
+// the metadata was introduced, so missing earlier days are pre-recording gaps.
 const DAILY_RETENTION_WATERMARK_KEY = 'dailyRetentionWatermark';
 const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
 // Keep two years of completed weekly buckets by default: enough for year-over-year
@@ -171,6 +174,7 @@ function clearTimer(name) {
 
 function cloneStats() {
   pruneWeeklyRetention(_stats);
+  markRuntimeWeeklyCoverageGaps(_stats);
   return JSON.parse(JSON.stringify(_stats));
 }
 
@@ -608,6 +612,20 @@ function dailyCoverageForWeek(statsObj, weekKey) {
   };
 }
 
+function nonAuthoritativeReasonForCoverage(coverage) {
+  if (!coverage) return null;
+  if (coverage.unknown) return 'coverage_unknown';
+  if (!coverage.complete) return 'pre_recording_daily_gap';
+  return null;
+}
+
+function coverageMetadataForWeek(statsObj, weekKey) {
+  if (!validWeekKey(weekKey)) return null;
+  const coverage = dailyCoverageForWeek(statsObj, weekKey);
+  const reason = nonAuthoritativeReasonForCoverage(coverage);
+  return reason ? { reason, coverage } : null;
+}
+
 function pruneWeeklyRetention(statsObj, now = new Date()) {
   const weekly = statsObj && statsObj[WEEKLY_KEY];
   if (!weekly || typeof weekly !== 'object') return;
@@ -722,8 +740,8 @@ function reconcileWeeklyFromDaily(statsObj) {
     statsObj[WEEKLY_KEY] = rebuilt;
     for (const [weekKey, weekData] of Object.entries(statsObj[WEEKLY_KEY])) {
       if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
-      const coverage = dailyCoverageForWeek(statsObj, weekKey);
-      if (coverage.unknown) markWeekNonAuthoritative(weekData, 'coverage_unknown', coverage);
+      const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
+      if (coverageMeta) markWeekNonAuthoritative(weekData, coverageMeta.reason, coverageMeta.coverage);
     }
     return;
   }
@@ -732,17 +750,13 @@ function reconcileWeeklyFromDaily(statsObj) {
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
     const stored = weekly[weekKey];
     if (validWeekKey(weekKey)) {
-      const coverage = dailyCoverageForWeek(statsObj, weekKey);
-      if (coverage.unknown) {
+      const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
+      if (coverageMeta) {
         reconciled[weekKey] = markWeekNonAuthoritative(
           isWeeklyContainer(stored) ? stored : weekData,
-          'coverage_unknown',
-          coverage,
+          coverageMeta.reason,
+          coverageMeta.coverage,
         );
-        continue;
-      }
-      if (isWeeklyContainer(stored) && !coverage.complete) {
-        reconciled[weekKey] = markWeekNonAuthoritative(stored, 'partial_daily_coverage', coverage);
         continue;
       }
     }
@@ -753,6 +767,18 @@ function reconcileWeeklyFromDaily(statsObj) {
     reconciled[weekKey] = markWeekNonAuthoritative(weekData, 'no_daily_backing');
   }
   statsObj[WEEKLY_KEY] = reconciled;
+}
+
+function markRuntimeWeeklyCoverageGaps(statsObj) {
+  const weekly = statsObj && statsObj[WEEKLY_KEY];
+  if (!isWeeklyContainer(weekly)) return;
+  for (const [weekKey, weekData] of Object.entries(weekly)) {
+    if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
+    const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
+    if (meta && meta.authoritative === false) continue;
+    const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
+    if (coverageMeta) markWeekNonAuthoritative(weekData, coverageMeta.reason, coverageMeta.coverage);
+  }
 }
 
 function emptyTechniqueBucket() {
@@ -1178,8 +1204,18 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = ne
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
   const makeWeek = (weekStart, complete) => {
     const weekData = weeklyData[weekStart];
-    const meta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
+    const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
       ? weekData[WEEKLY_META_KEY] : null;
+    const coverageMeta = !isWeeklyContainer(weekData) || (storedMeta && storedMeta.authoritative === false)
+      ? null
+      : coverageMetadataForWeek(_stats, weekStart);
+    const meta = (storedMeta && storedMeta.authoritative === false)
+      ? storedMeta
+      : coverageMeta && {
+        authoritative: false,
+        reason: coverageMeta.reason,
+        coverage: coverageMeta.coverage,
+      };
     const authoritative = !(meta && meta.authoritative === false);
     const out = {
       weekStart,

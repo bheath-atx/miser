@@ -104,6 +104,59 @@ const _pendingFlush = {
 };
 let _loadGeneration = 0;
 
+const _recordRejections = {
+  total: 0,
+  loadFailureRefusal: 0,
+  byLabel: {},
+  firstRejectedAt: null,
+  lastRejectedAt: null,
+  firstDroppedAt: null,
+  lastDroppedAt: null,
+  warned: false,
+};
+
+function canRetainMutationAfterLoadFailure(label) {
+  if (!_persistence.lastLoadErrored) return true;
+  // Preserve at most one post-load-failure in-memory mutation for degraded
+  // visibility. Once the refusal path has pending dirty data, dropping later
+  // panel mutations prevents unbounded growth while protecting the file.
+  const canRetain = !_pendingFlush.dirty && !_pendingFlush.inFlight;
+  if (!canRetain) noteDroppedMutationAfterLoadFailure(label);
+  return canRetain;
+}
+
+function noteRecordRejection(label, reason, detail) {
+  const nowIso = new Date().toISOString();
+  _recordRejections.total += 1;
+  _recordRejections[reason] += 1;
+  _recordRejections.byLabel[label] = (_recordRejections.byLabel[label] || 0) + 1;
+  if (!_recordRejections.firstRejectedAt) _recordRejections.firstRejectedAt = nowIso;
+  _recordRejections.lastRejectedAt = nowIso;
+  if (!_recordRejections.warned) {
+    _recordRejections.warned = true;
+    console.warn(`[miser/panel-stats] WARN rejecting panel stats records; first=${label} ${detail}; further rejection logs suppressed, counters exposed in /api/miser/stats/panels`);
+  }
+}
+
+function noteDroppedMutationAfterLoadFailure(label) {
+  noteRecordRejection(label, 'loadFailureRefusal', 'load-failure refusal');
+  const nowIso = new Date().toISOString();
+  if (!_recordRejections.firstDroppedAt) _recordRejections.firstDroppedAt = nowIso;
+  _recordRejections.lastDroppedAt = nowIso;
+}
+
+function getRecordRejectionStatus() {
+  return {
+    total: _recordRejections.total,
+    loadFailureRefusal: _recordRejections.loadFailureRefusal,
+    byLabel: { ..._recordRejections.byLabel },
+    firstRejectedAt: _recordRejections.firstRejectedAt,
+    lastRejectedAt: _recordRejections.lastRejectedAt,
+    firstDroppedAt: _recordRejections.firstDroppedAt,
+    lastDroppedAt: _recordRejections.lastDroppedAt,
+  };
+}
+
 function mergeLoadedPanel(key, loadedBucket) {
   const existing = _panels.get(key);
   if (!existing) {
@@ -374,6 +427,7 @@ function normalizeRaw(raw) {
 function recordPanelUsage(project, panel, rawUsage, nowFn = () => new Date()) {
   if (!project || typeof project !== 'string' || !panel || typeof panel !== 'string') return;
   const key = `${project}--${panel}`;
+  if (!canRetainMutationAfterLoadFailure(key)) return;
   let bucket = _panels.get(key);
   if (!bucket) {
     bucket = emptyPanelBucket();
@@ -445,12 +499,21 @@ function __resetForTest() {
   _persistence.loadPromise = null;
   _persistence.evictedKeys = 0;
   _persistence.lastPrune = null;
+  _recordRejections.total = 0;
+  _recordRejections.loadFailureRefusal = 0;
+  _recordRejections.byLabel = {};
+  _recordRejections.firstRejectedAt = null;
+  _recordRejections.lastRejectedAt = null;
+  _recordRejections.firstDroppedAt = null;
+  _recordRejections.lastDroppedAt = null;
+  _recordRejections.warned = false;
 }
 
 module.exports = {
   recordPanelUsage,
   getPanelStats,
   getPersistenceStatus,
+  getRecordRejectionStatus,
   flushNow,
   loadPanels,
   __resetForTest,

@@ -18,7 +18,7 @@ const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
 const { injectContextManagement } = require('./context-management.js');
 const { buildMetricsText } = require('./metrics.js');
-const { getPanelStats, getPersistenceStatus } = require('./panel-stats.js');
+const { getPanelStats, getPersistenceStatus, getRecordRejectionStatus: getPanelRecordRejectionStatus } = require('./panel-stats.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -313,6 +313,7 @@ function createProxy(deps = {}) {
         degraded: !persistence.healthy,
         authoritative,
         persistence,
+        recordRejections: getPanelRecordRejectionStatus(),
         panels,
       });
       return;

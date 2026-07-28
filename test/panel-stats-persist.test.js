@@ -1,6 +1,6 @@
 'use strict';
 
-const { test } = require('node:test');
+const { test, mock } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -8,6 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const panelStatsPath = require.resolve('../src/panel-stats.js');
+const proxyPath = require.resolve('../src/proxy.js');
 
 function tmpPanelFile(name) {
   return path.join(os.tmpdir(), `miser-test-panel-stats-${process.pid}-${name}-${Date.now()}-${Math.random()}.json`);
@@ -36,6 +37,48 @@ function cleanup(file, prevEnv) {
       try { fs.unlinkSync(path.join(dir, f)); } catch (_) {}
     }
   }
+}
+
+function fakeGetReq(url) {
+  const listeners = {};
+  const req = {
+    method: 'GET',
+    url,
+    headers: {},
+    on(evt, cb) { listeners[evt] = cb; return req; },
+  };
+  process.nextTick(() => { if (listeners.end) listeners.end(); });
+  return req;
+}
+
+function makeRes() {
+  return {
+    statusCode: null,
+    headers: null,
+    chunks: [],
+    writeHead(code, headers) {
+      this.statusCode = code;
+      this.headers = headers;
+      return this;
+    },
+    write(chunk) {
+      this.chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      return true;
+    },
+    end(chunk) {
+      if (chunk) this.write(chunk);
+      if (this.resolve) this.resolve(this);
+      return this;
+    },
+    body() { return this.chunks.join(''); },
+  };
+}
+
+function runGetHandler(handler, url) {
+  const res = makeRes();
+  const done = new Promise(resolve => { res.resolve = resolve; });
+  handler(fakeGetReq(url), res);
+  return done;
 }
 
 test('panel stats persist across a simulated restart', async () => {
@@ -272,6 +315,74 @@ test('panel stats do not overwrite existing file after load failure followed by 
     assert.equal(status.lastLoadErrored, true);
   } finally {
     cleanup(file, prevEnv);
+  }
+});
+
+test('panel stats bound and count mutations after load-failure refusal', async () => {
+  const file = tmpPanelFile('load-failure-drop-counts');
+  const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  const prevWarn = console.warn;
+  const prevError = console.error;
+  const corruptBody = '{not json';
+  const warnings = [];
+  const errors = [];
+  try {
+    console.warn = (...args) => warnings.push(args.join(' '));
+    console.error = (...args) => errors.push(args.join(' '));
+    fs.writeFileSync(file, corruptBody, 'utf8');
+    const panels = await freshLoadedPanelStats(file);
+    warnings.length = 0;
+
+    panels.recordPanelUsage('alpha', 'seed', { input_tokens: 9 }, () => new Date('2026-07-27T12:00:00.000Z'));
+    const first = await panels.flushNow();
+    assert.equal(first.ok, false);
+    assert.equal(first.errorCode, 'LOAD_ERROR');
+    assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
+
+    mock.timers.enable({ apis: ['Date'], now: new Date('2026-07-28T12:00:00.000Z') });
+    panels.recordPanelUsage('alpha', 'one', { input_tokens: 1 });
+    mock.timers.setTime(new Date('2026-07-28T12:00:01.000Z').getTime());
+    panels.recordPanelUsage('beta', 'two', { input_tokens: 2 });
+    panels.recordPanelUsage('alpha', 'one', { input_tokens: 3 });
+
+    const stats = panels.getPanelStats();
+    assert.deepEqual(Object.keys(stats), ['alpha--seed']);
+    assert.equal(stats['alpha--seed'].input, 9);
+    assert.equal(stats['alpha--one'], undefined);
+    assert.equal(stats['beta--two'], undefined);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /load-failure refusal/);
+    assert.match(warnings[0], /further rejection logs suppressed/);
+    assert.match(errors.join('\n'), /refusing flush after load failure/);
+
+    const rejections = panels.getRecordRejectionStatus();
+    assert.equal(rejections.total, 3);
+    assert.equal(rejections.loadFailureRefusal, 3);
+    assert.deepEqual(rejections.byLabel, {
+      'alpha--one': 2,
+      'beta--two': 1,
+    });
+    assert.equal(rejections.firstRejectedAt, '2026-07-28T12:00:00.000Z');
+    assert.equal(rejections.lastRejectedAt, '2026-07-28T12:00:01.000Z');
+    assert.equal(rejections.firstDroppedAt, '2026-07-28T12:00:00.000Z');
+    assert.equal(rejections.lastDroppedAt, '2026-07-28T12:00:01.000Z');
+
+    delete require.cache[proxyPath];
+    const { createProxy } = require('../src/proxy.js');
+    const res = await runGetHandler(createProxy(), '/api/miser/stats/panels');
+    const body = JSON.parse(res.body());
+    assert.equal(res.statusCode, 200);
+    assert.equal(body.ok, false);
+    assert.equal(body.degraded, true);
+    assert.equal(body.persistence.lastLoadErrored, true);
+    assert.deepEqual(body.recordRejections, rejections);
+    assert.deepEqual(Object.keys(body.panels), ['alpha--seed']);
+  } finally {
+    mock.timers.reset();
+    console.warn = prevWarn;
+    console.error = prevError;
+    cleanup(file, prevEnv);
+    delete require.cache[proxyPath];
   }
 });
 
