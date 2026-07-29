@@ -8,7 +8,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { computeCost } = require('./pricing.js');
 
-const DEFAULT_DEDUP_FILE = path.join(os.homedir(), '.miser-rollup-last.txt');
+const DEFAULT_DEDUP_FILE = process.env.MISER_ROLLUP_DEDUP_FILE
+  || path.join(os.homedir(), '.miser-rollup-last.txt');
 
 function dayKey(date = new Date()) {
   return date.toISOString().slice(0, 10);

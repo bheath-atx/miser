@@ -621,8 +621,9 @@ function sprintBSetup(overrides = {}) {
   const ledgerFile = path.join(os.tmpdir(), `miser-proxy-ledger-${process.pid}-${Date.now()}-${Math.random()}.json`);
   const alerts = [];
   const nowFn = () => new Date();
+  process.env.MISER_ALERT_LEDGER_FILE = ledgerFile;
   const guardDeps = {
-    ledger: createLedger(ledgerFile, nowFn),
+    ledger: createLedger(undefined, nowFn),
     sendAlert: async (t) => { alerts.push(t); },
     nowFn,
     ...overrides,

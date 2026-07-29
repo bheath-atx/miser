@@ -601,12 +601,14 @@ test('legacy-only daily retention watermark is deleted without using it as recor
   const file = tmpStatsFile('legacy-recording-start-migration');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
+  const sealedDay = '2026-07-28';
   try {
     const stats = freshStats(file, sparseStatsWithLegacyWatermark('2026-07-20', {
       '2026-07-20': {
         alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
       },
     }));
+    stats.__test.setNowFnForTest(() => new Date(`${sealedDay}T15:00:00.000Z`));
 
     const snapshot = stats.getRawStatsSnapshot();
     assert.equal(snapshot.__meta.recordingStartedAt, undefined);
@@ -625,7 +627,7 @@ test('legacy-only daily retention watermark is deleted without using it as recor
       data => data && data.__meta && data.__meta.dailyRetentionWatermark === undefined,
       'stale legacy boundary deletion should persist without explicit flushNow',
     );
-    assert.equal(persisted.__meta.recordingStartedAt, new Date().toISOString().slice(0, 10));
+    assert.equal(persisted.__meta.recordingStartedAt, sealedDay);
     assert.equal(persisted.__meta.dailyRetentionWatermark, undefined);
   } finally {
     cleanup(file, prevEnv);
@@ -637,6 +639,7 @@ test('clean successful load seals today and persists without explicit flushNow',
   const prevEnv = process.env.MISER_STATS_FILE;
   const fsp = require('node:fs/promises');
   const originalWriteFile = fsp.writeFile;
+  const sealedDay = '2026-07-28';
   const seed = {
     __meta: { recordingStartedAt: '2026-07-20' },
     '2026-07-20': {
@@ -651,36 +654,57 @@ test('clean successful load seals today and persists without explicit flushNow',
       writeCalls += 1;
       return originalWriteFile.apply(fsp, args);
     };
-    freshStats(file);
+    const stats = freshStats(file);
+    stats.__test.setNowFnForTest(() => new Date(`${sealedDay}T15:00:00.000Z`));
     const persisted = await waitForPersistedJson(
       file,
-      data => data && data[new Date().toISOString().slice(0, 10)] && data.__meta.recordingStartedAt === '2026-07-20',
+      data => data && data[sealedDay] && data.__meta.recordingStartedAt === '2026-07-20',
       'startup seal should persist today without explicit flushNow',
     );
     assert.ok(writeCalls >= 1);
-    assert.deepEqual(persisted[new Date().toISOString().slice(0, 10)], {});
+    assert.deepEqual(persisted[sealedDay], {});
   } finally {
     fsp.writeFile = originalWriteFile;
     cleanup(file, prevEnv);
   }
 });
 
-test('empty install startup seal writes today as an observed quiet day and becomes durable', async () => {
+test('empty install startup seal writes the pinned simulated day and becomes durable', async () => {
   const file = tmpStatsFile('startup-seal-empty');
   const prevEnv = process.env.MISER_STATS_FILE;
-  const today = new Date().toISOString().slice(0, 10);
+  const sealedDay = '2026-07-28';
   try {
-    freshStats(file, {});
+    const stats = freshStats(file, {});
+    stats.__test.setNowFnForTest(() => new Date(`${sealedDay}T15:00:00.000Z`));
     const persisted = await waitForPersistedJson(
       file,
-      data => data && data[today] && data.__meta && data.__meta.recordingStartedAt === today,
+      data => data && data[sealedDay] && data.__meta && data.__meta.recordingStartedAt === sealedDay,
       'empty startup seal should persist today without explicit flushNow',
     );
-    assert.deepEqual(persisted[today], {});
+    assert.deepEqual(persisted[sealedDay], {});
 
-    const stats = require('../src/stats.js');
     assert.equal(stats.getPersistenceStatus().healthy, true);
     assert.equal(stats.getPersistenceStatus().durable, true);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('observation seal writes the simulated day, not the real wall-clock day', () => {
+  const file = tmpStatsFile('seal-simulated-not-real');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const realDay = new Date().toISOString().slice(0, 10);
+  const simulatedDay = '2000-02-03';
+  assert.notEqual(simulatedDay, realDay, 'test requires simulated day to differ from the wall clock');
+  try {
+    const stats = freshStats(file, {});
+    stats.__test.setNowFnForTest(() => new Date(`${simulatedDay}T15:00:00.000Z`));
+    stats.__test.sealTodayObserved();
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.deepEqual(snapshot[simulatedDay], {});
+    assert.equal(snapshot[realDay], undefined);
+    assert.equal(snapshot.__meta.recordingStartedAt, simulatedDay);
   } finally {
     cleanup(file, prevEnv);
   }
@@ -827,15 +851,17 @@ test('fresh install first mid-week write marks earlier current-week days not obs
   const file = tmpStatsFile('runtime-first-mid-week');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-26T11:00:00.000Z';
+  const now = () => new Date('2026-07-28T15:00:00.000Z');
   try {
     const stats = freshStats(file);
+    stats.__test.setNowFnForTest(now);
     stats.recordAnthropicUsage(
       'alpha',
       'anthropic',
       'claude-sonnet-4',
       { input_tokens: 12 },
       null,
-      () => new Date('2026-07-28T15:00:00.000Z'),
+      now,
     );
     await stats.flushNow();
 
@@ -988,6 +1014,7 @@ test('current partially elapsed week ignores future days and stays authoritative
         },
       },
     }));
+    stats.__test.setNowFnForTest(() => new Date('2026-07-28T15:00:00.000Z'));
 
     const current = stats.getStats('9999').weekly.currentWeekToDate;
     assert.equal(current.weekStart, weekKey);

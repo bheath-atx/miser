@@ -82,6 +82,8 @@ const _observationSeal = {
   intervalTimer: null,
 };
 
+let _nowFn = () => new Date();
+
 let _loadStatsNeedsFlush = false;
 let _stats = loadStats();
 if (_loadStatsNeedsFlush) {
@@ -200,9 +202,10 @@ function clearTimer(name) {
 }
 
 function cloneStats() {
-  reconcileWeeklyFromDaily(_stats);
-  pruneWeeklyRetention(_stats);
-  markRuntimeWeeklyCoverageGaps(_stats);
+  const now = defaultNow();
+  reconcileWeeklyFromDaily(_stats, now);
+  pruneWeeklyRetention(_stats, now);
+  markRuntimeWeeklyCoverageGaps(_stats, now);
   return JSON.parse(JSON.stringify(_stats));
 }
 
@@ -374,8 +377,12 @@ function getStatsMeta(statsObj, create = false) {
   return statsObj[STATS_META_KEY];
 }
 
-function todayKey() {
-  return new Date().toISOString().slice(0, 10);
+function defaultNow() {
+  return _nowFn();
+}
+
+function todayKey(now = defaultNow()) {
+  return dayKeyFromDate(now);
 }
 
 function dayKeyFromDate(date) {
@@ -474,8 +481,8 @@ function subscriptionWeekKeyFromDate(date) {
   return subscriptionWeekStartDate(date).toISOString();
 }
 
-function cutoffKeyForDays(days) {
-  const cutoff = new Date();
+function cutoffKeyForDays(days, now = defaultNow()) {
+  const cutoff = new Date(now);
   cutoff.setUTCHours(0, 0, 0, 0);
   cutoff.setUTCDate(cutoff.getUTCDate() - (days - 1));
   return dayKeyFromDate(cutoff);
@@ -563,7 +570,7 @@ function ensureDayObserved(day) {
 function sealTodayObserved() {
   try {
     if (_persistence.lastLoadErrored) return false;
-    const changed = ensureDayObserved(todayKey());
+    const changed = ensureDayObserved(todayKey(defaultNow()));
     if (changed) scheduleFlush(false, 0);
     return changed;
   } catch (err) {
@@ -660,12 +667,11 @@ function validWeekKey(key) {
   return Number.isFinite(d.getTime()) && d.toISOString() === key;
 }
 
-function expectedDailyKeysForWeek(weekKey, now = new Date()) {
+function expectedDailyKeysForWeek(weekKey, now = defaultNow()) {
   if (!validWeekKey(weekKey)) return [];
   const weekStart = new Date(weekKey);
-  const today = todayKey();
   const nowDay = dayKeyFromDate(now);
-  const maxDay = nowDay < today ? nowDay : today;
+  const maxDay = nowDay;
   const start = new Date(Date.UTC(
     weekStart.getUTCFullYear(),
     weekStart.getUTCMonth(),
@@ -685,8 +691,8 @@ function expectedDailyKeysForWeek(weekKey, now = new Date()) {
   return expected;
 }
 
-function dailyCoverageForWeek(statsObj, weekKey) {
-  const expectedDays = expectedDailyKeysForWeek(weekKey);
+function dailyCoverageForWeek(statsObj, weekKey, now = defaultNow()) {
+  const expectedDays = expectedDailyKeysForWeek(weekKey, now);
   const presentDays = expectedDays
     .filter(day => {
       const dayData = statsObj && statsObj[day];
@@ -711,9 +717,9 @@ function nonAuthoritativeReasonForCoverage(coverage) {
   return null;
 }
 
-function coverageMetadataForWeek(statsObj, weekKey) {
+function coverageMetadataForWeek(statsObj, weekKey, now = defaultNow()) {
   if (!validWeekKey(weekKey)) return null;
-  const coverage = dailyCoverageForWeek(statsObj, weekKey);
+  const coverage = dailyCoverageForWeek(statsObj, weekKey, now);
   const reason = nonAuthoritativeReasonForCoverage(coverage);
   return reason ? { reason, coverage } : null;
 }
@@ -722,7 +728,7 @@ function isCoverageAuthorityReason(reason) {
   return reason === 'missing_daily_observation';
 }
 
-function pruneWeeklyRetention(statsObj, now = new Date()) {
+function pruneWeeklyRetention(statsObj, now = defaultNow()) {
   const weekly = statsObj && statsObj[WEEKLY_KEY];
   if (!weekly || typeof weekly !== 'object') return;
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
@@ -837,13 +843,13 @@ function hasHardFailedWeeklyMigration(statsObj) {
   });
 }
 
-function reconcileWeeklyFromDaily(statsObj) {
+function reconcileWeeklyFromDaily(statsObj, now = defaultNow()) {
   if (hasHardFailedWeeklyMigration(statsObj)) return;
   const rebuilt = buildWeeklyFromDaily(statsObj);
   const reconciled = {};
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
     if (validWeekKey(weekKey)) {
-      const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
+      const coverageMeta = coverageMetadataForWeek(statsObj, weekKey, now);
       if (coverageMeta) {
         reconciled[weekKey] = markWeekNonAuthoritative(
           weekData,
@@ -859,14 +865,14 @@ function reconcileWeeklyFromDaily(statsObj) {
   else delete statsObj[WEEKLY_KEY];
 }
 
-function markRuntimeWeeklyCoverageGaps(statsObj) {
+function markRuntimeWeeklyCoverageGaps(statsObj, now = defaultNow()) {
   const weekly = statsObj && statsObj[WEEKLY_KEY];
   if (!isWeeklyContainer(weekly)) return;
   for (const [weekKey, weekData] of Object.entries(weekly)) {
     if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
     const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
     if (meta && meta.authoritative === false && !isCoverageAuthorityReason(meta.reason)) continue;
-    const coverageMeta = coverageMetadataForWeek(statsObj, weekKey);
+    const coverageMeta = coverageMetadataForWeek(statsObj, weekKey, now);
     if (coverageMeta) {
       markWeekNonAuthoritative(weekData, coverageMeta.reason, coverageMeta.coverage);
     } else if (meta && meta.authoritative === false && isCoverageAuthorityReason(meta.reason)) {
@@ -907,7 +913,7 @@ function ensureProjectBucketForWeek(project, week) {
   return ensureOptimizerFields(_stats[WEEKLY_KEY][week][proj]);
 }
 
-function ensureProjectBucket(project, now = new Date()) {
+function ensureProjectBucket(project, now = defaultNow()) {
   return ensureProjectBucketForDay(project, dayKeyFromDate(now));
 }
 
@@ -926,7 +932,7 @@ function ensureMeasuredProjectBucketForWeek(project, week) {
   return _stats[WEEKLY_KEY][week][proj];
 }
 
-function ensureMeasuredProjectBucket(project, now = new Date()) {
+function ensureMeasuredProjectBucket(project, now = defaultNow()) {
   return ensureMeasuredProjectBucketForDay(project, dayKeyFromDate(now));
 }
 
@@ -950,7 +956,7 @@ function ensureWeeklyGuardrailBucket(project, weekKey) {
 // G3: sparse per-day per-project `budget` node { blockedCount, firstBlockedAt }.
 // nowFn() is captured exactly ONCE per invocation; dayKey and firstBlockedAt
 // both derive from that single capture.
-function recordBudgetBlock(project, nowFn = () => new Date()) {
+function recordBudgetBlock(project, nowFn = defaultNow) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'budget')) return 0;
   if (!canRetainMutationAfterLoadFailure('budget')) return 0;
@@ -971,7 +977,7 @@ function recordBudgetBlock(project, nowFn = () => new Date()) {
 // B6: sparse per-day per-project `policy` node { modelDriftCount, contextBloatCount }.
 // Same single-capture nowFn pattern. Returns the updated counts (alert text
 // uses the today-count).
-function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn = () => new Date()) {
+function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn = defaultNow) {
   if (!drift && !bloat) return { modelDriftCount: 0, contextBloatCount: 0 }; // no-op: never write zero node
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'policy')) return { modelDriftCount: 0, contextBloatCount: 0 };
@@ -1020,7 +1026,7 @@ function applyOptimizerStats(bucket, opts = {}) {
 }
 
 // opts: { inputTokensRemoved, cacheBillingDelta, toolsRemoved, techniques }
-function recordStats(project, opts = {}, nowFn = () => new Date()) {
+function recordStats(project, opts = {}, nowFn = defaultNow) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'optimizer')) return;
   if (!canRetainMutationAfterLoadFailure('optimizer')) return;
@@ -1099,7 +1105,7 @@ function applyMeasuredUsage(bucket, providerKey, modelKey, usage, editStats) {
   return hasMeasuredAxis || !!editStats;
 }
 
-function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEdits = null, nowFn = () => new Date()) {
+function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEdits = null, nowFn = defaultNow) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'usage')) return;
   if (!canRetainMutationAfterLoadFailure('usage')) return;
@@ -1294,8 +1300,8 @@ function aggregatePeriod(periodData, projectFilter, weights = DEFAULT_WEIGHTS) {
   return finalizeAggregate(perProject, weights);
 }
 
-function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = new Date()) {
-  reconcileWeeklyFromDaily(_stats);
+function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = defaultNow()) {
+  reconcileWeeklyFromDaily(_stats, now);
   pruneWeeklyRetention(_stats, now);
   const weeklyData = (_stats[WEEKLY_KEY] && typeof _stats[WEEKLY_KEY] === 'object') ? _stats[WEEKLY_KEY] : {};
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
@@ -1374,8 +1380,9 @@ function weeklyAuthorityRollup(weekly) {
 }
 
 function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
+  const now = defaultNow();
   const days = parseDays(daysParam, 7);
-  const cutoffKey = cutoffKeyForDays(days);
+  const cutoffKey = cutoffKeyForDays(days, now);
 
   const perProject = {};
   for (const [day, dayData] of Object.entries(_stats)) {
@@ -1389,7 +1396,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   const aggregate = finalizeAggregate(perProject, weights);
   const persistence = getPersistenceStatus();
   const authoritative = persistence.healthy && persistence.durable;
-  const weekly = getSubscriptionWeeks(projectFilter, weights);
+  const weekly = getSubscriptionWeeks(projectFilter, weights, now);
   const weeklyRollup = weeklyAuthorityRollup(weekly);
 
   return {
@@ -1430,8 +1437,9 @@ function summarizeUsage(usageTree) {
 }
 
 function getDailyTrend(daysParam, projectFilter) {
+  const now = defaultNow();
   const days = parseDays(daysParam, 30, 90);
-  const cutoffKey = cutoffKeyForDays(days);
+  const cutoffKey = cutoffKeyForDays(days, now);
   const entries = [];
 
   const dayKeys = Object.keys(_stats).filter(day => isValidDailyKey(day) && day >= cutoffKey).sort();
@@ -1469,6 +1477,7 @@ function getDailyTrend(daysParam, projectFilter) {
 
 function __resetForTest() {
   _stats = {};
+  _nowFn = () => new Date();
   clearTimer('timer');
   clearTimer('retryTimer');
   clearObservationSealTimers();
@@ -1505,6 +1514,11 @@ function getRawStatsSnapshot() {
   return cloneStats();
 }
 
+function setNowFnForTest(nowFn) {
+  if (typeof nowFn !== 'function') throw new TypeError('nowFn must be a function');
+  _nowFn = nowFn;
+}
+
 module.exports = {
   recordStats,
   recordAnthropicUsage,
@@ -1536,6 +1550,7 @@ module.exports = {
     getRecordingStartedAt,
     ensureDayObserved,
     sealTodayObserved,
+    setNowFnForTest,
     _observationSeal,
     reconcileWeeklyFromDaily,
     dailyCoverageForWeek,
