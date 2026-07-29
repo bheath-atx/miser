@@ -1,0 +1,31 @@
+{
+  "project": "pkachu",
+  "rawTokens": 6,
+  "techniques": [],
+  "inputBody": {
+    "model": "claude-opus-4-8",
+    "max_tokens": 8000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "poll?"
+      }
+    ]
+  },
+  "forwardBody": {
+    "model": "claude-opus-4-8",
+    "max_tokens": 8000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "poll?"
+      }
+    ]
+  },
+  "compactHeaders": {
+    "x-miser-input-tokens-est": "6",
+    "x-miser-poll-class": "likely",
+    "x-miser-compact-hint": "none",
+    "x-miser-techniques": "none"
+  }
+}

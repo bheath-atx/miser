@@ -4,11 +4,14 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const http = require('node:http');
 const https = require('node:https');
-const os = require('node:os');
-const path = require('node:path');
 const { computeCost } = require('./pricing.js');
+const { envOrHomeDefault } = require('./state-paths.js');
 
-const DEFAULT_DEDUP_FILE = path.join(os.homedir(), '.miser-rollup-last.txt');
+const DEFAULT_DEDUP_FILE = envOrHomeDefault(
+  'MISER_DAILY_ROLLUP_DEDUP_FILE',
+  'daily rollup dedup marker',
+  '.miser-rollup-last.txt'
+);
 
 function dayKey(date = new Date()) {
   return date.toISOString().slice(0, 10);
@@ -202,8 +205,13 @@ function startDailyRollupInterval(getStatsSnapshot, opts = {}) {
   return timer;
 }
 
+function buildDailyRollupOpts(_config = {}) {
+  return { advisor: { enabled: false } };
+}
+
 module.exports = {
   DEFAULT_DEDUP_FILE,
+  buildDailyRollupOpts,
   buildRollupText,
   emitDailyRollup,
   postPkachu,

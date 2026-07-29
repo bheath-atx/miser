@@ -3,6 +3,7 @@
 const { parseContextEditProjects } = require('./context-management.js');
 const { parseBudgets, parseBudgetGrace } = require('./budgets.js');
 const { parsePolicy } = require('./policy-watchdog.js');
+const { parsePollRewriteEnv } = require('./poll-rewrite.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
 // (which collides with the panel routing grammar). Exported for unit tests so
@@ -13,6 +14,7 @@ function validateStartupConfig(cfg) {
     ['policy',              cfg.policy],
     ['contextEditProjects', cfg.contextEditProjects],
     ['toolAllowlists',      cfg.toolAllowlists],
+    ['pollRewrite',         cfg.pollRewriteProjects],
   ];
   for (const [label, map] of maps) {
     if (!map || typeof map !== 'object') continue;
@@ -38,6 +40,13 @@ function validateStartupConfig(cfg) {
 }
 
 const contextEditConfig = parseContextEditProjects(process.env.MISER_CONTEXT_EDIT_PROJECTS || '');
+const pollRewriteConfig = parsePollRewriteEnv({
+  raw: process.env.MISER_POLL_REWRITE || '',
+  windowMs: process.env.MISER_POLL_REWRITE_BREAKER_WINDOW_MS,
+  threshold: process.env.MISER_POLL_REWRITE_BREAKER_THRESHOLD,
+  resetMs: process.env.MISER_POLL_REWRITE_BREAKER_RESET_MS,
+});
+for (const w of pollRewriteConfig.warnings) console.warn(w);
 
 module.exports = {
   port: parseInt(process.env.MISER_PORT || '20128', 10),
@@ -72,6 +81,8 @@ module.exports = {
   compactHintUrgentFraction: parseFloat(process.env.COMPACT_HINT_URGENT_FRACTION ?? '0.70'),
   compactHintRecommendFraction: parseFloat(process.env.COMPACT_HINT_RECOMMEND_FRACTION ?? '0.40'),
   contextEditProjects: contextEditConfig.projects,
+  pollRewriteProjects: pollRewriteConfig.projects,
+  pollRewriteBreaker: pollRewriteConfig.breaker,
   // Sprint B guardrails (fail-closed-to-OFF: null ↔ feature fully OFF).
   // G3 per-project daily USD budget caps + grace list; B6 policy watchdog.
   // Parsers warn at startup only when the relevant env var is actually set.

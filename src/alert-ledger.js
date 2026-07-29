@@ -2,8 +2,7 @@
 
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
-const path = require('node:path');
-const os = require('node:os');
+const { envOrHomeDefault } = require('./state-paths.js');
 
 // At-most-once-per-(key, UTC-day) guard for outbound alerts (Sprint B §3).
 // Key convention: `<feature>:<project>:<type>` (e.g. `budget:pkachu:warn`,
@@ -22,8 +21,7 @@ const os = require('node:os');
 //   empty ledger + one warning (worst case: one duplicate alert, accepted).
 
 function defaultLedgerFile() {
-  return process.env.MISER_ALERT_LEDGER_FILE
-    || path.join(os.homedir(), '.miser-alert-ledger.json');
+  return envOrHomeDefault('MISER_ALERT_LEDGER_FILE', 'alert ledger', '.miser-alert-ledger.json');
 }
 
 function createLedger(filePath, nowFn = () => new Date()) {

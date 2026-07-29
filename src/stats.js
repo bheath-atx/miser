@@ -2,14 +2,12 @@
 
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
-const path = require('node:path');
-const os = require('node:os');
 const { computeCost } = require('./pricing.js');
+const { envOrHomeDefault } = require('./state-paths.js');
 
 // Persisted per-day x per-project x per-technique stats.
 // Atomic write (temp+rename) so process restarts do not corrupt the file.
-const STATS_FILE = process.env.MISER_STATS_FILE
-  || path.join(os.homedir(), '.miser-stats.json');
+const STATS_FILE = envOrHomeDefault('MISER_STATS_FILE', 'stats', '.miser-stats.json');
 
 let _stats = loadStats();
 
@@ -269,6 +267,57 @@ function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn
   return { modelDriftCount: bucket.policy.modelDriftCount, contextBloatCount: bucket.policy.contextBloatCount };
 }
 
+function emptyPollRewriteBucket() {
+  return {
+    appliedCount: 0,
+    leverCounts: { maxTokens: 0, thinking: 0, model: 0 },
+    skippedInvalid: 0,
+    breakerTrips: 0,
+  };
+}
+
+function hasPollRewriteActivity(node) {
+  if (!node || typeof node !== 'object') return false;
+  const levers = node.leverCounts || {};
+  return (node.appliedCount || 0) > 0
+    || (node.skippedInvalid || 0) > 0
+    || (node.breakerTrips || 0) > 0
+    || (levers.maxTokens || 0) > 0
+    || (levers.thinking || 0) > 0
+    || (levers.model || 0) > 0;
+}
+
+function addPollRewrite(target, source) {
+  if (!hasPollRewriteActivity(source)) return;
+  if (!target.pollRewrite) target.pollRewrite = emptyPollRewriteBucket();
+  target.pollRewrite.appliedCount += source.appliedCount || 0;
+  target.pollRewrite.skippedInvalid += source.skippedInvalid || 0;
+  target.pollRewrite.breakerTrips += source.breakerTrips || 0;
+  const levers = source.leverCounts || {};
+  for (const key of ['maxTokens', 'thinking', 'model']) {
+    target.pollRewrite.leverCounts[key] += levers[key] || 0;
+  }
+}
+
+function recordPollRewriteStats(project, event = {}, nowFn = () => new Date()) {
+  const now = nowFn();
+  const dayKey = now.toISOString().slice(0, 10);
+  const bucket = ensureGuardrailBucket(project, dayKey);
+  if (!bucket.pollRewrite) bucket.pollRewrite = emptyPollRewriteBucket();
+  const node = bucket.pollRewrite;
+  const levers = Array.isArray(event.levers) ? event.levers : [];
+  if (levers.length > 0) {
+    node.appliedCount += 1;
+    for (const lever of levers) {
+      if (Object.prototype.hasOwnProperty.call(node.leverCounts, lever)) node.leverCounts[lever] += 1;
+    }
+  }
+  if (event.skipped) node.skippedInvalid += 1;
+  if (event.breakerTrip) node.breakerTrips += 1;
+  scheduleFlush();
+  return JSON.parse(JSON.stringify(node));
+}
+
 // opts: { inputTokensRemoved, cacheBillingDelta, toolsRemoved, techniques }
 function recordStats(project, opts = {}) {
   const bucket = ensureProjectBucket(project);
@@ -445,7 +494,8 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
       // Guardrail activity only counts when counts are positive (sparse contract §2.3).
       const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
         || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0));
-      if (!hasLegacy && !hasGuardrail) continue;
+      const hasPollRewrite = hasPollRewriteActivity(projData.pollRewrite);
+      if (!hasLegacy && !hasGuardrail && !hasPollRewrite) continue;
       if (!perProject[proj]) perProject[proj] = {};
       const target = perProject[proj];
       if (hasLegacy && !target.dedup) {
@@ -493,6 +543,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
           target.policy.contextBloatCount += bc;
         }
       }
+      addPollRewrite(target, projData.pollRewrite);
     }
   }
 
@@ -615,6 +666,7 @@ module.exports = {
   recordAnthropicUsage,
   recordBudgetBlock,
   recordPolicyEvent,
+  recordPollRewriteStats,
   getStats,
   getDailyTrend,
   loadStats,

@@ -7,8 +7,7 @@ const os = require('node:os');
 const { createProxy } = require('./proxy.js');
 const { flushNow, getRawStatsSnapshot } = require('./stats.js');
 const { startDailyRollupInterval } = require('./daily-rollup.js');
-const { buildGuardDeps } = require('./budgets.js');
-const { wireCacheThrashDeps } = require('./cache-thrash.js');
+const { startProduction } = require('./bootstrap.js');
 const config = require('./config.js');
 const { validateStartupConfig } = config;
 
@@ -52,17 +51,12 @@ try {
 // with the panel routing grammar (contains '--'). Throws with a clear message.
 validateStartupConfig(config);
 
-// Sprint B guardrail wiring (normative §2.5, assembled by buildGuardDeps):
-// ledger creation is CONDITIONAL — when both MISER_BUDGETS and MISER_POLICY
-// are OFF, no ledger I/O happens at startup and guardDeps stays empty (zero
-// overhead). checkContextBloat is only wired when MISER_POLICY is active.
-const guardDeps = buildGuardDeps(config);
-
-// B2: wire cache-thrash detector into guardDeps (no-op when MIN_REQUESTS=0).
-wireCacheThrashDeps(config, guardDeps);
-
-const server = http.createServer(createProxy({ guardDeps }));
-startDailyRollupInterval(getRawStatsSnapshot);
+const { server } = startProduction(config, {
+  createServer: http.createServer,
+  createProxy,
+  startDailyRollupInterval,
+  getRawStatsSnapshot,
+});
 
 server.listen(config.port, '127.0.0.1', () => {
   writeLock();
@@ -77,6 +71,9 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log(`[miser] retry: max ${config.retryMaxAttempts} attempts, base ${config.retryBaseMs}ms jittered backoff`);
   console.log(`[miser] breaker: threshold=${config.breakerThreshold} reset=${config.breakerResetMs}ms per-upstream`);
   console.log(`[miser] sub-cap: codex 5h cap ${config.codex5hCap > 0 ? `${config.codex5hCap} req` : 'OFF'} weekly ${config.codexWeeklyCap > 0 ? `${config.codexWeeklyCap} req` : 'OFF'}`);
+  console.log(`[miser] poll-rewrite: ${Object.keys(config.pollRewriteProjects || {}).length > 0 && config.pollRewriteBreaker
+    ? `ON (${Object.keys(config.pollRewriteProjects).length} project(s), breaker window=${config.pollRewriteBreaker.windowMs}ms threshold=${config.pollRewriteBreaker.threshold} reset=${config.pollRewriteBreaker.resetMs}ms)`
+    : 'OFF'}`);
   console.log(`[miser] thrash-detector: ${config.cacheThrashMinRequests > 0
     ? `ON (warm after ${config.cacheThrashMinRequests} req, spike=${config.cacheThrashSpikeRatio}×, ring=${config.cacheThrashRingSize})`
     : 'OFF (MISER_CACHE_THRASH_MIN_REQUESTS=0)'}`);

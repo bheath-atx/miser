@@ -1,8 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
+const { envOrHomeDefault } = require('./state-paths.js');
 
 // Subscription OAuth bearer provider for the Codex/OpenAI failover path.
 //
@@ -23,8 +22,7 @@ const path = require('node:path');
 // touch the real ~/.codex/auth.json. The real path is only ever read through
 // the default production provider.
 
-const DEFAULT_AUTH_PATH = process.env.CODEX_AUTH_PATH
-  || path.join(os.homedir(), '.codex', 'auth.json');
+const DEFAULT_AUTH_PATH = envOrHomeDefault('CODEX_AUTH_PATH', 'codex oauth', '.codex', 'auth.json');
 
 class OAuthUnavailableError extends Error {
   constructor(message) {

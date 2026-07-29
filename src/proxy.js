@@ -30,6 +30,7 @@ const COMPACT_HEADER_NAMES = [
   'x-miser-oversized-turns',
   'x-miser-compact-hint',
   'x-miser-techniques',
+  'x-miser-poll-rewrite',
 ];
 
 function readBody(req) {
@@ -179,6 +180,21 @@ function updateContextBreaker(project, injected, statusCode) {
 
 function shouldRecordInjectedStats(statusCode) {
   return Number.isFinite(statusCode) && statusCode >= 200 && statusCode < 300;
+}
+
+function hasPollRewriteProjects(pollRewrite) {
+  return !!(pollRewrite && pollRewrite.projects && Object.keys(pollRewrite.projects).length > 0);
+}
+
+function pollRewriteEvent(result, breakerTrip) {
+  if (!result) return null;
+  if (result.skipped) return { skipped: true };
+  if (Array.isArray(result.applied) && result.applied.length > 0) {
+    const event = { levers: [...result.applied] };
+    if (breakerTrip) event.breakerTrip = true;
+    return event;
+  }
+  return null;
 }
 
 function trackRequest(now = Date.now()) {
@@ -378,6 +394,7 @@ function createProxy(deps = {}) {
 
       let forwardBody = prunedBody;
       let forwardHeaders = req.headers;
+      let pollRewriteResult = null;
       if (format === 'anthropic') {
         const injected = injectContextManagement(prunedBody, req.headers, project, contextProjectConfig());
         forwardBody = injected.body;
@@ -388,10 +405,67 @@ function createProxy(deps = {}) {
 
       if (!c1Injected) recordStats(project, legacyStats);
 
+      const pollRewrite = deps.pollRewrite;
+      if (format === 'anthropic' && hasPollRewriteProjects(pollRewrite)) {
+        try {
+          const now = pollRewrite.nowFn();
+          const nowMs = now.getTime();
+          if (pollRewrite.shouldRewrite(project, panel, compactHeaders['x-miser-poll-class'], format,
+              pollRewrite.projects, pollRewrite.breaker, nowMs)) {
+            const knobs = pollRewrite.projects[project];
+            const result = pollRewrite.applyPollRewrite(forwardBody, knobs);
+            if (result && result.skipped) {
+              pollRewriteResult = result;
+            } else if (result && Array.isArray(result.applied) && result.applied.length > 0) {
+              const header = pollRewrite.formatRewriteHeader(result.applied, result.details || {});
+              if (header) {
+                forwardBody = result.body;
+                pollRewriteResult = result;
+                res.setHeader('x-miser-poll-rewrite', header);
+              }
+            }
+          }
+        } catch (e) {
+          pollRewriteResult = null;
+          forwardBody = c1Injected ? forwardBody : prunedBody;
+          console.warn('[miser] poll-rewrite error (passthrough):', e.message);
+          if (typeof res.removeHeader === 'function') res.removeHeader('x-miser-poll-rewrite');
+        }
+      }
+
       // Forward the REDUCED body (I6) — every leg serializes THIS body, so the
       // hoisted top-level `system` and any cache hint reach the wire on all legs.
-      await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format,
-        { ...deps, panel });
+      let routeError = null;
+      try {
+        await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format,
+          { ...deps, panel });
+      } catch (e) {
+        routeError = e;
+      }
+      if (pollRewriteResult && hasPollRewriteProjects(pollRewrite)
+          && (pollRewriteResult.skipped || (pollRewriteResult.applied || []).length > 0)) {
+        const applied = Array.isArray(pollRewriteResult.applied) && pollRewriteResult.applied.length > 0;
+        const ok = !routeError && Number(res.statusCode) < 400;
+        let tripped = false;
+        const now = pollRewrite.nowFn();
+        const nowMs = now.getTime();
+        if (applied) {
+          try {
+            const outcome = pollRewrite.breaker.recordOutcome(project, ok, nowMs) || {};
+            tripped = outcome.tripped === true;
+          } catch (e) {
+            console.warn('[miser] poll-rewrite breaker error:', e.message);
+            tripped = false;
+          }
+        }
+        try {
+          const event = pollRewriteEvent(pollRewriteResult, tripped);
+          if (event) pollRewrite.recordPollRewriteStats(project, event, () => now);
+        } catch (e) {
+          console.warn('[miser] poll-rewrite stats error:', e.message);
+        }
+      }
+      if (routeError) throw routeError;
       if (c1Injected && (res.statusCode < 200 || res.statusCode >= 300)) {
         console.warn(`[miser] c1-injected non-2xx project=${project} status=${res.statusCode}`);
       }
