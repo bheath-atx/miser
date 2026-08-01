@@ -70,9 +70,30 @@ async function loadPanels() {
     }
     const raw = await fsp.readFile(PANEL_STATS_FILE, 'utf8');
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return map;
+    // A file we did not write is a LOAD FAILURE, not a healthy empty file.
+    // Returning an empty Map here would clear the load-error state below and
+    // let the next flush overwrite real accounting with `{}`. Mirror
+    // src/stats.js loadStats(): raise it into the same catch so invalid shape
+    // degrades exactly like invalid JSON (refuse-overwrite, degraded status).
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      const err = new Error('panel stats file root must be an object');
+      err.code = 'LOAD_SHAPE';
+      throw err;
+    }
+    let retained = 0;
     for (const [key, bucket] of Object.entries(parsed)) {
-      if (typeof key === 'string' && key.includes('--')) map.set(key, sanitizeBucket(bucket));
+      if (typeof key === 'string' && key.includes('--')) {
+        map.set(key, sanitizeBucket(bucket));
+        retained += 1;
+      }
+    }
+    // `{}` is a legitimate empty file. A non-empty object with no
+    // `project--panel` key is not something this module ever wrote, so it is
+    // the same laundering hazard as a bad root shape.
+    if (retained === 0 && Object.keys(parsed).length > 0) {
+      const err = new Error('panel stats file contains no project--panel keys');
+      err.code = 'LOAD_SHAPE';
+      throw err;
     }
   } catch (err) {
     if (err && err.code !== 'ENOENT') {

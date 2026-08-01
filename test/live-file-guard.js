@@ -8,8 +8,12 @@ const path = require('node:path');
 const GUARD_ENV = 'MISER_LIVE_FILE_GUARD';
 const home = os.homedir();
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), `miser-test-home-guard-${process.pid}-`));
+// Every `process.env.X || path.join(os.homedir(), ...)` default in src/ must
+// appear here. live-file-guard.test.js scans src/ and fails if one is missing,
+// so adding a new HOME-backed file cannot silently escape the guard again.
 const homeDefaults = new Map([
   ['MISER_STATS_FILE', path.join(home, '.miser-stats.json')],
+  ['MISER_PANEL_STATS_FILE', path.join(home, '.miser-panel-stats.json')],
   ['MISER_ALERT_LEDGER_FILE', path.join(home, '.miser-alert-ledger.json')],
   ['MISER_ROLLUP_DEDUP_FILE', path.join(home, '.miser-rollup-last.txt')],
   ['CODEX_AUTH_PATH', path.join(home, '.codex', 'auth.json')],
@@ -17,6 +21,7 @@ const homeDefaults = new Map([
 
 const isolatedDefaults = {
   MISER_STATS_FILE: path.join(tmpRoot, 'miser-stats.json'),
+  MISER_PANEL_STATS_FILE: path.join(tmpRoot, 'miser-panel-stats.json'),
   MISER_ALERT_LEDGER_FILE: path.join(tmpRoot, 'miser-alert-ledger.json'),
   MISER_ROLLUP_DEDUP_FILE: path.join(tmpRoot, 'miser-rollup-last.txt'),
   CODEX_AUTH_PATH: path.join(tmpRoot, 'codex-auth.json'),
@@ -145,7 +150,7 @@ patchPromiseFs();
 const originalHomedir = os.homedir;
 os.homedir = function guardedHomedir() {
   const stack = new Error().stack || '';
-  if (/src[\/\\](stats|alert-ledger|daily-rollup|oauth)\.js/.test(stack)) {
+  if (/src[\/\\](stats|panel-stats|alert-ledger|daily-rollup|oauth)\.js/.test(stack)) {
     throw new Error('[miser-live-file-guard] blocked HOME default resolution from protected miser module');
   }
   return originalHomedir.call(this);

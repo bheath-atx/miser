@@ -3,6 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 const guard = global.__miserLiveFileGuard;
@@ -21,11 +22,32 @@ function runGuarded(script) {
   });
 }
 
-test('live file guard isolates all four HOME-backed defaults through env', () => {
-  for (const envName of ['MISER_STATS_FILE', 'MISER_ALERT_LEDGER_FILE', 'MISER_ROLLUP_DEDUP_FILE', 'CODEX_AUTH_PATH']) {
+// Driven off the guard's own list rather than a copy of it: a hardcoded list
+// here is what let MISER_PANEL_STATS_FILE ship unguarded.
+test('live file guard isolates every HOME-backed default through env', () => {
+  assert.ok(guard.homeDefaults.size >= 5, 'guard must cover at least the five known HOME defaults');
+  for (const envName of guard.homeDefaults.keys()) {
     assert.ok(process.env[envName], `${envName} should be set by the test guard`);
     assert.doesNotThrow(() => guard.assertSafeResolvedPath(envName, process.env[envName]));
     assert.match(process.env[envName], /miser-test-home-guard-/);
+  }
+});
+
+test('every HOME default in src/ is covered by the guard', () => {
+  const srcDir = path.join(__dirname, '..', 'src');
+  const found = new Map();
+  for (const name of fs.readdirSync(srcDir).filter(f => f.endsWith('.js'))) {
+    const text = fs.readFileSync(path.join(srcDir, name), 'utf8');
+    const re = /process\.env\.([A-Z0-9_]+)\s*\|\|\s*path\.join\(\s*os\.homedir\(\)/g;
+    let match;
+    while ((match = re.exec(text)) !== null) found.set(match[1], name);
+  }
+  assert.ok(found.size >= 5, `expected to find the HOME-backed defaults in src/; found ${found.size}`);
+  for (const [envName, file] of found) {
+    assert.ok(
+      guard.homeDefaults.has(envName),
+      `src/${file} resolves ${envName} against HOME but the live-file guard does not protect it`,
+    );
   }
 });
 
@@ -42,6 +64,7 @@ test('live file guard fails loudly when a guarded path resolves to its HOME defa
 test('protected modules cannot resolve HOME defaults when their env is unset', () => {
   const cases = [
     ['MISER_STATS_FILE', "require('./src/stats.js')"],
+    ['MISER_PANEL_STATS_FILE', "require('./src/panel-stats.js')"],
     ['MISER_ALERT_LEDGER_FILE', "require('./src/alert-ledger.js').createLedger()"],
     ['MISER_ROLLUP_DEDUP_FILE', "require('./src/daily-rollup.js')"],
     ['CODEX_AUTH_PATH', "require('./src/oauth.js')"],

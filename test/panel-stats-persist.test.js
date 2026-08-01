@@ -125,20 +125,70 @@ test('panel stats missing and corrupt files fail soft to empty', async () => {
   }
 });
 
-test('panel stats invalid JSON shapes load as empty', async () => {
+test('panel stats unreadable-shape files degrade and refuse to overwrite the file', async () => {
   const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  // Each of these is a file this module did not write. Loading one as a
+  // healthy-but-empty map would make the next flush replace whatever is on
+  // disk with `{}` — silent loss of real accounting. The contract is: degrade
+  // loudly, and never write over a file we could not read.
   for (const [name, value] of [
     ['zero', ''],
     ['array', '[]'],
     ['scalar', '"nope"'],
+    ['null-root', 'null'],
+    ['no-panel-keys', '{"totally":"unrelated"}'],
   ]) {
     const file = tmpPanelFile(name);
     try {
       fs.writeFileSync(file, value, 'utf8');
-      assert.deepEqual((await freshLoadedPanelStats(file)).getPanelStats(), {});
+      const panels = await freshLoadedPanelStats(file);
+
+      assert.deepEqual(panels.getPanelStats(), {}, `${name}: nothing is recoverable from the file`);
+
+      const status = panels.getPersistenceStatus();
+      assert.equal(status.lastLoadErrored, true, `${name}: load must be recorded as failed`);
+      assert.equal(status.healthy, false, `${name}: status must report degraded`);
+      assert.equal(status.durable, false, `${name}: nothing is durable after a failed load`);
+
+      panels.recordPanelUsage('alpha', 'orch', { input_tokens: 5 },
+        () => new Date('2026-07-27T12:00:00.000Z'));
+      const flushed = await panels.flushNow();
+      assert.equal(flushed.ok, false, `${name}: flush must refuse after a failed load`);
+
+      assert.equal(fs.readFileSync(file, 'utf8'), value, `${name}: the file on disk must be untouched`);
     } finally {
       cleanup(file, prevEnv);
     }
+  }
+});
+
+test('panel stats refuse-overwrite protects real accounting behind an unreadable file', async () => {
+  const file = tmpPanelFile('shape-preserves-accounting');
+  const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  try {
+    // Write real accounting, then corrupt only the ROOT SHAPE (valid JSON).
+    // This is the case that used to be laundered into authoritative empty
+    // state: the next flush overwrote the surviving numbers with `{}`.
+    let panels = await freshLoadedPanelStats(file);
+    panels.recordPanelUsage('alpha', 'orch', { input_tokens: 100, output_tokens: 20 },
+      () => new Date('2026-07-27T12:00:00.000Z'));
+    await panels.flushNow();
+    const realAccounting = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(realAccounting['alpha--orch'].input, 100);
+
+    fs.writeFileSync(file, JSON.stringify([realAccounting]), 'utf8');
+
+    panels = await freshLoadedPanelStats(file);
+    panels.recordPanelUsage('beta', 'builder', { input_tokens: 7 },
+      () => new Date('2026-07-27T13:00:00.000Z'));
+    const flushed = await panels.flushNow();
+
+    assert.equal(flushed.ok, false, 'flush must refuse rather than overwrite');
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(onDisk, [realAccounting], 'the recoverable numbers must still be on disk');
+    assert.equal(panels.getPersistenceStatus().lastLoadErrored, true);
+  } finally {
+    cleanup(file, prevEnv);
   }
 });
 

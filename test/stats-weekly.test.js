@@ -84,6 +84,22 @@ function fakeReq(url) {
   };
 }
 
+// A CHANGING injected clock whose second read has already crossed UTC
+// midnight. Code that captures `now` once sees only instants[0]; code that
+// re-reads the clock mid-answer sees the rollover and derives a different day
+// for part of the result. `clock.reads` is the proof of single capture: a
+// correct read path leaves it at length 1.
+function rolloverClock(instants) {
+  const reads = [];
+  const clock = () => {
+    const iso = instants[Math.min(reads.length, instants.length - 1)];
+    reads.push(iso);
+    return new Date(iso);
+  };
+  clock.reads = reads;
+  return clock;
+}
+
 function sparseStatsWithRecordingStart(recordingStartedAt, entries = {}) {
   return {
     __meta: { recordingStartedAt },
@@ -821,7 +837,9 @@ test('empty daily stats have missing daily observation coverage until a day is o
     assert.equal(snapshot.__meta, undefined);
     assert.equal(stats.__test.getRecordingStartedAt(snapshot), null);
 
-    const coverage = stats.__test.dailyCoverageForWeek(snapshot, weekKey);
+    // Explicit instant, not the ambient clock: the expected-day set below is
+    // only correct for an observer standing at the end of that week.
+    const coverage = stats.__test.dailyCoverageForWeek(snapshot, weekKey, new Date('2026-07-25T23:00:00.000Z'));
     assert.equal(coverage.complete, false);
     assert.deepEqual(coverage.presentDays, []);
     assert.deepEqual(coverage.missingDays, [
@@ -847,11 +865,11 @@ test('empty daily stats have missing daily observation coverage until a day is o
   }
 });
 
-test('fresh install first mid-week write marks earlier current-week days not observed', async () => {
+test('fresh install first mid-week write marks earlier current-week days not observed, from a single captured clock', async () => {
   const file = tmpStatsFile('runtime-first-mid-week');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-26T11:00:00.000Z';
-  const now = () => new Date('2026-07-28T15:00:00.000Z');
+  const now = () => new Date('2026-07-28T23:59:59.900Z');
   try {
     const stats = freshStats(file);
     stats.__test.setNowFnForTest(now);
@@ -865,15 +883,30 @@ test('fresh install first mid-week write marks earlier current-week days not obs
     );
     await stats.flushNow();
 
-    const current = stats.getStats('9999').weekly.currentWeekToDate;
+    // Swap in a clock that rolls into 2026-07-29 on its SECOND read. The read
+    // below must answer entirely from the first instant: if any part of the
+    // weekly path re-reads the clock, 2026-07-29 appears as an expected-but-
+    // missing day and the coverage assertions change.
+    const clock = rolloverClock(['2026-07-28T23:59:59.999Z', '2026-07-29T00:00:00.001Z']);
+    stats.__test.setNowFnForTest(clock);
+
+    const result = stats.getStats('9999');
+    assert.equal(
+      clock.reads.length,
+      1,
+      `getStats() must capture the clock exactly once; reads=${JSON.stringify(clock.reads)}`,
+    );
+    const current = result.weekly.currentWeekToDate;
     assert.equal(current.weekStart, weekKey);
     assert.equal(current.authoritative, false);
     assert.equal(current.degraded, true);
     assert.equal(current.nonAuthoritativeReason, 'missing_daily_observation');
     assert.deepEqual(current.coverage.presentDays, ['2026-07-28']);
+    // 2026-07-29 must NOT appear here: it is only "expected" to an observer
+    // that re-read the clock after the rollover.
     assert.deepEqual(current.coverage.missingDays, ['2026-07-26', '2026-07-27']);
     assert.equal(current.usage.alpha.anthropic['claude-sonnet-4'].input, 12);
-    assert.equal(stats.getStats('9999').weekly.authoritative, false);
+    assert.equal(result.weekly.authoritative, false);
 
     const snapshot = stats.getRawStatsSnapshot();
     assert.equal(snapshot.__weekly[weekKey].__meta.authoritative, false);
@@ -997,7 +1030,7 @@ test('sparse quiet-day gaps replace stored weekly value and stay non-authoritati
   }
 });
 
-test('current partially elapsed week ignores future days and stays authoritative', () => {
+test('current partially elapsed week stays authoritative across a UTC-midnight rollover mid-read', () => {
   const file = tmpStatsFile('migration-current-week');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-26T11:00:00.000Z';
@@ -1014,9 +1047,21 @@ test('current partially elapsed week ignores future days and stays authoritative
         },
       },
     }));
-    stats.__test.setNowFnForTest(() => new Date('2026-07-28T15:00:00.000Z'));
+    // Every elapsed day of the week is observed as of 2026-07-28T23:59:59.999Z,
+    // so the week is authoritative. One instant later it is 2026-07-29, a day
+    // with no observation yet. A request that reads the clock twice straddles
+    // that line and reports the week as degraded on the strength of a day that
+    // had not begun when the request started.
+    const clock = rolloverClock(['2026-07-28T23:59:59.999Z', '2026-07-29T00:00:00.001Z']);
+    stats.__test.setNowFnForTest(clock);
 
-    const current = stats.getStats('9999').weekly.currentWeekToDate;
+    const result = stats.getStats('9999');
+    assert.equal(
+      clock.reads.length,
+      1,
+      `getStats() must capture the clock exactly once; reads=${JSON.stringify(clock.reads)}`,
+    );
+    const current = result.weekly.currentWeekToDate;
     assert.equal(current.weekStart, weekKey);
     assert.equal(current.authoritative, true);
     assert.equal(current.degraded, false);
@@ -1024,6 +1069,7 @@ test('current partially elapsed week ignores future days and stays authoritative
     assert.equal(current.coverage, undefined);
     assert.equal(current.usage.alpha.anthropic.model.input, 4);
     assert.equal(current.usage.alpha.anthropic.model.requests, 1);
+    assert.equal(result.weekly.authoritative, true);
   } finally {
     cleanup(file, prevEnv);
   }
@@ -1046,6 +1092,11 @@ test('real-file-shape migration treats existing 2026-07-14 through 2026-07-28 ke
     };
 
     const stats = freshStats(file, seed);
+    // Pin the clock: the seed observes days through 2026-07-28, so "the current
+    // week is fully covered" is only true to an observer standing on
+    // 2026-07-28. Left on the ambient clock this test asserted a fact about the
+    // real calendar and went red on 2026-07-29.
+    stats.__test.setNowFnForTest(() => new Date('2026-07-28T15:00:00.000Z'));
     const snapshot = stats.getRawStatsSnapshot();
     assert.equal(snapshot.__meta.recordingStartedAt, '2026-07-14');
     assert.deepEqual(

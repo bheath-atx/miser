@@ -180,8 +180,9 @@ function loadStats() {
       && Object.prototype.hasOwnProperty.call(meta, DAILY_RETENTION_WATERMARK_KEY));
     const removedLegacyOnlyBoundary = migrateStatsMeta(parsed);
     const derivedBoundary = removedLegacyOnlyBoundary ? false : deriveRecordingStartedAtFromDaily(parsed);
-    reconcileWeeklyFromDaily(parsed);
-    pruneWeeklyRetention(parsed);
+    const loadNow = defaultNow();
+    reconcileWeeklyFromDaily(parsed, loadNow);
+    pruneWeeklyRetention(parsed, loadNow);
     if (hadLegacyBoundary || derivedBoundary) _loadStatsNeedsFlush = true;
   } catch (err) {
     console.error('[miser/stats] ERROR stats migration/retention failed; preserving parsed daily stats:', err.message);
@@ -381,8 +382,21 @@ function defaultNow() {
   return _nowFn();
 }
 
-function todayKey(now = defaultNow()) {
-  return dayKeyFromDate(now);
+// Clock-dependent helpers take `now` as a REQUIRED argument. A `now =
+// defaultNow()` default silently converts a missed hand-off into a second
+// clock read, so a request crossing UTC midnight (or a test clock that
+// advances) computes one part of an answer from one instant and another part
+// from a later one. Requiring the argument turns that into a loud failure at
+// the call site instead of a wrong-but-plausible number.
+function requireNow(now, fnName) {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    throw new TypeError(`[miser/stats] ${fnName}() requires an explicit \`now\` Date captured by the caller`);
+  }
+  return now;
+}
+
+function todayKey(now) {
+  return dayKeyFromDate(requireNow(now, 'todayKey'));
 }
 
 function dayKeyFromDate(date) {
@@ -481,7 +495,8 @@ function subscriptionWeekKeyFromDate(date) {
   return subscriptionWeekStartDate(date).toISOString();
 }
 
-function cutoffKeyForDays(days, now = defaultNow()) {
+function cutoffKeyForDays(days, now) {
+  requireNow(now, 'cutoffKeyForDays');
   const cutoff = new Date(now);
   cutoff.setUTCHours(0, 0, 0, 0);
   cutoff.setUTCDate(cutoff.getUTCDate() - (days - 1));
@@ -667,7 +682,8 @@ function validWeekKey(key) {
   return Number.isFinite(d.getTime()) && d.toISOString() === key;
 }
 
-function expectedDailyKeysForWeek(weekKey, now = defaultNow()) {
+function expectedDailyKeysForWeek(weekKey, now) {
+  requireNow(now, 'expectedDailyKeysForWeek');
   if (!validWeekKey(weekKey)) return [];
   const weekStart = new Date(weekKey);
   const nowDay = dayKeyFromDate(now);
@@ -691,8 +707,8 @@ function expectedDailyKeysForWeek(weekKey, now = defaultNow()) {
   return expected;
 }
 
-function dailyCoverageForWeek(statsObj, weekKey, now = defaultNow()) {
-  const expectedDays = expectedDailyKeysForWeek(weekKey, now);
+function dailyCoverageForWeek(statsObj, weekKey, now) {
+  const expectedDays = expectedDailyKeysForWeek(weekKey, requireNow(now, 'dailyCoverageForWeek'));
   const presentDays = expectedDays
     .filter(day => {
       const dayData = statsObj && statsObj[day];
@@ -717,7 +733,8 @@ function nonAuthoritativeReasonForCoverage(coverage) {
   return null;
 }
 
-function coverageMetadataForWeek(statsObj, weekKey, now = defaultNow()) {
+function coverageMetadataForWeek(statsObj, weekKey, now) {
+  requireNow(now, 'coverageMetadataForWeek');
   if (!validWeekKey(weekKey)) return null;
   const coverage = dailyCoverageForWeek(statsObj, weekKey, now);
   const reason = nonAuthoritativeReasonForCoverage(coverage);
@@ -728,7 +745,8 @@ function isCoverageAuthorityReason(reason) {
   return reason === 'missing_daily_observation';
 }
 
-function pruneWeeklyRetention(statsObj, now = defaultNow()) {
+function pruneWeeklyRetention(statsObj, now) {
+  requireNow(now, 'pruneWeeklyRetention');
   const weekly = statsObj && statsObj[WEEKLY_KEY];
   if (!weekly || typeof weekly !== 'object') return;
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
@@ -843,7 +861,8 @@ function hasHardFailedWeeklyMigration(statsObj) {
   });
 }
 
-function reconcileWeeklyFromDaily(statsObj, now = defaultNow()) {
+function reconcileWeeklyFromDaily(statsObj, now) {
+  requireNow(now, 'reconcileWeeklyFromDaily');
   if (hasHardFailedWeeklyMigration(statsObj)) return;
   const rebuilt = buildWeeklyFromDaily(statsObj);
   const reconciled = {};
@@ -865,7 +884,8 @@ function reconcileWeeklyFromDaily(statsObj, now = defaultNow()) {
   else delete statsObj[WEEKLY_KEY];
 }
 
-function markRuntimeWeeklyCoverageGaps(statsObj, now = defaultNow()) {
+function markRuntimeWeeklyCoverageGaps(statsObj, now) {
+  requireNow(now, 'markRuntimeWeeklyCoverageGaps');
   const weekly = statsObj && statsObj[WEEKLY_KEY];
   if (!isWeeklyContainer(weekly)) return;
   for (const [weekKey, weekData] of Object.entries(weekly)) {
@@ -913,8 +933,8 @@ function ensureProjectBucketForWeek(project, week) {
   return ensureOptimizerFields(_stats[WEEKLY_KEY][week][proj]);
 }
 
-function ensureProjectBucket(project, now = defaultNow()) {
-  return ensureProjectBucketForDay(project, dayKeyFromDate(now));
+function ensureProjectBucket(project, now) {
+  return ensureProjectBucketForDay(project, dayKeyFromDate(requireNow(now, 'ensureProjectBucket')));
 }
 
 function ensureMeasuredProjectBucketForDay(project, day) {
@@ -932,8 +952,8 @@ function ensureMeasuredProjectBucketForWeek(project, week) {
   return _stats[WEEKLY_KEY][week][proj];
 }
 
-function ensureMeasuredProjectBucket(project, now = defaultNow()) {
-  return ensureMeasuredProjectBucketForDay(project, dayKeyFromDate(now));
+function ensureMeasuredProjectBucket(project, now) {
+  return ensureMeasuredProjectBucketForDay(project, dayKeyFromDate(requireNow(now, 'ensureMeasuredProjectBucket')));
 }
 
 // Sprint B guardrail writers. Takes an EXPLICIT day string (not todayKey()) so
@@ -1300,7 +1320,10 @@ function aggregatePeriod(periodData, projectFilter, weights = DEFAULT_WEIGHTS) {
   return finalizeAggregate(perProject, weights);
 }
 
-function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = defaultNow()) {
+// getStats() is the single clock-capture seam for the weekly path; everything
+// below it is handed that one instant rather than re-reading the clock.
+function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
+  requireNow(now, 'getSubscriptionWeeks');
   reconcileWeeklyFromDaily(_stats, now);
   pruneWeeklyRetention(_stats, now);
   const weeklyData = (_stats[WEEKLY_KEY] && typeof _stats[WEEKLY_KEY] === 'object') ? _stats[WEEKLY_KEY] : {};
@@ -1316,7 +1339,7 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now = de
     const coverageMeta = !isWeeklyContainer(weekData)
       || (storedMeta && storedMeta.authoritative === false && !isCoverageAuthorityReason(storedMeta.reason))
       ? null
-      : coverageMetadataForWeek(_stats, weekStart);
+      : coverageMetadataForWeek(_stats, weekStart, now);
     const meta = (storedMeta && storedMeta.authoritative === false && !isCoverageAuthorityReason(storedMeta.reason))
       ? storedMeta
       : coverageMeta && {
