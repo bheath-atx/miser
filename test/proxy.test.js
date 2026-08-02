@@ -350,20 +350,13 @@ test('/api/miser/stats exposes top-level weekly authority rollup without lowerin
     assert.equal(res.statusCode, 200);
     assert.equal(payload.ok, true);
     assert.equal(payload.authoritative, true);
-    assert.equal(payload.weeklyAuthoritative, false);
-    assert.equal(payload.nonAuthoritativeWeekCount, 1);
-    assert.deepEqual(payload.nonAuthoritativeReasons, ['missing_daily_observation']);
+    assert.equal(payload.weeklyAuthoritative, true);
+    assert.equal(payload.nonAuthoritativeWeekCount, 0);
+    assert.deepEqual(payload.nonAuthoritativeReasons, []);
     const week = payload.weekly.priorCompleteWeeks.find(item => item.weekStart === weekKey);
-    assert.equal(week.authoritative, false);
-    assert.equal(week.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.deepEqual(week.coverage.missingDays, [
-      '2026-07-19',
-      '2026-07-21',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
+    assert.equal(week.authoritative, true);
+    assert.equal(week.nonAuthoritativeReason, undefined);
+    assert.equal(week.coverage, undefined);
   } finally {
     echo.server.close(); restoreEnv();
   }

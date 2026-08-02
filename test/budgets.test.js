@@ -426,6 +426,37 @@ test('AC4: budget check sees un-flushed usage (no flushNow anywhere)', () => {
   }
 });
 
+test('budget cap sees boundary usage recorded under the same UTC day key', async () => {
+  const statsFile = tmpFile('boundary-cap');
+  const ledgerFile = tmpFile('boundary-cap-ledger');
+  const { stats, budgets } = freshModules(statsFile);
+  try {
+    const alerts = [];
+    const boundary = new Date('2026-07-26T01:00:00.000Z');
+    const nowFn = () => boundary;
+    const guardDeps = {
+      budgetsConfig: { alpha: { dailyUSD: 2 } },
+      budgetGraceConfig: [],
+      ledger: createEnvLedger(ledgerFile, nowFn),
+      sendAlert: async (text) => { alerts.push(text); },
+      nowFn,
+    };
+
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 2 }, null, nowFn);
+    assert.equal(stats.getRawStatsSnapshot()['2026-07-26'].alpha.usage.anthropic.testmodel.input, 2);
+
+    const block = budgets.checkBudget('alpha', guardDeps);
+    assert.equal(block.status, 429);
+    assert.equal(block.body.error.message, "miser: project 'alpha' daily budget of $2.00 exhausted (spent $2.00); resets at next UTC midnight");
+    assert.equal(stats.getRawStatsSnapshot()['2026-07-26'].alpha.budget.blockedCount, 1);
+    await tick();
+    assert.deepEqual(alerts, ['⛔ miser budget: alpha EXHAUSTED $2.00/$2.00 — blocking until UTC midnight']);
+  } finally {
+    cleanup(statsFile);
+    cleanup(ledgerFile);
+  }
+});
+
 test('AC4: non-Anthropic measured legs accrue $0 toward the budget', () => {
   const statsFile = tmpFile('legs');
   const { stats, budgets } = freshModules(statsFile);

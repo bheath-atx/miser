@@ -160,14 +160,12 @@ test('usage before Sunday reset keeps the same subscription week after flush and
       label: 'cdt',
       eventIso: '2026-07-26T01:00:00.000Z',
       utcDayKey: '2026-07-26',
-      persistedDayKey: '2026-07-25',
       weekKey: '2026-07-19T11:00:00.000Z',
     },
     {
       label: 'cst',
       eventIso: '2026-01-04T07:00:00.000Z',
       utcDayKey: '2026-01-04',
-      persistedDayKey: '2026-01-03',
       weekKey: '2025-12-28T12:00:00.000Z',
     },
   ];
@@ -192,15 +190,13 @@ test('usage before Sunday reset keeps the same subscription week after flush and
       );
 
       const live = stats.__test.getUnreconciledStatsSnapshotForTest();
-      assert.equal(live[fixture.persistedDayKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
-      assert.equal(live[fixture.utcDayKey], undefined);
+      assert.equal(live[fixture.utcDayKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
       assert.deepEqual(Object.keys(live.__weekly || {}).sort(), [fixture.weekKey]);
       assert.equal(live.__weekly[fixture.weekKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
 
       await stats.flushNow();
       const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
-      assert.equal(persisted[fixture.persistedDayKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
-      assert.equal(persisted[fixture.utcDayKey], undefined);
+      assert.equal(persisted[fixture.utcDayKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
       assert.deepEqual(Object.keys(persisted.__weekly || {}).sort(), [fixture.weekKey]);
       assert.equal(persisted.__weekly[fixture.weekKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
 
@@ -383,7 +379,6 @@ test('weekly retention caps prior complete weeks and prunes persisted snapshots'
     await stats.flushNow();
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.deepEqual(Object.keys(raw.__weekly).sort(), [
-      '2026-07-12T11:00:00.000Z',
       '2026-07-19T11:00:00.000Z',
       '2026-07-26T11:00:00.000Z',
     ]);
@@ -435,9 +430,8 @@ test('daily stats with no meta derive recordingStartedAt and backfill weekly buc
       contextBloatCount: 2,
     });
     assert.equal(weekly.authoritative, false);
-    assert.equal(weekly.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.deepEqual(weekly.coverage.presentDays, ['2026-07-19', '2026-07-20', '2026-07-21']);
-    assert.deepEqual(weekly.coverage.missingDays, ['2026-07-22', '2026-07-23', '2026-07-24', '2026-07-25']);
+    assert.equal(weekly.nonAuthoritativeReason, 'inferred_from_legacy_daily');
+    assert.equal(weekly.coverage, undefined);
 
     const persisted = await waitForPersistedJson(
       file,
@@ -450,7 +444,7 @@ test('daily stats with no meta derive recordingStartedAt and backfill weekly buc
   }
 });
 
-test('existing empty, partial, array, and stale weekly buckets are reconciled from daily stats', () => {
+test('legacy daily-only stats are backfilled non-authoritatively when no weekly bucket exists', () => {
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
   const daily = sparseStatsWithRecordingStart('2026-07-19', {
@@ -467,45 +461,66 @@ test('existing empty, partial, array, and stale weekly buckets are reconciled fr
       },
     },
   });
-  const cases = [
-    ['empty', {}],
-    ['partial', {
-      [weekKey]: { alpha: { usage: { anthropic: { model: { input: 5, requests: 1 } } } } },
-    }],
-    ['array', []],
-    ['stale', {
-      [weekKey]: {
-        alpha: {
-          usage: { anthropic: { model: { input: 1, requests: 1 } } },
-          budget: { blockedCount: 1, firstBlockedAt: '2026-07-21T14:00:00.000Z' },
-        },
-      },
-    }],
-  ];
-
-  for (const [name, weeklySeed] of cases) {
-    const file = tmpStatsFile(`migration-${name}`);
-    try {
-      const stats = freshStats(file, { ...daily, __weekly: weeklySeed });
-      const weekly = stats.getRawStatsSnapshot().__weekly[weekKey].alpha;
-      assert.equal(weekly.usage.anthropic.model.input, 5, name);
-      assert.equal(weekly.usage.anthropic.model.output, 3, name);
-      assert.equal(weekly.usage.anthropic.model.requests, 2, name);
-      assert.deepEqual(weekly.budget, {
-        blockedCount: 2,
-        firstBlockedAt: '2026-07-20T14:00:00.000Z',
-      }, name);
-      assert.deepEqual(weekly.policy, {
-        modelDriftCount: 1,
-        contextBloatCount: 2,
-      }, name);
-    } finally {
-      cleanup(file, prevEnv);
-    }
+  const file = tmpStatsFile('migration-daily-only');
+  try {
+    const stats = freshStats(file, daily);
+    const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
+    const weekly = rawWeek.alpha;
+    assert.equal(weekly.usage.anthropic.model.input, 5);
+    assert.equal(weekly.usage.anthropic.model.output, 3);
+    assert.equal(weekly.usage.anthropic.model.requests, 2);
+    assert.deepEqual(weekly.budget, {
+      blockedCount: 2,
+      firstBlockedAt: '2026-07-20T14:00:00.000Z',
+    });
+    assert.deepEqual(weekly.policy, {
+      modelDriftCount: 1,
+      contextBloatCount: 2,
+    });
+    assert.deepEqual(rawWeek.__meta, {
+      authoritative: false,
+      reason: 'inferred_from_legacy_daily',
+    });
+  } finally {
+    cleanup(file, prevEnv);
   }
 });
 
-test('weekly reconciliation uses daily-derived counters when stored weekly is higher', () => {
+test('legacy UTC daily-only boundary usage is never exposed as authoritative weekly data', () => {
+  const file = tmpStatsFile('legacy-boundary-daily-only');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file, sparseStatsWithRecordingStart('2026-07-26', {
+      '2026-07-26': {
+        alpha: {
+          usage: { anthropic: { 'claude-sonnet-4': { input: 10, requests: 1 } } },
+        },
+      },
+    }));
+    stats.__test.setNowFnForTest(() => new Date('2026-07-26T01:00:00.000Z'));
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.deepEqual(Object.keys(snapshot.__weekly || {}).sort(), ['2026-07-26T11:00:00.000Z']);
+    assert.deepEqual(snapshot.__weekly['2026-07-26T11:00:00.000Z'].__meta, {
+      authoritative: false,
+      reason: 'inferred_from_legacy_daily',
+    });
+
+    const result = stats.getStats('9999');
+    assert.equal(result.weekly.currentWeekToDate.weekStart, '2026-07-19T11:00:00.000Z');
+    assert.equal(result.weekly.currentWeekToDate.authoritative, false);
+    assert.equal(result.weekly.currentWeekToDate.nonAuthoritativeReason, 'missing_daily_observation');
+    const inferred = result.weekly.priorCompleteWeeks
+      .find(week => week.weekStart === '2026-07-26T11:00:00.000Z');
+    assert.equal(inferred, undefined);
+    assert.equal(result.weeklyAuthoritative, false);
+    assert.deepEqual(result.nonAuthoritativeReasons, ['missing_daily_observation']);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('weekly reconciliation preserves recorded weekly counters when daily counters differ', () => {
   const file = tmpStatsFile('migration-inflated');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
@@ -539,31 +554,31 @@ test('weekly reconciliation uses daily-derived counters when stored weekly is hi
       },
     }));
     const weekly = stats.getRawStatsSnapshot().__weekly[weekKey].alpha;
-    assert.equal(weekly.usage.anthropic.model.input, 5);
-    assert.equal(weekly.usage.anthropic.model.output, 3);
-    assert.equal(weekly.usage.anthropic.model.requests, 1);
-    assert.equal(weekly.dedup.inputTokensRemoved, 7);
-    assert.equal(weekly.dedup.appliedCount, 1);
-    assert.equal(weekly.likelyPollCount, 1);
+    assert.equal(weekly.usage.anthropic.model.input, 999);
+    assert.equal(weekly.usage.anthropic.model.output, 999);
+    assert.equal(weekly.usage.anthropic.model.requests, 99);
+    assert.equal(weekly.dedup.inputTokensRemoved, 999);
+    assert.equal(weekly.dedup.appliedCount, 99);
+    assert.equal(weekly.likelyPollCount, 99);
     assert.deepEqual(weekly.budget, {
-      blockedCount: 2,
-      firstBlockedAt: '2026-07-20T14:00:00.000Z',
+      blockedCount: 99,
+      firstBlockedAt: '2026-07-21T14:00:00.000Z',
     });
     assert.deepEqual(weekly.policy, {
-      modelDriftCount: 1,
-      contextBloatCount: 1,
+      modelDriftCount: 99,
+      contextBloatCount: 99,
     });
     const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
       .find(week => week.weekStart === weekKey);
     assert.equal(exposed.authoritative, true);
     assert.equal(exposed.degraded, false);
-    assert.equal(exposed.usage.alpha.anthropic.model.input, 5);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 999);
   } finally {
     cleanup(file, prevEnv);
   }
 });
 
-test('partial daily coverage drops stored weekly value and marks it non-authoritative', () => {
+test('partial daily coverage does not overwrite a recorded weekly bucket', () => {
   const file = tmpStatsFile('migration-partial-coverage');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
@@ -583,60 +598,24 @@ test('partial daily coverage drops stored weekly value and marks it non-authorit
     }));
 
     const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
-    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 30);
-    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 2);
-    assert.equal(rawWeek.__meta.authoritative, false);
-    assert.equal(rawWeek.__meta.reason, 'missing_daily_observation');
-    assert.deepEqual(rawWeek.__meta.coverage.presentDays, ['2026-07-20', '2026-07-21']);
-    assert.deepEqual(rawWeek.__meta.coverage.missingDays, [
-      '2026-07-19',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
-    assert.deepEqual(rawWeek.__meta.coverage.expectedDays, [
-      '2026-07-19',
-      '2026-07-20',
-      '2026-07-21',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
-    assert.equal(rawWeek.__meta.coverage.presentCount, 2);
-    assert.equal(rawWeek.__meta.coverage.expectedCount, 7);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 70);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 7);
+    assert.equal(rawWeek.__meta, undefined);
 
     const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
       .find(week => week.weekStart === weekKey);
-    assert.equal(exposed.authoritative, false);
-    assert.equal(exposed.degraded, true);
-    assert.equal(exposed.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.equal(exposed.usage.alpha.anthropic.model.input, 30);
-    assert.deepEqual(exposed.coverage.presentDays, ['2026-07-20', '2026-07-21']);
-    assert.deepEqual(exposed.coverage.missingDays, [
-      '2026-07-19',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
-    assert.deepEqual(exposed.coverage.expectedDays, [
-      '2026-07-19',
-      '2026-07-20',
-      '2026-07-21',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
+    assert.equal(exposed.authoritative, true);
+    assert.equal(exposed.degraded, false);
+    assert.equal(exposed.nonAuthoritativeReason, undefined);
+    assert.equal(exposed.coverage, undefined);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 70);
     assert.equal(stats.getStats('9999').weekly.authoritative, false);
   } finally {
     cleanup(file, prevEnv);
   }
 });
 
-test('known-incomplete coverage with no stored weekly bucket is non-authoritative', () => {
+test('legacy daily-only stats with no stored weekly bucket are non-authoritative', () => {
   const file = tmpStatsFile('migration-partial-no-stored-weekly');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
@@ -655,28 +634,15 @@ test('known-incomplete coverage with no stored weekly bucket is non-authoritativ
     assert.equal(rawWeek.alpha.usage.anthropic.model.output, 4);
     assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 2);
     assert.equal(rawWeek.__meta.authoritative, false);
-    assert.equal(rawWeek.__meta.reason, 'missing_daily_observation');
-    assert.deepEqual(rawWeek.__meta.coverage.presentDays, ['2026-07-20', '2026-07-21']);
-    assert.deepEqual(rawWeek.__meta.coverage.missingDays, [
-      '2026-07-19',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
+    assert.equal(rawWeek.__meta.reason, 'inferred_from_legacy_daily');
+    assert.equal(rawWeek.__meta.coverage, undefined);
 
     const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
       .find(week => week.weekStart === weekKey);
     assert.equal(exposed.authoritative, false);
     assert.equal(exposed.degraded, true);
-    assert.equal(exposed.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.deepEqual(exposed.coverage.missingDays, [
-      '2026-07-19',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
+    assert.equal(exposed.nonAuthoritativeReason, 'inferred_from_legacy_daily');
+    assert.equal(exposed.coverage, undefined);
     assert.equal(stats.getStats('9999').weekly.authoritative, false);
   } finally {
     cleanup(file, prevEnv);
@@ -717,7 +683,11 @@ test('missing completed week after recording start is exposed non-authoritative'
       '2026-07-24',
       '2026-07-25',
     ]);
-    assert.equal(result.nonAuthoritativeWeekCount, 1);
+    assert.equal(result.nonAuthoritativeWeekCount, 3);
+    assert.deepEqual(result.nonAuthoritativeReasons, [
+      'inferred_from_legacy_daily',
+      'missing_daily_observation',
+    ]);
   } finally {
     cleanup(file, prevEnv);
   }
@@ -780,7 +750,7 @@ test('legacy-only daily retention watermark is deleted without using it as recor
       .find(week => week.weekStart === weekKey);
     assert.equal(exposed.authoritative, false);
     assert.equal(exposed.degraded, true);
-    assert.equal(exposed.nonAuthoritativeReason, 'missing_daily_observation');
+    assert.equal(exposed.nonAuthoritativeReason, 'inferred_from_legacy_daily');
 
     const persisted = await waitForPersistedJson(
       file,
@@ -1051,7 +1021,7 @@ for (const fixture of [
   });
 }
 
-test('fresh install first mid-week write marks earlier current-week days not observed, from a single captured clock', async () => {
+test('fresh install first mid-week write keeps recorded current week authoritative from a single captured clock', async () => {
   const file = tmpStatsFile('runtime-first-mid-week');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-26T11:00:00.000Z';
@@ -1084,25 +1054,21 @@ test('fresh install first mid-week write marks earlier current-week days not obs
     );
     const current = result.weekly.currentWeekToDate;
     assert.equal(current.weekStart, weekKey);
-    assert.equal(current.authoritative, false);
-    assert.equal(current.degraded, true);
-    assert.equal(current.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.deepEqual(current.coverage.presentDays, ['2026-07-28']);
-    // 2026-07-29 must NOT appear here: it is only "expected" to an observer
-    // that re-read the clock after the rollover.
-    assert.deepEqual(current.coverage.missingDays, ['2026-07-26', '2026-07-27']);
+    assert.equal(current.authoritative, true);
+    assert.equal(current.degraded, false);
+    assert.equal(current.nonAuthoritativeReason, undefined);
+    assert.equal(current.coverage, undefined);
     assert.equal(current.usage.alpha.anthropic['claude-sonnet-4'].input, 12);
-    assert.equal(result.weekly.authoritative, false);
+    assert.equal(result.weekly.authoritative, true);
 
     const snapshot = stats.getRawStatsSnapshot();
-    assert.equal(snapshot.__weekly[weekKey].__meta.authoritative, false);
-    assert.equal(snapshot.__weekly[weekKey].__meta.reason, 'missing_daily_observation');
+    assert.equal(snapshot.__weekly[weekKey].__meta, undefined);
   } finally {
     cleanup(file, prevEnv);
   }
 });
 
-test('recordingStartedAt is write-once and older records do not cover intervening missing days', async () => {
+test('recordingStartedAt is write-once and older records still accumulate in recorded weekly bucket', async () => {
   const file = tmpStatsFile('recording-start-monotonic');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
@@ -1136,37 +1102,22 @@ test('recordingStartedAt is write-once and older records do not cover intervenin
     assert.equal(after['2026-07-19'].alpha.usage.anthropic['claude-sonnet-4'].input, 19);
     assert.equal(after['2026-07-22'].alpha.usage.anthropic['claude-sonnet-4'].input, 22);
     assert.equal(after.__weekly[weekKey].alpha.usage.anthropic['claude-sonnet-4'].input, 41);
-    assert.equal(after.__weekly[weekKey].__meta.authoritative, false);
-    assert.equal(after.__weekly[weekKey].__meta.reason, 'missing_daily_observation');
-    assert.deepEqual(after.__weekly[weekKey].__meta.coverage.presentDays, ['2026-07-19', '2026-07-22']);
-    assert.deepEqual(after.__weekly[weekKey].__meta.coverage.missingDays, [
-      '2026-07-20',
-      '2026-07-21',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
+    assert.equal(after.__weekly[weekKey].__meta, undefined);
 
     const result = stats.getStats('9999');
     const exposed = result.weekly.priorCompleteWeeks.find(week => week.weekStart === weekKey);
-    assert.equal(exposed.authoritative, false);
-    assert.equal(exposed.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.deepEqual(exposed.coverage.missingDays, [
-      '2026-07-20',
-      '2026-07-21',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
+    assert.equal(exposed.authoritative, true);
+    assert.equal(exposed.nonAuthoritativeReason, undefined);
+    assert.equal(exposed.coverage, undefined);
     assert.equal(result.weeklyAuthoritative, false);
-    assert.equal(result.nonAuthoritativeWeekCount, 2);
+    assert.equal(result.nonAuthoritativeWeekCount, 1);
     assert.deepEqual(result.nonAuthoritativeReasons, ['missing_daily_observation']);
   } finally {
     cleanup(file, prevEnv);
   }
 });
 
-test('sparse quiet-day gaps replace stored weekly value and stay non-authoritative', () => {
+test('sparse quiet-day gaps do not replace a recorded weekly value', () => {
   const file = tmpStatsFile('migration-complete-coverage');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
@@ -1186,32 +1137,17 @@ test('sparse quiet-day gaps replace stored weekly value and stay non-authoritati
     }));
 
     const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
-    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 30);
-    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 2);
-    assert.equal(rawWeek.__meta.authoritative, false);
-    assert.equal(rawWeek.__meta.reason, 'missing_daily_observation');
-    assert.deepEqual(rawWeek.__meta.coverage.presentDays, ['2026-07-20', '2026-07-21']);
-    assert.deepEqual(rawWeek.__meta.coverage.missingDays, [
-      '2026-07-19',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 70);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 7);
+    assert.equal(rawWeek.__meta, undefined);
 
     const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
       .find(week => week.weekStart === weekKey);
-    assert.equal(exposed.authoritative, false);
-    assert.equal(exposed.degraded, true);
-    assert.equal(exposed.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.deepEqual(exposed.coverage.missingDays, [
-      '2026-07-19',
-      '2026-07-22',
-      '2026-07-23',
-      '2026-07-24',
-      '2026-07-25',
-    ]);
-    assert.equal(exposed.usage.alpha.anthropic.model.input, 30);
+    assert.equal(exposed.authoritative, true);
+    assert.equal(exposed.degraded, false);
+    assert.equal(exposed.nonAuthoritativeReason, undefined);
+    assert.equal(exposed.coverage, undefined);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 70);
   } finally {
     cleanup(file, prevEnv);
   }
@@ -1254,8 +1190,8 @@ test('current partially elapsed week stays authoritative across a UTC-midnight r
     assert.equal(current.degraded, false);
     assert.equal(current.nonAuthoritativeReason, undefined);
     assert.equal(current.coverage, undefined);
-    assert.equal(current.usage.alpha.anthropic.model.input, 4);
-    assert.equal(current.usage.alpha.anthropic.model.requests, 1);
+    assert.equal(current.usage.alpha.anthropic.model.input, 99);
+    assert.equal(current.usage.alpha.anthropic.model.requests, 9);
     assert.equal(result.weekly.authoritative, true);
   } finally {
     cleanup(file, prevEnv);
@@ -1314,18 +1250,18 @@ test('real-file-shape migration treats existing 2026-07-14 through 2026-07-28 ke
     const complete = result.weekly.priorCompleteWeeks
       .find(week => week.weekStart === '2026-07-19T11:00:00.000Z');
     assert.equal(straddling.authoritative, false);
-    assert.equal(straddling.nonAuthoritativeReason, 'missing_daily_observation');
-    assert.deepEqual(straddling.coverage.missingDays, ['2026-07-12', '2026-07-13']);
-    assert.equal(complete.authoritative, true);
-    assert.equal(complete.nonAuthoritativeReason, undefined);
-    assert.equal(result.weekly.currentWeekToDate.authoritative, true);
-    assert.equal(result.weekly.currentWeekToDate.nonAuthoritativeReason, undefined);
+    assert.equal(straddling.nonAuthoritativeReason, 'inferred_from_legacy_daily');
+    assert.equal(straddling.coverage, undefined);
+    assert.equal(complete.authoritative, false);
+    assert.equal(complete.nonAuthoritativeReason, 'inferred_from_legacy_daily');
+    assert.equal(result.weekly.currentWeekToDate.authoritative, false);
+    assert.equal(result.weekly.currentWeekToDate.nonAuthoritativeReason, 'inferred_from_legacy_daily');
   } finally {
     cleanup(file, prevEnv);
   }
 });
 
-test('weekly reconciliation removes surplus stored projects and models from authoritative weeks', () => {
+test('weekly reconciliation preserves surplus stored projects and models from recorded weeks', () => {
   const file = tmpStatsFile('migration-surplus');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-19T11:00:00.000Z';
@@ -1359,23 +1295,25 @@ test('weekly reconciliation removes surplus stored projects and models from auth
       },
     }));
     const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
-    assert.deepEqual(Object.keys(rawWeek).sort(), ['alpha']);
-    assert.deepEqual(Object.keys(rawWeek.alpha.usage.anthropic), ['model']);
-    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 5);
-    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 1);
+    assert.deepEqual(Object.keys(rawWeek).sort(), ['alpha', 'surplusProject']);
+    assert.deepEqual(Object.keys(rawWeek.alpha.usage.anthropic).sort(), ['model', 'surplusModel']);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 999);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 99);
+    assert.equal(rawWeek.alpha.usage.anthropic.surplusModel.input, 88);
+    assert.equal(rawWeek.surplusProject.usage.anthropic.model.input, 77);
 
     const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
       .find(week => week.weekStart === weekKey);
     assert.equal(exposed.authoritative, true);
-    assert.equal(exposed.usage.alpha.anthropic.model.input, 5);
-    assert.equal(exposed.usage.alpha.anthropic.surplusModel, undefined);
-    assert.equal(exposed.usage.surplusProject, undefined);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 999);
+    assert.equal(exposed.usage.alpha.anthropic.surplusModel.input, 88);
+    assert.equal(exposed.usage.surplusProject.anthropic.model.input, 77);
   } finally {
     cleanup(file, prevEnv);
   }
 });
 
-test('valid stored weekly week with no daily backing is dropped on reconcile', () => {
+test('valid stored weekly week with no daily backing is preserved as recorded', () => {
   const file = tmpStatsFile('migration-stored-only');
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-12T11:00:00.000Z';
@@ -1388,12 +1326,13 @@ test('valid stored weekly week with no daily backing is dropped on reconcile', (
       },
     });
     const snapshot = stats.getRawStatsSnapshot();
-    assert.equal(snapshot.__weekly, undefined);
+    assert.equal(snapshot.__weekly[weekKey].alpha.usage.anthropic.model.input, 11);
 
     const exposed = stats.getStats('9999').weekly.priorCompleteWeeks
       .find(week => week.weekStart === weekKey);
-    assert.equal(exposed, undefined);
-    assert.equal(stats.getStats('9999').weekly.priorCompleteWeeks.length, 0);
+    assert.ok(exposed, 'stored weekly-only bucket should be exposed');
+    assert.equal(exposed.authoritative, true);
+    assert.equal(exposed.usage.alpha.anthropic.model.input, 11);
   } finally {
     cleanup(file, prevEnv);
   }
@@ -1490,6 +1429,76 @@ test('budget and policy events are written to weekly buckets', () => {
     });
   } finally {
     cleanup(file, prevEnv);
+  }
+});
+
+test('budget and policy events before Sunday reset keep event-time subscription week after reload', async () => {
+  const cases = [
+    {
+      label: 'cdt',
+      eventIso: '2026-07-26T01:00:00.000Z',
+      utcDayKey: '2026-07-26',
+      weekKey: '2026-07-19T11:00:00.000Z',
+    },
+    {
+      label: 'cst',
+      eventIso: '2026-01-04T07:00:00.000Z',
+      utcDayKey: '2026-01-04',
+      weekKey: '2025-12-28T12:00:00.000Z',
+    },
+  ];
+
+  for (const fixture of cases) {
+    const file = tmpStatsFile(`guardrail-boundary-${fixture.label}`);
+    const prevEnv = process.env.MISER_STATS_FILE;
+    let stats;
+    try {
+      const event = new Date(fixture.eventIso);
+      const now = () => event;
+      stats = freshStats(file);
+      stats.__test.setNowFnForTest(now);
+
+      stats.recordBudgetBlock('alpha', now);
+      stats.recordBudgetBlock('alpha', now);
+      stats.recordPolicyEvent('alpha', { drift: true, bloat: true }, now);
+
+      const live = stats.__test.getUnreconciledStatsSnapshotForTest();
+      assert.equal(live[fixture.utcDayKey].alpha.budget.blockedCount, 2);
+      assert.deepEqual(live[fixture.utcDayKey].alpha.policy, {
+        modelDriftCount: 1,
+        contextBloatCount: 1,
+      });
+      assert.deepEqual(Object.keys(live.__weekly || {}).sort(), [fixture.weekKey]);
+      assert.equal(live.__weekly[fixture.weekKey].alpha.budget.blockedCount, 2);
+      assert.deepEqual(live.__weekly[fixture.weekKey].alpha.policy, {
+        modelDriftCount: 1,
+        contextBloatCount: 1,
+      });
+
+      await stats.flushNow();
+      stats.__resetForTest();
+      delete require.cache[statsPath];
+      stats = freshStats(file);
+      stats.__test.setNowFnForTest(now);
+
+      const reloaded = stats.getRawStatsSnapshot();
+      assert.equal(reloaded[fixture.utcDayKey].alpha.budget.blockedCount, 2);
+      assert.deepEqual(Object.keys(reloaded.__weekly || {}).sort(), [fixture.weekKey]);
+      assert.equal(reloaded.__weekly[fixture.weekKey].alpha.budget.blockedCount, 2);
+      assert.deepEqual(reloaded.__weekly[fixture.weekKey].alpha.policy, {
+        modelDriftCount: 1,
+        contextBloatCount: 1,
+      });
+
+      const current = stats.getStats('9999').weekly.currentWeekToDate;
+      assert.equal(current.weekStart, fixture.weekKey);
+      assert.equal(current.perProject.alpha.budget.blockedCount, 2);
+      assert.equal(current.perProject.alpha.policy.modelDriftCount, 1);
+      assert.equal(current.authoritative, true);
+    } finally {
+      if (stats && stats.__resetForTest) stats.__resetForTest();
+      cleanup(file, prevEnv);
+    }
   }
 });
 

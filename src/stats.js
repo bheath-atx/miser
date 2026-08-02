@@ -420,17 +420,8 @@ function todayKey(now) {
   return dayKeyFromDate(requireNow(now, 'todayKey'));
 }
 
-function formatDailyKey(parts) {
-  return `${String(parts.year).padStart(4, '0')}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
-}
-
 function dayKeyFromDate(date) {
-  const timeZoneStatus = getSubscriptionTimeZoneStatus();
-  if (!timeZoneStatus.supported) {
-    return new Date(date.getTime() - 12 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  }
-  const local = getZonedParts(date);
-  return formatDailyKey(local.hour < 6 ? localDatePlusDays(local, -1) : local);
+  return date.toISOString().slice(0, 10);
 }
 
 function getZonedParts(date, timeZone = SUBSCRIPTION_TIME_ZONE) {
@@ -898,21 +889,13 @@ function hasHardFailedWeeklyMigration(statsObj) {
 function reconcileWeeklyFromDaily(statsObj, now) {
   requireNow(now, 'reconcileWeeklyFromDaily');
   if (hasHardFailedWeeklyMigration(statsObj)) return;
+  const existing = statsObj && statsObj[WEEKLY_KEY];
+  if (isWeeklyContainer(existing) && Object.keys(existing).some(validWeekKey)) return;
   const rebuilt = buildWeeklyFromDaily(statsObj);
   const reconciled = {};
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
-    if (validWeekKey(weekKey)) {
-      const coverageMeta = coverageMetadataForWeek(statsObj, weekKey, now);
-      if (coverageMeta) {
-        reconciled[weekKey] = markWeekNonAuthoritative(
-          weekData,
-          coverageMeta.reason,
-          coverageMeta.coverage,
-        );
-        continue;
-      }
-    }
-    reconciled[weekKey] = weekData;
+    if (!validWeekKey(weekKey)) continue;
+    reconciled[weekKey] = markWeekNonAuthoritative(weekData, 'inferred_from_legacy_daily');
   }
   if (Object.keys(reconciled).length > 0) statsObj[WEEKLY_KEY] = reconciled;
   else delete statsObj[WEEKLY_KEY];
@@ -920,19 +903,6 @@ function reconcileWeeklyFromDaily(statsObj, now) {
 
 function markRuntimeWeeklyCoverageGaps(statsObj, now) {
   requireNow(now, 'markRuntimeWeeklyCoverageGaps');
-  const weekly = statsObj && statsObj[WEEKLY_KEY];
-  if (!isWeeklyContainer(weekly)) return;
-  for (const [weekKey, weekData] of Object.entries(weekly)) {
-    if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
-    const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
-    if (meta && meta.authoritative === false && !isCoverageAuthorityReason(meta.reason)) continue;
-    const coverageMeta = coverageMetadataForWeek(statsObj, weekKey, now);
-    if (coverageMeta) {
-      markWeekNonAuthoritative(weekData, coverageMeta.reason, coverageMeta.coverage);
-    } else if (meta && meta.authoritative === false && isCoverageAuthorityReason(meta.reason)) {
-      delete weekData[WEEKLY_META_KEY];
-    }
-  }
 }
 
 function nextSubscriptionWeekKey(weekKey) {
@@ -1046,7 +1016,7 @@ function recordBudgetBlock(project, nowFn = defaultNow) {
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'budget')) return 0;
   if (!canRetainMutationAfterLoadFailure('budget')) return 0;
-  const dayKey = now.toISOString().slice(0, 10);
+  const dayKey = dayKeyFromDate(now);
   const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
   const weekBucket = ensureWeeklyGuardrailBucket(project, weekKey);
@@ -1068,7 +1038,7 @@ function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'policy')) return { modelDriftCount: 0, contextBloatCount: 0 };
   if (!canRetainMutationAfterLoadFailure('policy')) return { modelDriftCount: 0, contextBloatCount: 0 };
-  const dayKey = now.toISOString().slice(0, 10);
+  const dayKey = dayKeyFromDate(now);
   const weekKey = subscriptionWeekKeyFromDate(now);
   const bucket = ensureGuardrailBucket(project, dayKey);
   const weekBucket = ensureWeeklyGuardrailBucket(project, weekKey);
@@ -1403,16 +1373,13 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
     const weekData = weeklyData[weekStart];
     const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
       ? weekData[WEEKLY_META_KEY] : null;
-    const storedNonCoverageMeta = storedMeta
-      && storedMeta.authoritative === false
-      && !isCoverageAuthorityReason(storedMeta.reason);
-    const shouldEvaluateCoverage = weekStart === currentWeekStart
-      || isWeeklyContainer(weekData)
-      || observationWeekKeys.has(weekStart);
-    const coverageMeta = storedNonCoverageMeta || !shouldEvaluateCoverage
+    const storedNonAuthoritativeMeta = storedMeta && storedMeta.authoritative === false;
+    const shouldEvaluateCoverage = !isWeeklyContainer(weekData)
+      && (weekStart === currentWeekStart || observationWeekKeys.has(weekStart));
+    const coverageMeta = storedNonAuthoritativeMeta || !shouldEvaluateCoverage
       ? null
       : coverageMetadataForWeek(_stats, weekStart, now);
-    const meta = storedNonCoverageMeta
+    const meta = storedNonAuthoritativeMeta
       ? storedMeta
       : coverageMeta && {
         authoritative: false,
