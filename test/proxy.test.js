@@ -333,6 +333,7 @@ test('/api/miser/stats exposes top-level weekly authority rollup without lowerin
     '2026-07-20': {
       alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
     },
+    '2026-07-26': {},
     __weekly: {
       [weekKey]: {
         alpha: { usage: { anthropic: { model: { input: 70, requests: 7 } } } },
@@ -342,6 +343,7 @@ test('/api/miser/stats exposes top-level weekly authority rollup without lowerin
   const echo = await startEcho(() => ({ status: 200, body: {} }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_STATS_FILE: file });
   try {
+    require('../src/stats.js').__test.setNowFnForTest(() => new Date('2026-07-26T12:00:00.000Z'));
     const res = fakeRes();
     await drive(createProxy, fakeReq('GET', '/api/miser/stats', null, {}), res);
     const payload = JSON.parse(res.body());

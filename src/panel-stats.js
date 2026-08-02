@@ -18,6 +18,8 @@ const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 const MAX_ALLOWED_KEYS = 100_000;
 const MAX_ALLOWED_AGE_DAYS = 730;
 const MAX_ALLOWED_BYTES = 20 * 1024 * 1024;
+const FINAL_FLUSH_MAX_ATTEMPTS = 3;
+const FINAL_FLUSH_MAX_MS = 2000;
 const PANEL_STATS_MAX_KEYS = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_KEYS, DEFAULT_MAX_KEYS, MAX_ALLOWED_KEYS, 'MISER_PANEL_STATS_MAX_KEYS');
 const PANEL_STATS_MAX_AGE_DAYS = parsePositiveInt(process.env.MISER_PANEL_STATS_MAX_AGE_DAYS, DEFAULT_MAX_AGE_DAYS, MAX_ALLOWED_AGE_DAYS, 'MISER_PANEL_STATS_MAX_AGE_DAYS');
 const PANEL_STATS_MAX_AGE_MS = PANEL_STATS_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
@@ -401,10 +403,21 @@ async function drainFlushNow() {
   clearTimer('timer');
   clearTimer('retryTimer');
   let lastResult = { ok: true, file: PANEL_STATS_FILE };
+  let attempts = 0;
+  let retryObservedInFlightFailure = false;
+  const startedAt = Date.now();
   while (true) {
     if (_pendingFlush.inFlight) {
       lastResult = await (_pendingFlush.currentPromise || Promise.resolve(lastResult));
-      if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
+      attempts += 1;
+      if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
+      if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
+        retryObservedInFlightFailure = true;
+        if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
+          console.error(`[miser/panel-stats] CRITICAL final panel stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
+          return lastResult;
+        }
+      }
       continue;
     }
     if (!_pendingFlush.dirty) {
@@ -412,7 +425,15 @@ async function drainFlushNow() {
       return lastResult;
     }
     lastResult = await executeFlush();
-    if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
+    attempts += 1;
+    if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
+    if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
+      if (!retryObservedInFlightFailure) return lastResult;
+      if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
+        console.error(`[miser/panel-stats] CRITICAL final panel stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
+        return lastResult;
+      }
+    }
   }
 }
 

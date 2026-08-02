@@ -399,3 +399,45 @@ test('flushNow drains mutation that arrives during in-flight write', async () =>
     cleanup(file, prevEnv, stats);
   }
 });
+
+test('flushNow retries when shutdown observes an in-flight write failure', async () => {
+  const file = tmpStatsFile('shutdown-inflight-failure');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const originalRename = fsp.rename;
+  let releaseFirstRename;
+  let firstRenameEntered = false;
+  let renameCount = 0;
+  let stats;
+
+  fsp.rename = async function failFirstDelayedRename(...args) {
+    renameCount += 1;
+    if (renameCount === 1) {
+      firstRenameEntered = true;
+      await new Promise(resolve => {
+        releaseFirstRename = resolve;
+      });
+      throw new Error('transient in-flight rename failure');
+    }
+    return originalRename.apply(this, args);
+  };
+
+  try {
+    stats = freshStats(file);
+    stats.recordStats('alpha', { inputTokensRemoved: 9, techniques: { dedup: true } });
+    const inFlight = stats.executeFlush();
+    while (!firstRenameEntered) await new Promise(resolve => setImmediate(resolve));
+
+    const drain = stats.flushNow();
+    releaseFirstRename();
+    const [first, drained] = await Promise.all([inFlight, drain]);
+
+    assert.equal(first.ok, false);
+    assert.equal(drained.ok, true);
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(raw[dayKey()].alpha.dedup.inputTokensRemoved, 9);
+    assert.equal(stats.getPersistenceStatus().durable, true);
+  } finally {
+    fsp.rename = originalRename;
+    cleanup(file, prevEnv, stats);
+  }
+});

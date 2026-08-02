@@ -32,6 +32,8 @@ const DEFAULT_CLOCK_PAST_DAYS = 400;
 const DEFAULT_CLOCK_FUTURE_DAYS = 7;
 const MAX_CLOCK_PAST_DAYS = 730;
 const MAX_CLOCK_FUTURE_DAYS = 30;
+const FINAL_FLUSH_MAX_ATTEMPTS = 3;
+const FINAL_FLUSH_MAX_MS = 2000;
 const WEEKLY_MAX_WEEKS = parsePositiveInt(process.env.MISER_WEEKLY_STATS_MAX_WEEKS, DEFAULT_WEEKLY_MAX_WEEKS, MAX_WEEKLY_MAX_WEEKS, 'MISER_WEEKLY_STATS_MAX_WEEKS');
 const CLOCK_PAST_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_PAST_DAYS, DEFAULT_CLOCK_PAST_DAYS, MAX_CLOCK_PAST_DAYS, 'MISER_STATS_CLOCK_PAST_DAYS') * 24 * 60 * 60 * 1000;
 const CLOCK_FUTURE_MS = parsePositiveInt(process.env.MISER_STATS_CLOCK_FUTURE_DAYS, DEFAULT_CLOCK_FUTURE_DAYS, MAX_CLOCK_FUTURE_DAYS, 'MISER_STATS_CLOCK_FUTURE_DAYS') * 24 * 60 * 60 * 1000;
@@ -318,10 +320,21 @@ async function drainFlushNow() {
   clearTimer('timer');
   clearTimer('retryTimer');
   let lastResult = { ok: true, file: STATS_FILE };
+  let attempts = 0;
+  let retryObservedInFlightFailure = false;
+  const startedAt = Date.now();
   while (true) {
     if (_pendingFlush.inFlight) {
       lastResult = await (_pendingFlush.currentPromise || Promise.resolve(lastResult));
-      if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
+      attempts += 1;
+      if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
+      if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
+        retryObservedInFlightFailure = true;
+        if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
+          console.error(`[miser/stats] CRITICAL final stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
+          return lastResult;
+        }
+      }
       continue;
     }
     if (!_pendingFlush.dirty) {
@@ -329,7 +342,15 @@ async function drainFlushNow() {
       return lastResult;
     }
     lastResult = await executeFlush();
-    if (_pendingFlush.dirty && (_pendingFlush.lastFlushErrored || _persistence.lastLoadErrored)) return lastResult;
+    attempts += 1;
+    if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
+    if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
+      if (!retryObservedInFlightFailure) return lastResult;
+      if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
+        console.error(`[miser/stats] CRITICAL final stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
+        return lastResult;
+      }
+    }
   }
 }
 
@@ -901,6 +922,29 @@ function markRuntimeWeeklyCoverageGaps(statsObj, now) {
   }
 }
 
+function nextSubscriptionWeekKey(weekKey) {
+  if (!validWeekKey(weekKey)) return null;
+  const nextProbe = new Date(new Date(weekKey).getTime() + 8 * 24 * 60 * 60 * 1000);
+  return subscriptionWeekKeyFromDate(nextProbe);
+}
+
+function weeklyKeysSinceRecordingStart(statsObj, now) {
+  requireNow(now, 'weeklyKeysSinceRecordingStart');
+  const recordingStartedAt = getRecordingStartedAt(statsObj);
+  if (!recordingStartedAt) return [];
+  const currentWeekStart = subscriptionWeekKeyFromDate(now);
+  let weekKey = subscriptionWeekKeyFromDate(new Date(`${recordingStartedAt}T12:00:00.000Z`));
+  const keys = [];
+  for (let guard = 0; validWeekKey(weekKey) && weekKey <= currentWeekStart && guard < WEEKLY_MAX_WEEKS + 2; guard += 1) {
+    keys.push(weekKey);
+    if (weekKey === currentWeekStart) break;
+    const next = nextSubscriptionWeekKey(weekKey);
+    if (!next || next <= weekKey) break;
+    weekKey = next;
+  }
+  return keys;
+}
+
 function emptyTechniqueBucket() {
   return { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0 };
 }
@@ -1328,6 +1372,7 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
   pruneWeeklyRetention(_stats, now);
   const weeklyData = (_stats[WEEKLY_KEY] && typeof _stats[WEEKLY_KEY] === 'object') ? _stats[WEEKLY_KEY] : {};
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
+  const observationWeekKeys = new Set(weeklyKeysSinceRecordingStart(_stats, now));
   const persistence = getPersistenceStatus();
   const persistenceMeta = !(persistence.healthy && persistence.durable)
     ? { authoritative: false, reason: 'persistence_degraded' }
@@ -1337,6 +1382,7 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
     const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
       ? weekData[WEEKLY_META_KEY] : null;
     const coverageMeta = !isWeeklyContainer(weekData)
+      && !observationWeekKeys.has(weekStart)
       || (storedMeta && storedMeta.authoritative === false && !isCoverageAuthorityReason(storedMeta.reason))
       ? null
       : coverageMetadataForWeek(_stats, weekStart, now);
@@ -1361,9 +1407,11 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
     return out;
   };
   const priorCompleteWeeks = Object.keys(weeklyData)
+    .concat([...observationWeekKeys])
     .filter(key => validWeekKey(key) && key < currentWeekStart)
     .sort()
     .reverse()
+    .filter((key, index, keys) => index === 0 || key !== keys[index - 1])
     .slice(0, WEEKLY_MAX_WEEKS)
     .map(weekStart => makeWeek(weekStart, true));
   const currentWeekToDate = makeWeek(currentWeekStart, false);

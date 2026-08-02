@@ -469,6 +469,46 @@ test('panel stats final flush retries after a previous write failure', async () 
   }
 });
 
+test('panel stats flushNow retries when shutdown observes an in-flight write failure', async () => {
+  const file = tmpPanelFile('shutdown-inflight-failure');
+  const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  const originalRename = fsp.rename;
+  let releaseFirstRename;
+  let firstRenameEntered = false;
+  let renameCount = 0;
+  try {
+    const panels = await freshLoadedPanelStats(file);
+    fsp.rename = async function failFirstDelayedRename(...args) {
+      renameCount += 1;
+      if (renameCount === 1) {
+        firstRenameEntered = true;
+        await new Promise(resolve => {
+          releaseFirstRename = resolve;
+        });
+        throw new Error('transient in-flight panel rename failure');
+      }
+      return originalRename.apply(this, args);
+    };
+
+    for (let i = 0; i < 200; i += 1) {
+      panels.recordPanelUsage('alpha', 'orch', { input_tokens: 1 }, () => new Date('2026-07-27T12:00:00.000Z'));
+    }
+    while (!firstRenameEntered) await new Promise(resolve => setImmediate(resolve));
+
+    const drain = panels.flushNow();
+    releaseFirstRename();
+    const result = await drain;
+
+    assert.equal(result.ok, true);
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(persisted['alpha--orch'].input, 200);
+    assert.equal(panels.getPersistenceStatus().durable, true);
+  } finally {
+    fsp.rename = originalRename;
+    cleanup(file, prevEnv);
+  }
+});
+
 test('panel stats treat chmod failure as flush failure', async () => {
   const file = tmpPanelFile('chmod');
   const prevEnv = process.env.MISER_PANEL_STATS_FILE;

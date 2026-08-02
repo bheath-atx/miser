@@ -272,6 +272,7 @@ test('weekly buckets accumulate current week-to-date and prior complete weeks', 
     stats.recordStats('alpha', { inputTokensRemoved: 3, techniques: { dedup: true } }, () => now);
     stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-4', { output_tokens: 2 }, null, () => priorWeekDate);
 
+    stats.__test.setNowFnForTest(() => now);
     const result = stats.getStats('30');
     assert.equal(result.weekly.currentWeekStart, currentWeekKey);
     assert.equal(result.weekly.currentWeekToDate.weekStart, currentWeekKey);
@@ -305,6 +306,7 @@ test('weekly retention caps prior complete weeks and prunes persisted snapshots'
       },
     }, { MISER_WEEKLY_STATS_MAX_WEEKS: '2' });
 
+    stats.__test.setNowFnForTest(() => new Date('2026-07-28T15:00:00.000Z'));
     const result = stats.getStats('30');
     assert.deepEqual(result.weekly.priorCompleteWeeks.map(w => w.weekStart), [
       '2026-07-19T11:00:00.000Z',
@@ -608,6 +610,46 @@ test('known-incomplete coverage with no stored weekly bucket is non-authoritativ
       '2026-07-25',
     ]);
     assert.equal(stats.getStats('9999').weekly.authoritative, false);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('missing completed week after recording start is exposed non-authoritative', () => {
+  const file = tmpStatsFile('missing-complete-week');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const missingWeekKey = '2026-07-19T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, sparseStatsWithRecordingStart('2026-07-12', {
+      '2026-07-12': {},
+      '2026-07-13': {},
+      '2026-07-14': {},
+      '2026-07-15': {},
+      '2026-07-16': {},
+      '2026-07-17': {},
+      '2026-07-18': {},
+      '2026-07-26': {},
+      '2026-07-27': {},
+      '2026-07-28': {},
+    }));
+    stats.__test.setNowFnForTest(() => new Date('2026-07-28T15:00:00.000Z'));
+
+    const result = stats.getStats('9999');
+    const missing = result.weekly.priorCompleteWeeks.find(week => week.weekStart === missingWeekKey);
+    assert.ok(missing, 'missing completed week should be exposed');
+    assert.equal(missing.authoritative, false);
+    assert.equal(missing.nonAuthoritativeReason, 'missing_daily_observation');
+    assert.deepEqual(missing.coverage.presentDays, []);
+    assert.deepEqual(missing.coverage.missingDays, [
+      '2026-07-19',
+      '2026-07-20',
+      '2026-07-21',
+      '2026-07-22',
+      '2026-07-23',
+      '2026-07-24',
+      '2026-07-25',
+    ]);
+    assert.equal(result.nonAuthoritativeWeekCount, 1);
   } finally {
     cleanup(file, prevEnv);
   }
@@ -922,6 +964,7 @@ test('recordingStartedAt is write-once and older records do not cover intervenin
   const weekKey = '2026-07-19T11:00:00.000Z';
   try {
     const stats = freshStats(file);
+    stats.__test.setNowFnForTest(() => new Date('2026-07-28T15:00:00.000Z'));
     stats.recordAnthropicUsage(
       'alpha',
       'anthropic',
@@ -1035,7 +1078,7 @@ test('current partially elapsed week stays authoritative across a UTC-midnight r
   const prevEnv = process.env.MISER_STATS_FILE;
   const weekKey = '2026-07-26T11:00:00.000Z';
   try {
-    const stats = freshStats(file, sparseStatsWithRecordingStart('2026-07-19', {
+    const stats = freshStats(file, sparseStatsWithRecordingStart('2026-07-26', {
       '2026-07-26': {},
       '2026-07-27': {
         alpha: { usage: { anthropic: { model: { input: 4, requests: 1 } } } },
@@ -1288,6 +1331,7 @@ test('budget and policy events are written to weekly buckets', () => {
   try {
     const stats = freshStats(file);
     const now = () => new Date('2026-07-27T12:00:00.000Z');
+    stats.__test.setNowFnForTest(now);
     stats.recordBudgetBlock('alpha', now);
     stats.recordBudgetBlock('alpha', now);
     stats.recordPolicyEvent('alpha', { drift: true, bloat: true }, now);
