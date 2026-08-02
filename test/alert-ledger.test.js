@@ -5,6 +5,7 @@
 // All tests use createLedger(tmpPath, mockNowFn) — NEVER the live default
 // ~/.miser-alert-ledger.json. Also hosts the production sendAlert failure-path
 // unit tests (per AC8: tested here only). Fully offline — no live sockets.
+// Ledger persistence is exercised through MISER_ALERT_LEDGER_FILE temp paths.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -28,11 +29,16 @@ function cleanupFile(file) {
   }
 }
 
+function createEnvLedger(file, nowFn) {
+  process.env.MISER_ALERT_LEDGER_FILE = file;
+  return createLedger(undefined, nowFn);
+}
+
 test('AC7a: same key same UTC day fires exactly once', () => {
   const file = tmpLedgerFile('once');
   try {
     const now = () => new Date('2026-07-23T12:00:00Z');
-    const ledger = createLedger(file, now);
+    const ledger = createEnvLedger(file, now);
     assert.equal(ledger.shouldSend('budget:alpha:warn'), true);
     ledger.markSent('budget:alpha:warn');
     assert.equal(ledger.shouldSend('budget:alpha:warn'), false);
@@ -49,10 +55,10 @@ test('AC7b: restart durability — flushNow() persists, a new instance stays sup
   const file = tmpLedgerFile('restart');
   try {
     const now = () => new Date('2026-07-23T12:00:00Z');
-    const first = createLedger(file, now);
+    const first = createEnvLedger(file, now);
     first.markSent('policy:aetheria:drift');
     await first.flushNow();
-    const second = createLedger(file, now);
+    const second = createEnvLedger(file, now);
     assert.equal(second.shouldSend('policy:aetheria:drift'), false);
     assert.equal(second.shouldSend('policy:aetheria:bloat'), true);
   } finally {
@@ -65,7 +71,7 @@ test('AC7c: next UTC day re-arms (new instance AND same instance)', async () => 
   try {
     let clock = new Date('2026-07-23T23:59:59Z');
     const now = () => clock;
-    const ledger = createLedger(file, now);
+    const ledger = createEnvLedger(file, now);
     ledger.markSent('budget:alpha:cap');
     assert.equal(ledger.shouldSend('budget:alpha:cap'), false);
     await ledger.flushNow();
@@ -75,7 +81,7 @@ test('AC7c: next UTC day re-arms (new instance AND same instance)', async () => 
     assert.equal(ledger.shouldSend('budget:alpha:cap'), true);
 
     // Fresh instance loaded from disk: prior-day mark does not suppress today.
-    const reloaded = createLedger(file, now);
+    const reloaded = createEnvLedger(file, now);
     assert.equal(reloaded.shouldSend('budget:alpha:cap'), true);
   } finally {
     cleanupFile(file);
@@ -89,7 +95,7 @@ test('AC7d: corrupt ledger file → warning + empty in-memory ledger, still func
   console.warn = (line) => warns.push(String(line));
   try {
     fs.writeFileSync(file, 'this is not json{{{', 'utf8');
-    const ledger = createLedger(file, () => new Date('2026-07-23T12:00:00Z'));
+    const ledger = createEnvLedger(file, () => new Date('2026-07-23T12:00:00Z'));
     assert.match(warns.join('\n'), /ledger load failed|corrupt ledger/);
     assert.equal(ledger.shouldSend('budget:alpha:warn'), true);
     ledger.markSent('budget:alpha:warn');
@@ -111,7 +117,7 @@ test('non-object ledger JSON (array) → warning + empty ledger', () => {
   console.warn = (line) => warns.push(String(line));
   try {
     fs.writeFileSync(file, '["not","a","map"]', 'utf8');
-    const ledger = createLedger(file, () => new Date('2026-07-23T12:00:00Z'));
+    const ledger = createEnvLedger(file, () => new Date('2026-07-23T12:00:00Z'));
     assert.match(warns.join('\n'), /corrupt ledger/);
     assert.equal(ledger.shouldSend('anything'), true);
   } finally {
@@ -126,7 +132,7 @@ test('missing file emits one warning and starts empty (spec §3 / AC7)', () => {
   const warns = [];
   console.warn = (line) => warns.push(String(line));
   try {
-    const ledger = createLedger(file, () => new Date('2026-07-23T12:00:00Z'));
+    const ledger = createEnvLedger(file, () => new Date('2026-07-23T12:00:00Z'));
     assert.equal(warns.length, 1);
     assert.ok(warns[0].includes('ledger load failed'), `expected load-failed warn, got: ${warns[0]}`);
     assert.equal(ledger.shouldSend('k'), true);
@@ -144,7 +150,7 @@ test('entries older than 2 days are pruned on load and on write', async () => {
       'budget:recent:cap': '2026-07-22',   // 1 day old → kept
       'budget:today:cap': '2026-07-23',    // today → kept
     }), 'utf8');
-    const ledger = createLedger(file, () => new Date('2026-07-23T12:00:00Z'));
+    const ledger = createEnvLedger(file, () => new Date('2026-07-23T12:00:00Z'));
     ledger.markSent('budget:new:warn');
     await ledger.flushNow();
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));

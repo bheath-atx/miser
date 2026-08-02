@@ -12,6 +12,8 @@ const {
   shouldEmitNow,
 } = require('../src/daily-rollup.js');
 
+const rollupPath = require.resolve('../src/daily-rollup.js');
+
 function dayKey(date) {
   return date.toISOString().slice(0, 10);
 }
@@ -35,6 +37,12 @@ function restoreEnv(prev) {
   else process.env.MISER_PKACHU_ENDPOINT = prev.endpoint;
   if (prev.token === undefined) delete process.env.MISER_PKACHU_TOKEN;
   else process.env.MISER_PKACHU_TOKEN = prev.token;
+}
+
+function freshRollupWithDedupEnv(file) {
+  delete require.cache[rollupPath];
+  process.env.MISER_ROLLUP_DEDUP_FILE = file;
+  return require('../src/daily-rollup.js');
 }
 
 test('rollup baseline excludes today and fires anomaly above two times trailing average', () => {
@@ -206,6 +214,38 @@ test('emitDailyRollup writes dedup marker after successful post and skips same U
     assert.equal(fs.readFileSync(dedupFile, 'utf8'), '2026-07-23');
   } finally {
     restoreEnv(prev);
+    try { fs.unlinkSync(dedupFile); } catch (_) {}
+    try { fs.unlinkSync(tokenFile); } catch (_) {}
+  }
+});
+
+test('emitDailyRollup default dedup marker is isolated by MISER_ROLLUP_DEDUP_FILE', async () => {
+  const prev = {
+    endpoint: process.env.MISER_PKACHU_ENDPOINT,
+    token: process.env.MISER_PKACHU_TOKEN,
+    rollup: process.env.MISER_ROLLUP_DEDUP_FILE,
+  };
+  const dedupFile = tmpFile('dedup-env');
+  const tokenFile = tmpFile('token-env');
+  try {
+    const rollup = freshRollupWithDedupEnv(dedupFile);
+    fs.writeFileSync(tokenFile, 'tok', 'utf8');
+    process.env.MISER_PKACHU_ENDPOINT = 'http://127.0.0.1:1/hook';
+    process.env.MISER_PKACHU_TOKEN = tokenFile;
+    const result = await rollup.emitDailyRollup({
+      '2026-07-23': {
+        alpha: usage('claude-sonnet-4-6', { input: 1_000_000 }),
+      },
+    }, async () => {}, { now: new Date('2026-07-23T00:00:30Z') });
+    assert.equal(result.emitted, true);
+    assert.equal(fs.readFileSync(dedupFile, 'utf8'), '2026-07-23');
+    assert.equal(rollup.DEFAULT_DEDUP_FILE, dedupFile);
+  } finally {
+    if (prev.rollup === undefined) delete process.env.MISER_ROLLUP_DEDUP_FILE;
+    else process.env.MISER_ROLLUP_DEDUP_FILE = prev.rollup;
+    restoreEnv(prev);
+    delete require.cache[rollupPath];
+    require('../src/daily-rollup.js');
     try { fs.unlinkSync(dedupFile); } catch (_) {}
     try { fs.unlinkSync(tokenFile); } catch (_) {}
   }

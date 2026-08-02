@@ -112,6 +112,118 @@ test('flushNow writes all pending records before simulated shutdown', async () =
   }
 });
 
+test('load failure followed by flush does not overwrite existing stats file', async () => {
+  const file = tmpStatsFile('load-failure-refuse');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const prevWarn = console.warn;
+  const prevError = console.error;
+  const corruptBody = '{not json';
+  const warnings = [];
+  const errors = [];
+  let stats;
+  try {
+    console.warn = (...args) => warnings.push(args.join(' '));
+    console.error = (...args) => errors.push(args.join(' '));
+    fs.writeFileSync(file, corruptBody, 'utf8');
+    stats = freshStats(file);
+
+    assert.equal(stats.getPersistenceStatus().lastLoadErrored, true);
+    assert.match(stats.getPersistenceStatus().lastErrorMessage, /Expected property name|Unexpected token/);
+
+    stats.recordStats('alpha', { inputTokensRemoved: 3, techniques: { dedup: true } });
+    const first = await stats.flushNow();
+
+    assert.equal(first.ok, false);
+    assert.equal(first.errorCode, 'LOAD_ERROR');
+    assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
+
+    const degradedAfterFirst = stats.getStats('1');
+    assert.equal(degradedAfterFirst.ok, false);
+    assert.equal(degradedAfterFirst.authoritative, false);
+    assert.equal(degradedAfterFirst.degraded, true);
+    const afterFirst = degradedAfterFirst.persistence;
+    assert.equal(afterFirst.healthy, false);
+    assert.equal(afterFirst.durable, false);
+    assert.equal(afterFirst.pending, true);
+    assert.equal(afterFirst.lastLoadErrored, true);
+    assert.equal(afterFirst.lastFlushErrored, false);
+    assert.equal(afterFirst.lastErrorCode, 'LOAD_ERROR');
+    assert.match(afterFirst.lastErrorMessage, /refusing to overwrite/);
+
+    const second = await stats.flushNow();
+    assert.equal(second.ok, false);
+    assert.equal(fs.readFileSync(file, 'utf8'), corruptBody);
+    stats.recordStats('beta', { inputTokensRemoved: 4, techniques: { dedup: true } });
+    const afterDroppedMutation = stats.getStats('1');
+    assert.equal(afterDroppedMutation.persistence.lastLoadErrored, true);
+    assert.equal(afterDroppedMutation.perProject.beta, undefined);
+    assert.match(warnings.join('\n'), /load failed; starting empty/);
+    assert.match(errors.join('\n'), /refusing flush after load failure/);
+  } finally {
+    console.warn = prevWarn;
+    console.error = prevError;
+    cleanup(file, prevEnv, stats);
+  }
+});
+
+test('load failure mutation drops are counted by label and warned once', async () => {
+  const file = tmpStatsFile('load-failure-drop-counts');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const prevWarn = console.warn;
+  const prevError = console.error;
+  const corruptBody = '{not json';
+  const warnings = [];
+  const errors = [];
+  let stats;
+  try {
+    console.warn = (...args) => warnings.push(args.join(' '));
+    console.error = (...args) => errors.push(args.join(' '));
+    fs.writeFileSync(file, corruptBody, 'utf8');
+    stats = freshStats(file);
+    warnings.length = 0;
+
+    stats.recordStats('seed', { inputTokensRemoved: 3, techniques: { dedup: true } });
+    await stats.flushNow();
+
+    mock.timers.enable({ apis: ['Date'], now: new Date('2026-07-28T12:00:00.000Z') });
+    stats.recordAnthropicUsage('beta', 'anthropic', 'claude-sonnet-4-6', { input_tokens: 11 });
+    mock.timers.setTime(new Date('2026-07-28T12:00:01.000Z').getTime());
+    stats.recordAnthropicUsage('gamma', 'anthropic', 'claude-sonnet-4-6', { output_tokens: 7 });
+    assert.equal(stats.recordBudgetBlock('beta'), 0);
+    assert.deepEqual(stats.recordPolicyEvent('beta', { drift: true, bloat: true }), { modelDriftCount: 0, contextBloatCount: 0 });
+    stats.recordStats('beta', { inputTokensRemoved: 5, techniques: { dedup: true } });
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.equal(snapshot['2026-07-28']?.beta, undefined);
+    assert.equal(snapshot['2026-07-28']?.gamma, undefined);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /load-failure refusal/);
+    assert.match(warnings[0], /further rejection logs suppressed/);
+    assert.match(errors.join('\n'), /refusing flush after load failure/);
+
+    const rejections = stats.getStats('30').recordRejections;
+    assert.equal(rejections.total, 5);
+    assert.equal(rejections.invalidTimestamp, 0);
+    assert.equal(rejections.outOfBoundsTimestamp, 0);
+    assert.equal(rejections.loadFailureRefusal, 5);
+    assert.deepEqual(rejections.byLabel, {
+      usage: 2,
+      budget: 1,
+      policy: 1,
+      optimizer: 1,
+    });
+    assert.equal(rejections.firstRejectedAt, '2026-07-28T12:00:00.000Z');
+    assert.equal(rejections.lastRejectedAt, '2026-07-28T12:00:01.000Z');
+    assert.equal(rejections.firstDroppedAt, '2026-07-28T12:00:00.000Z');
+    assert.equal(rejections.lastDroppedAt, '2026-07-28T12:00:01.000Z');
+  } finally {
+    mock.timers.reset();
+    console.warn = prevWarn;
+    console.error = prevError;
+    cleanup(file, prevEnv, stats);
+  }
+});
+
 // Shutdown race regression: mutation arrives AFTER an initial flushNow() quiesces
 // (simulating an accepted in-flight request that records stats during server.close()).
 // The final flushNow() called after server.close() must capture it.
@@ -157,7 +269,7 @@ test('concurrent flushNow calls resolve without interleaved writes', async () =>
   }
 });
 
-test('flush failure restores dirty and retry persists same data on second attempt', async () => {
+test('flushNow retries a transient non-in-flight write failure before returning', async () => {
   const file = tmpStatsFile('retry');
   const prevEnv = process.env.MISER_STATS_FILE;
   const originalRename = fsp.rename;
@@ -169,19 +281,16 @@ test('flush failure restores dirty and retry persists same data on second attemp
   };
   let stats;
   try {
-    mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
     stats = freshStats(file);
     stats.recordStats('alpha', { inputTokensRemoved: 7, techniques: { dedup: true } });
-    await stats.flushNow();
-    assert.equal(stats.__test._pendingFlush.dirty, true);
-    assert.equal(stats.__test._pendingFlush.writeFailures, 1);
-    mock.timers.tick(5000);
-    await currentFlush(stats);
+    const result = await stats.flushNow();
+    assert.equal(result.ok, true);
+    assert.equal(renameCount, 2);
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(raw[dayKey()].alpha.dedup.inputTokensRemoved, 7);
     assert.equal(stats.__test._pendingFlush.writeFailures, 0);
+    assert.equal(stats.__test._pendingFlush.dirty, false);
   } finally {
-    mock.timers.reset();
     fsp.rename = originalRename;
     cleanup(file, prevEnv, stats);
   }
@@ -216,7 +325,7 @@ test('six consecutive failures log critical and stop retrying', async () => {
   }
 });
 
-test('successful write resets writeFailures to zero', async () => {
+test('successful retry inside flushNow resets writeFailures to zero', async () => {
   const file = tmpStatsFile('reset-failures');
   const prevEnv = process.env.MISER_STATS_FILE;
   const originalRename = fsp.rename;
@@ -228,16 +337,13 @@ test('successful write resets writeFailures to zero', async () => {
   };
   let stats;
   try {
-    mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
     stats = freshStats(file);
     stats.recordStats('alpha', { inputTokensRemoved: 1, techniques: { dedup: true } });
-    await stats.flushNow();
-    assert.equal(stats.__test._pendingFlush.writeFailures, 1);
-    mock.timers.tick(5000);
-    await currentFlush(stats);
+    const result = await stats.flushNow();
+    assert.equal(result.ok, true);
+    assert.equal(renameCount, 2);
     assert.equal(stats.__test._pendingFlush.writeFailures, 0);
   } finally {
-    mock.timers.reset();
     fsp.rename = originalRename;
     cleanup(file, prevEnv, stats);
   }
@@ -284,6 +390,48 @@ test('flushNow drains mutation that arrives during in-flight write', async () =>
   } finally {
     fsp.rename = originalRename;
     fsp.writeFile = originalWriteFile;
+    cleanup(file, prevEnv, stats);
+  }
+});
+
+test('flushNow retries when shutdown observes an in-flight write failure', async () => {
+  const file = tmpStatsFile('shutdown-inflight-failure');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const originalRename = fsp.rename;
+  let releaseFirstRename;
+  let firstRenameEntered = false;
+  let renameCount = 0;
+  let stats;
+
+  fsp.rename = async function failFirstDelayedRename(...args) {
+    renameCount += 1;
+    if (renameCount === 1) {
+      firstRenameEntered = true;
+      await new Promise(resolve => {
+        releaseFirstRename = resolve;
+      });
+      throw new Error('transient in-flight rename failure');
+    }
+    return originalRename.apply(this, args);
+  };
+
+  try {
+    stats = freshStats(file);
+    stats.recordStats('alpha', { inputTokensRemoved: 9, techniques: { dedup: true } });
+    const inFlight = stats.executeFlush();
+    while (!firstRenameEntered) await new Promise(resolve => setImmediate(resolve));
+
+    const drain = stats.flushNow();
+    releaseFirstRename();
+    const [first, drained] = await Promise.all([inFlight, drain]);
+
+    assert.equal(first.ok, false);
+    assert.equal(drained.ok, true);
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(raw[dayKey()].alpha.dedup.inputTokensRemoved, 9);
+    assert.equal(stats.getPersistenceStatus().durable, true);
+  } finally {
+    fsp.rename = originalRename;
     cleanup(file, prevEnv, stats);
   }
 });

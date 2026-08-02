@@ -6,6 +6,7 @@
 const os   = require('node:os');
 const path = require('node:path');
 process.env.MISER_STATS_FILE = path.join(os.tmpdir(), `miser-panel-test-${process.pid}-${Date.now()}.json`);
+process.env.MISER_PANEL_STATS_FILE = path.join(os.tmpdir(), `miser-panel-stats-test-${process.pid}-${Date.now()}.json`);
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -36,6 +37,14 @@ function runGetHandler(handler, url) {
     res.end = (chunk) => { origEnd(chunk); resolve(res); return res; };
     handler(fakeGetReq(url), res);
   });
+}
+
+function clearPanelEndpointModules() {
+  for (const key of Object.keys(require.cache)) {
+    if (/\/src\/(proxy|panel-stats|routing|stats|pricing|config|metrics|budgets|policy-watchdog|context-management)\.js$/.test(key.replace(/\\/g, '/'))) {
+      delete require.cache[key];
+    }
+  }
 }
 
 // ---- AC10–AC14, AC19: classifyRoute panel routing ---------------------------
@@ -125,11 +134,42 @@ test('AC17: GET /api/miser/stats/panels returns correct structure', async () => 
   const res = await runGetHandler(handler, '/api/miser/stats/panels');
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body());
-  assert.equal(body.ok, true);
-  assert.equal(body.note, 'in-memory; resets on restart');
+  assert.equal(body.ok, false);
+  assert.equal(body.note, 'persistence pending; panel stats may not survive restart yet');
+  assert.equal(body.durable, false);
+  assert.equal(body.degraded, false);
+  assert.equal(body.persistence.healthy, true);
+  assert.equal(body.persistence.pending, true);
+  assert.equal(body.persistence.dirty, true);
   assert.ok(typeof body.panels === 'object');
   assert.ok('testproj--testpanel' in body.panels);
   assert.equal(body.panels['testproj--testpanel'].input, 42);
+});
+
+test('GET /api/miser/stats/panels reflects degraded persistence', async () => {
+  const prevEnv = process.env.MISER_PANEL_STATS_FILE;
+  const dir = require('node:fs').mkdtempSync(path.join(os.tmpdir(), `miser-panel-endpoint-dir-${process.pid}-`));
+  try {
+    process.env.MISER_PANEL_STATS_FILE = dir;
+    clearPanelEndpointModules();
+    const { createProxy: createReloadedProxy } = require('../src/proxy.js');
+    await require('../src/panel-stats.js').__test.waitForLoad();
+    const handler = createReloadedProxy();
+    const res = await runGetHandler(handler, '/api/miser/stats/panels');
+    assert.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body());
+    assert.equal(body.ok, false);
+    assert.equal(body.durable, false);
+    assert.equal(body.degraded, true);
+    assert.equal(body.persistence.healthy, false);
+    assert.notEqual(body.note, 'persisted; survives restart');
+    assert.match(body.note, /degraded/);
+  } finally {
+    if (prevEnv === undefined) delete process.env.MISER_PANEL_STATS_FILE;
+    else process.env.MISER_PANEL_STATS_FILE = prevEnv;
+    clearPanelEndpointModules();
+    try { require('node:fs').rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+  }
 });
 
 test('routing: classifyRoute GET /api/miser/stats/panels → stats_panels kind', () => {

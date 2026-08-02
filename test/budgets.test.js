@@ -25,6 +25,11 @@ function tmpFile(name) {
   return path.join(os.tmpdir(), `miser-budgets-${process.pid}-${name}-${Date.now()}-${Math.random()}.json`);
 }
 
+function createEnvLedger(file, nowFn) {
+  process.env.MISER_ALERT_LEDGER_FILE = file;
+  return createLedger(undefined, nowFn);
+}
+
 // budgets.js binds the stats module at require time, so both must be
 // re-required together for a fresh in-memory stats tree per test.
 function freshModules(statsFile) {
@@ -262,7 +267,7 @@ test('AC3: warn once at 80%, cap once at 100%, block repeats without re-alerting
     const sendAlert = async (text) => { alerts.push(text); };
     let clock = new Date(); // real today — stats todayKey() uses the real clock
     const nowFn = () => clock;
-    const ledger = createLedger(ledgerFile, nowFn);
+    const ledger = createEnvLedger(ledgerFile, nowFn);
     const guardDeps = {
       budgetsConfig: { alpha: { dailyUSD: 5 } },
       budgetGraceConfig: [],
@@ -329,7 +334,7 @@ test('grace project at cap: cap alert fires with GRACE text, request passes, no 
     const guardDeps = {
       budgetsConfig: { alpha: { dailyUSD: 2 } },
       budgetGraceConfig: ['alpha'],
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -356,7 +361,7 @@ test('unbudgeted project and budgets-OFF are state OFF: no check, no alert', asy
     const guardDeps = {
       budgetsConfig: { alpha: { dailyUSD: 1 } },
       budgetGraceConfig: [],
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -410,11 +415,42 @@ test('AC4: budget check sees un-flushed usage (no flushNow anywhere)', () => {
     const block = budgets.checkBudget('alpha', {
       budgetsConfig: { alpha: { dailyUSD: 5 } },
       budgetGraceConfig: [],
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async () => {},
       nowFn,
     });
     assert.equal(block.status, 429);
+  } finally {
+    cleanup(statsFile);
+    cleanup(ledgerFile);
+  }
+});
+
+test('budget cap sees boundary usage recorded under the same UTC day key', async () => {
+  const statsFile = tmpFile('boundary-cap');
+  const ledgerFile = tmpFile('boundary-cap-ledger');
+  const { stats, budgets } = freshModules(statsFile);
+  try {
+    const alerts = [];
+    const boundary = new Date('2026-07-26T01:00:00.000Z');
+    const nowFn = () => boundary;
+    const guardDeps = {
+      budgetsConfig: { alpha: { dailyUSD: 2 } },
+      budgetGraceConfig: [],
+      ledger: createEnvLedger(ledgerFile, nowFn),
+      sendAlert: async (text) => { alerts.push(text); },
+      nowFn,
+    };
+
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 2 }, null, nowFn);
+    assert.equal(stats.getRawStatsSnapshot()['2026-07-26'].alpha.usage.anthropic.testmodel.input, 2);
+
+    const block = budgets.checkBudget('alpha', guardDeps);
+    assert.equal(block.status, 429);
+    assert.equal(block.body.error.message, "miser: project 'alpha' daily budget of $2.00 exhausted (spent $2.00); resets at next UTC midnight");
+    assert.equal(stats.getRawStatsSnapshot()['2026-07-26'].alpha.budget.blockedCount, 1);
+    await tick();
+    assert.deepEqual(alerts, ['⛔ miser budget: alpha EXHAUSTED $2.00/$2.00 — blocking until UTC midnight']);
   } finally {
     cleanup(statsFile);
     cleanup(ledgerFile);
@@ -483,7 +519,7 @@ test('AC8: checkBudget returns before a pending sendAlert resolves; second event
     const guardDeps = {
       budgetsConfig: { alpha: { dailyUSD: 1 } },
       budgetGraceConfig: [],
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: () => { callCount += 1; return pending; },
       nowFn,
     };
@@ -517,7 +553,7 @@ test('AC8: a rejecting injected sendAlert is swallowed by the dispatch wrapper',
     const block = budgets.checkBudget('alpha', {
       budgetsConfig: { alpha: { dailyUSD: 1 } },
       budgetGraceConfig: [],
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: () => Promise.reject(new Error('pkachu down')),
       nowFn,
     });

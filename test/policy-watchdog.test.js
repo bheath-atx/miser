@@ -19,6 +19,11 @@ function tmpFile(name) {
   return path.join(os.tmpdir(), `miser-policy-${process.pid}-${name}-${Date.now()}-${Math.random()}.json`);
 }
 
+function createEnvLedger(file, nowFn) {
+  process.env.MISER_ALERT_LEDGER_FILE = file;
+  return createLedger(undefined, nowFn);
+}
+
 function freshModules(statsFile) {
   delete require.cache[statsPath];
   delete require.cache[watchdogPath];
@@ -120,7 +125,7 @@ test('AC5a/b: mismatched model alerts once, counter keeps incrementing; matching
     const nowFn = () => new Date();
     const guardDeps = {
       policyConfig: { orch: { expectedModel: 'claude-sonnet' } },
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -161,7 +166,7 @@ test('AC5c: absent / non-string body.model → skip, no alert, no throw', async 
     const nowFn = () => new Date();
     const guardDeps = {
       policyConfig: { orch: { expectedModel: 'claude-sonnet' } },
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -187,7 +192,7 @@ test('AC5d: bloat-only policy project → drift skips silently on ANY model', as
     const nowFn = () => new Date();
     const guardDeps = {
       policyConfig: { orch: { maxContextTokens: 100000 } }, // no expectedModel
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -232,7 +237,7 @@ test('AC6a: measured usage over threshold → one alert + counter increments per
     const nowFn = () => new Date();
     const guardDeps = {
       policyConfig: { orch: { maxContextTokens: 100000 } },
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -281,7 +286,7 @@ test('AC6b: null / missing usage → returns immediately, no event, no fabricate
     const nowFn = () => new Date();
     const guardDeps = {
       policyConfig: { orch: { maxContextTokens: 10000 } },
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -309,7 +314,7 @@ test('AC6: at-threshold is NOT bloat (strictly greater-than), drift-only policy 
         orch: { maxContextTokens: 100000 },
         driftproj: { expectedModel: 'claude-sonnet' },
       },
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async (t) => { alerts.push(t); },
       nowFn,
     };
@@ -351,7 +356,7 @@ test('drift + bloat counters share one sparse policy node per project per day', 
     const nowFn = () => new Date();
     const guardDeps = {
       policyConfig: { orch: { expectedModel: 'claude-sonnet', maxContextTokens: 10000 } },
-      ledger: createLedger(ledgerFile, nowFn),
+      ledger: createEnvLedger(ledgerFile, nowFn),
       sendAlert: async () => {},
       nowFn,
     };

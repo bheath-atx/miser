@@ -48,6 +48,7 @@ The old goal of saving billed tokens through proxy-side byte mutation is withdra
 | `GET /api/miser/quota` | Legacy request-count quota view |
 | `GET /api/miser/stats?days=N&project=X` | Optimizer legacy counters plus sparse measured usage tree and Anthropic estimated dollars |
 | `GET /api/miser/stats/trend?days=N&project=X` | Sparse daily measured-usage trend entries, capped at 90 days |
+| `GET /api/miser/stats/panels` | Per-project/per-panel attribution counters for `/p/<project>--<panel>/v1/messages` traffic |
 
 Project path names must match `[A-Za-z0-9._-]{1,80}` after one URL-decode pass. Invalid `/p/...` shapes return 404 and are not forwarded.
 
@@ -67,6 +68,24 @@ Anthropic 2xx responses are tee-parsed without buffering SSE streams. Stats incl
 
 Missing usage means “not measured”; v4 does not zero-fill absent usage nodes.
 
+`GET /api/miser/stats`, `GET /api/miser/stats/trend`, and `GET /api/miser/stats/panels` use `ok` as a data-authority flag, not as a handler-reachability flag. They return HTTP 200 when reachable even if `ok:false`. On `GET /api/miser/stats`, top-level `ok` / `authoritative` cover the rolling-window aggregate and persistence state; they do not cover per-week authority. `GET /api/miser/stats/trend` mirrors the same persistence contract while returning its sparse `entries` payload. Clients must check:
+
+- `authoritative`: true only when the returned counters are durable and not degraded.
+- `durable`: true only when there are no pending writes and persistence is healthy.
+- `degraded`: true when load/write/persistence state means the counters are not authoritative.
+- `persistence`: detailed load, flush, pending, and file state.
+- `recordRejections`: dropped/rejected record counters and `byLabel` breakdown. Main stats labels include `usage`, `budget`, `policy`, and `optimizer`; panel stats labels are `<project>--<panel>`.
+- `weeklyAuthoritative`: true only when every exposed week is authoritative.
+- `nonAuthoritativeWeekCount` / `nonAuthoritativeReasons`: top-level weekly rollup fields, so clients do not have to iterate the weekly array to detect unverified weekly data.
+
+Weekly stats in the `/api/miser/stats` response include `authoritative` / `degraded` at the weekly summary and per-week level. Contract revision: weekly authority is no longer proven by daily-key coverage. A weekly total is authoritative only when persistence is healthy and durable and the persisted `__weekly` bucket carries explicit `recorded_event_instant` provenance from a stats writer. This follows the record-don't-reconstruct rule: subscription weeks are keyed from the event instant, while daily UTC keys are an observation log for rolling windows and legacy recovery. An empty daily object `{}` means the day was observed and quiet; a missing daily key means the day was not observed. Daily coverage can explain degradation for missing unrecorded weeks, but it cannot make reconstructed or unprovenanced weekly data authoritative. The top-level `weeklyAuthoritative` rollup is the response-level signal for weekly authority. A non-authoritative week carries `nonAuthoritativeReason` and, when daily observations are missing, `coverage`. Current reasons:
+
+- `missing_daily_observation`: at least one expected day key for the week is absent.
+- `missing_weekly_provenance`: a stored or exposed weekly bucket has no explicit event-instant provenance, including legacy/R20-era stored weekly data and hand-edited snapshots.
+- `inferred_from_legacy_daily`: the weekly bucket was rebuilt from legacy daily-only data and is preserved for visibility only.
+- `persistence_degraded`: stats persistence is unhealthy or not durable.
+- `migration_retention_failed`: weekly migration/retention failed, so preserved weekly data cannot be trusted as authoritative.
+
 `GET /api/miser/health` returns process vitals:
 
 - `ok`
@@ -76,6 +95,8 @@ Missing usage means “not measured”; v4 does not zero-fill absent usage nodes
 - `c1DisabledProjects`
 - `statsFlushLagMs`
 - `pendingWrites`
+
+Health `ok` remains the process health flag. Stats endpoint `ok` values are stricter: HTTP 200 with `ok:false` means “reachable, but not authoritative.”
 
 ---
 
