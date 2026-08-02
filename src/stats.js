@@ -927,13 +927,23 @@ function reconcileWeeklyFromDaily(statsObj, now) {
         hasRecordedWeekly = true;
         continue;
       }
-      markUnprovenancedStoredWeekNonAuthoritative(weekData);
+      if (markUnprovenancedStoredWeekNonAuthoritative(weekData)) changed = true;
     }
   }
-  if (hasRecordedWeekly) return changed;
   const rebuilt = buildWeeklyFromDaily(statsObj);
-  const oldestExistingWeek = isWeeklyContainer(statsObj[WEEKLY_KEY])
-    ? Object.keys(statsObj[WEEKLY_KEY]).filter(validWeekKey).sort()[0]
+  const oldestStoredLegacyWeek = isWeeklyContainer(statsObj[WEEKLY_KEY])
+    ? Object.entries(statsObj[WEEKLY_KEY])
+      .filter(([weekKey, weekData]) => validWeekKey(weekKey)
+        && isWeeklyContainer(weekData)
+        && !hasWeeklyRecordedProvenance(weekData))
+      .map(([weekKey]) => weekKey)
+      .sort()[0]
+    : null;
+  const firstRecordedWeek = hasRecordedWeekly && isWeeklyContainer(statsObj[WEEKLY_KEY])
+    ? Object.entries(statsObj[WEEKLY_KEY])
+      .filter(([weekKey, weekData]) => validWeekKey(weekKey) && hasWeeklyRecordedProvenance(weekData))
+      .map(([weekKey]) => weekKey)
+      .sort()[0]
     : null;
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
   const retainedPriorBackfill = new Set(Object.keys(rebuilt)
@@ -943,12 +953,14 @@ function reconcileWeeklyFromDaily(statsObj, now) {
     .slice(0, WEEKLY_MAX_WEEKS));
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
     if (!validWeekKey(weekKey)) continue;
-    if (oldestExistingWeek && weekKey < oldestExistingWeek) continue;
+    if (oldestStoredLegacyWeek && weekKey < oldestStoredLegacyWeek) continue;
+    if (firstRecordedWeek && weekKey >= firstRecordedWeek) continue;
     if (weekKey < currentWeekStart && !retainedPriorBackfill.has(weekKey)) continue;
     const current = statsObj[WEEKLY_KEY] && statsObj[WEEKLY_KEY][weekKey];
     if (isWeeklyContainer(current)) continue;
     if (!statsObj[WEEKLY_KEY] || !isWeeklyContainer(statsObj[WEEKLY_KEY])) statsObj[WEEKLY_KEY] = {};
     statsObj[WEEKLY_KEY][weekKey] = markWeekNonAuthoritative(weekData, 'inferred_from_legacy_daily');
+    changed = true;
   }
   if (isWeeklyContainer(statsObj[WEEKLY_KEY]) && Object.keys(statsObj[WEEKLY_KEY]).length === 0) {
     delete statsObj[WEEKLY_KEY];

@@ -65,6 +65,7 @@ async function driveTrend(file, seed, url) {
   fs.writeFileSync(file, JSON.stringify(seed), 'utf8');
   process.env.MISER_STATS_FILE = file;
   const { createProxy } = require('../src/proxy.js');
+  await require('../src/stats.js').flushNow();
   const res = new FakeRes();
   const handler = createProxy();
   handler(fakeReq(url), res);

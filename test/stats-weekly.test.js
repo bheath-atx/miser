@@ -493,6 +493,87 @@ test('legacy daily-only stats are backfilled non-authoritatively when no weekly 
   }
 });
 
+test('load reconciliation persists missing-provenance classification without an explicit writer', async () => {
+  const file = tmpStatsFile('persist-missing-provenance');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  let stats;
+  try {
+    stats = freshStats(file, {
+      __weekly: {
+        [weekKey]: {
+          alpha: { usage: { anthropic: { model: { input: 17, requests: 1 } } } },
+        },
+      },
+    });
+    clearTimeout(stats.__test._observationSeal.startupTimer);
+    stats.__test._observationSeal.startupTimer = null;
+
+    await waitForPersistedJson(
+      file,
+      data => data && data.__weekly && data.__weekly[weekKey]
+        && data.__weekly[weekKey].__meta
+        && data.__weekly[weekKey].__meta.reason === 'missing_weekly_provenance',
+      'missing-provenance load reconciliation should schedule persistence',
+    );
+
+    stats.__resetForTest();
+    delete require.cache[statsPath];
+    stats = freshStats(file);
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.deepEqual(snapshot.__weekly[weekKey].__meta, {
+      authoritative: false,
+      reason: 'missing_weekly_provenance',
+    });
+    assert.equal(snapshot.__weekly[weekKey].alpha.usage.anthropic.model.input, 17);
+  } finally {
+    if (stats && stats.__resetForTest) stats.__resetForTest();
+    cleanup(file, prevEnv);
+  }
+});
+
+test('load reconciliation persists legacy daily backfill without an explicit writer', async () => {
+  const file = tmpStatsFile('persist-legacy-backfill');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const weekKey = '2026-07-19T11:00:00.000Z';
+  let stats;
+  try {
+    stats = freshStats(file, sparseStatsWithRecordingStart('2026-07-20', {
+      '2026-07-20': {
+        alpha: { usage: { anthropic: { model: { input: 10, requests: 1 } } } },
+      },
+      '2026-07-21': {
+        alpha: { usage: { anthropic: { model: { output: 4, requests: 1 } } } },
+      },
+    }));
+    clearTimeout(stats.__test._observationSeal.startupTimer);
+    stats.__test._observationSeal.startupTimer = null;
+
+    await waitForPersistedJson(
+      file,
+      data => data && data.__weekly && data.__weekly[weekKey]
+        && data.__weekly[weekKey].__meta
+        && data.__weekly[weekKey].__meta.reason === 'inferred_from_legacy_daily',
+      'legacy daily backfill should schedule persistence',
+    );
+
+    stats.__resetForTest();
+    delete require.cache[statsPath];
+    stats = freshStats(file);
+    const rawWeek = stats.getRawStatsSnapshot().__weekly[weekKey];
+    assert.deepEqual(rawWeek.__meta, {
+      authoritative: false,
+      reason: 'inferred_from_legacy_daily',
+    });
+    assert.equal(rawWeek.alpha.usage.anthropic.model.input, 10);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.output, 4);
+    assert.equal(rawWeek.alpha.usage.anthropic.model.requests, 2);
+  } finally {
+    if (stats && stats.__resetForTest) stats.__resetForTest();
+    cleanup(file, prevEnv);
+  }
+});
+
 test('legacy UTC daily-only boundary usage is never exposed as authoritative weekly data', () => {
   const file = tmpStatsFile('legacy-boundary-daily-only');
   const prevEnv = process.env.MISER_STATS_FILE;
@@ -702,6 +783,52 @@ test('mixed stored-weekly and daily-only legacy data reconciles missing weeks pe
     assert.equal(unprovenanced.nonAuthoritativeReason, 'missing_weekly_provenance');
     assert.equal(inferred.authoritative, false);
     assert.equal(inferred.nonAuthoritativeReason, 'inferred_from_legacy_daily');
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('mixed provenanced weekly and older daily-only legacy data backfills only missing older weeks', async () => {
+  const file = tmpStatsFile('mixed-provenanced-and-older-daily-only');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  const inferredWeekKey = '2026-07-19T11:00:00.000Z';
+  const recordedWeekKey = '2026-07-26T11:00:00.000Z';
+  try {
+    const stats = freshStats(file, sparseStatsWithRecordingStart('2026-07-20', {
+      '2026-07-20': {
+        beta: { usage: { anthropic: { model: { input: 31, requests: 1 } } } },
+      },
+      '2026-07-21': {
+        beta: { usage: { anthropic: { model: { output: 9, requests: 1 } } } },
+      },
+      __weekly: {
+        [recordedWeekKey]: {
+          __meta: recordedWeeklyMeta(),
+          alpha: { usage: { anthropic: { model: { input: 17, requests: 1 } } } },
+        },
+      },
+    }));
+    stats.__test.setNowFnForTest(() => new Date('2026-08-03T12:00:00.000Z'));
+
+    const snapshot = stats.getRawStatsSnapshot();
+    assert.deepEqual(Object.keys(snapshot.__weekly).sort(), [inferredWeekKey, recordedWeekKey]);
+    assert.deepEqual(snapshot.__weekly[recordedWeekKey].__meta, recordedWeeklyMeta());
+    assert.equal(snapshot.__weekly[recordedWeekKey].alpha.usage.anthropic.model.input, 17);
+    assert.deepEqual(snapshot.__weekly[inferredWeekKey].__meta, {
+      authoritative: false,
+      reason: 'inferred_from_legacy_daily',
+    });
+    assert.equal(snapshot.__weekly[inferredWeekKey].beta.usage.anthropic.model.input, 31);
+    assert.equal(snapshot.__weekly[inferredWeekKey].beta.usage.anthropic.model.output, 9);
+
+    await stats.flushNow();
+    const result = stats.getStats('9999');
+    const inferred = result.weekly.priorCompleteWeeks.find(week => week.weekStart === inferredWeekKey);
+    const recorded = result.weekly.priorCompleteWeeks.find(week => week.weekStart === recordedWeekKey);
+    assert.equal(inferred.authoritative, false);
+    assert.equal(inferred.nonAuthoritativeReason, 'inferred_from_legacy_daily');
+    assert.equal(recorded.authoritative, true);
+    assert.equal(recorded.nonAuthoritativeReason, undefined);
   } finally {
     cleanup(file, prevEnv);
   }
@@ -1658,6 +1785,7 @@ test('/api/miser/stats/trend ignores internal weekly buckets and keeps daily sha
       },
     }), 'utf8');
     const { createProxy } = require('../src/proxy.js');
+    await require('../src/stats.js').flushNow();
     const res = new FakeRes();
     createProxy()(fakeReq('/api/miser/stats/trend?days=9999'), res);
     await res.whenDone();
@@ -1697,6 +1825,7 @@ test('/api/miser/stats/trend intentionally ignores legacy malformed daily keys',
       },
     }), 'utf8');
     const { createProxy } = require('../src/proxy.js');
+    await require('../src/stats.js').flushNow();
     const res = new FakeRes();
     createProxy()(fakeReq('/api/miser/stats/trend?days=9999'), res);
     await res.whenDone();

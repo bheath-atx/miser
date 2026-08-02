@@ -344,6 +344,7 @@ test('/api/miser/stats exposes top-level weekly authority rollup without lowerin
   const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_STATS_FILE: file });
   try {
     require('../src/stats.js').__test.setNowFnForTest(() => new Date('2026-07-26T12:00:00.000Z'));
+    await require('../src/stats.js').flushNow();
     const res = fakeRes();
     await drive(createProxy, fakeReq('GET', '/api/miser/stats', null, {}), res);
     const payload = JSON.parse(res.body());
