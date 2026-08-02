@@ -655,6 +655,40 @@ test('missing completed week after recording start is exposed non-authoritative'
   }
 });
 
+test('retained weeks after the recording-start cap are exposed non-authoritative', () => {
+  const file = tmpStatsFile('missing-complete-week-after-cap');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file, sparseStatsWithRecordingStart('2025-01-05'));
+    stats.__test.setNowFnForTest(() => new Date('2027-03-16T15:00:00.000Z'));
+    const missingWeekKey = stats.__test.subscriptionWeekKeyFromDate(new Date('2027-03-07T15:00:00.000Z'));
+
+    const result = stats.getStats('9999');
+    const missing = result.weekly.priorCompleteWeeks.find(week => week.weekStart === missingWeekKey);
+    assert.ok(missing, 'missing retained week after the old iteration cap should be exposed');
+    assert.equal(result.weekly.priorCompleteWeeks.length, stats.__test.WEEKLY_MAX_WEEKS);
+    assert.equal(missing.authoritative, false);
+    assert.equal(missing.degraded, true);
+    assert.equal(missing.nonAuthoritativeReason, 'missing_daily_observation');
+    assert.deepEqual(missing.coverage.presentDays, []);
+    assert.deepEqual(missing.coverage.missingDays, [
+      '2027-03-07',
+      '2027-03-08',
+      '2027-03-09',
+      '2027-03-10',
+      '2027-03-11',
+      '2027-03-12',
+      '2027-03-13',
+    ]);
+    assert.equal(result.weekly.currentWeekToDate.authoritative, false);
+    assert.equal(result.weekly.currentWeekToDate.nonAuthoritativeReason, 'missing_daily_observation');
+    assert.equal(result.nonAuthoritativeWeekCount, stats.__test.WEEKLY_MAX_WEEKS + 1);
+    assert.deepEqual(result.nonAuthoritativeReasons, ['missing_daily_observation']);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
 test('legacy-only daily retention watermark is deleted without using it as recording boundary', async () => {
   const file = tmpStatsFile('legacy-recording-start-migration');
   const prevEnv = process.env.MISER_STATS_FILE;

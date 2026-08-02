@@ -928,21 +928,30 @@ function nextSubscriptionWeekKey(weekKey) {
   return subscriptionWeekKeyFromDate(nextProbe);
 }
 
+function previousSubscriptionWeekKey(weekKey) {
+  if (!validWeekKey(weekKey)) return null;
+  const previousProbe = new Date(new Date(weekKey).getTime() - 6 * 24 * 60 * 60 * 1000);
+  return subscriptionWeekKeyFromDate(previousProbe);
+}
+
 function weeklyKeysSinceRecordingStart(statsObj, now) {
   requireNow(now, 'weeklyKeysSinceRecordingStart');
   const recordingStartedAt = getRecordingStartedAt(statsObj);
   if (!recordingStartedAt) return [];
   const currentWeekStart = subscriptionWeekKeyFromDate(now);
-  let weekKey = subscriptionWeekKeyFromDate(new Date(`${recordingStartedAt}T12:00:00.000Z`));
+  const recordingWeekStart = subscriptionWeekKeyFromDate(new Date(`${recordingStartedAt}T12:00:00.000Z`));
+  if (!validWeekKey(recordingWeekStart) || recordingWeekStart > currentWeekStart) return [];
   const keys = [];
-  for (let guard = 0; validWeekKey(weekKey) && weekKey <= currentWeekStart && guard < WEEKLY_MAX_WEEKS + 2; guard += 1) {
+  let weekKey = currentWeekStart;
+  // Walk the retained display window backward so an ancient recording boundary
+  // cannot exhaust the bound before reaching the weeks getStats() can expose.
+  for (let guard = 0; validWeekKey(weekKey) && weekKey >= recordingWeekStart && guard <= WEEKLY_MAX_WEEKS; guard += 1) {
     keys.push(weekKey);
-    if (weekKey === currentWeekStart) break;
-    const next = nextSubscriptionWeekKey(weekKey);
-    if (!next || next <= weekKey) break;
-    weekKey = next;
+    const previous = previousSubscriptionWeekKey(weekKey);
+    if (!previous || previous >= weekKey) break;
+    weekKey = previous;
   }
-  return keys;
+  return keys.reverse();
 }
 
 function emptyTechniqueBucket() {
