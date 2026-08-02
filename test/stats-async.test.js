@@ -269,7 +269,7 @@ test('concurrent flushNow calls resolve without interleaved writes', async () =>
   }
 });
 
-test('flush failure restores dirty and retry persists same data on second attempt', async () => {
+test('flushNow retries a transient non-in-flight write failure before returning', async () => {
   const file = tmpStatsFile('retry');
   const prevEnv = process.env.MISER_STATS_FILE;
   const originalRename = fsp.rename;
@@ -281,19 +281,16 @@ test('flush failure restores dirty and retry persists same data on second attemp
   };
   let stats;
   try {
-    mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
     stats = freshStats(file);
     stats.recordStats('alpha', { inputTokensRemoved: 7, techniques: { dedup: true } });
-    await stats.flushNow();
-    assert.equal(stats.__test._pendingFlush.dirty, true);
-    assert.equal(stats.__test._pendingFlush.writeFailures, 1);
-    mock.timers.tick(5000);
-    await currentFlush(stats);
+    const result = await stats.flushNow();
+    assert.equal(result.ok, true);
+    assert.equal(renameCount, 2);
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(raw[dayKey()].alpha.dedup.inputTokensRemoved, 7);
     assert.equal(stats.__test._pendingFlush.writeFailures, 0);
+    assert.equal(stats.__test._pendingFlush.dirty, false);
   } finally {
-    mock.timers.reset();
     fsp.rename = originalRename;
     cleanup(file, prevEnv, stats);
   }
@@ -328,7 +325,7 @@ test('six consecutive failures log critical and stop retrying', async () => {
   }
 });
 
-test('successful write resets writeFailures to zero', async () => {
+test('successful retry inside flushNow resets writeFailures to zero', async () => {
   const file = tmpStatsFile('reset-failures');
   const prevEnv = process.env.MISER_STATS_FILE;
   const originalRename = fsp.rename;
@@ -340,16 +337,13 @@ test('successful write resets writeFailures to zero', async () => {
   };
   let stats;
   try {
-    mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
     stats = freshStats(file);
     stats.recordStats('alpha', { inputTokensRemoved: 1, techniques: { dedup: true } });
-    await stats.flushNow();
-    assert.equal(stats.__test._pendingFlush.writeFailures, 1);
-    mock.timers.tick(5000);
-    await currentFlush(stats);
+    const result = await stats.flushNow();
+    assert.equal(result.ok, true);
+    assert.equal(renameCount, 2);
     assert.equal(stats.__test._pendingFlush.writeFailures, 0);
   } finally {
-    mock.timers.reset();
     fsp.rename = originalRename;
     cleanup(file, prevEnv, stats);
   }

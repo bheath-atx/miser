@@ -13,10 +13,12 @@ const STATS_FILE = process.env.MISER_STATS_FILE
 const WEEKLY_KEY = '__weekly';
 const WEEKLY_META_KEY = '__meta';
 const STATS_META_KEY = '__meta';
+const WEEKLY_RECORDED_PROVENANCE = 'recorded_event_instant';
 // Historical E3-only key name retained only so unshipped snapshots can be cleaned.
 const DAILY_RETENTION_WATERMARK_KEY = 'dailyRetentionWatermark';
-// Daily buckets are the observation log. __meta.recordingStartedAt is display
-// metadata only; weekly authority is based on daily key presence plus persistence.
+// Daily buckets remain the rolling-window observation log. Weekly authority is
+// based on explicit event-instant provenance on the weekly bucket plus healthy
+// persistence; missing provenance is never treated as authority.
 const RECORDING_STARTED_AT_KEY = 'recordingStartedAt';
 const SUBSCRIPTION_TIME_ZONE = 'America/Chicago';
 const DEFAULT_OBSERVATION_SEAL_INTERVAL_MS = 60_000;
@@ -183,9 +185,9 @@ function loadStats() {
     const removedLegacyOnlyBoundary = migrateStatsMeta(parsed);
     const derivedBoundary = removedLegacyOnlyBoundary ? false : deriveRecordingStartedAtFromDaily(parsed);
     const loadNow = defaultNow();
-    reconcileWeeklyFromDaily(parsed, loadNow);
+    const reconciledWeekly = reconcileWeeklyFromDaily(parsed, loadNow);
     pruneWeeklyRetention(parsed, loadNow);
-    if (hadLegacyBoundary || derivedBoundary) _loadStatsNeedsFlush = true;
+    if (hadLegacyBoundary || derivedBoundary || reconciledWeekly) _loadStatsNeedsFlush = true;
   } catch (err) {
     console.error('[miser/stats] ERROR stats migration/retention failed; preserving parsed daily stats:', err.message);
     if (!parsed[WEEKLY_KEY] || typeof parsed[WEEKLY_KEY] !== 'object' || Array.isArray(parsed[WEEKLY_KEY])) {
@@ -307,7 +309,7 @@ function executeFlush() {
     } finally {
       _pendingFlush.inFlight = false;
       _pendingFlush.currentPromise = null;
-      if (shouldReschedule && !_pendingFlush.lastFlushErrored) scheduleFlush(false);
+      if (shouldReschedule && !_pendingFlush.lastFlushErrored) scheduleFlush(false, 0);
     }
   })();
 
@@ -321,7 +323,6 @@ async function drainFlushNow() {
   clearTimer('retryTimer');
   let lastResult = { ok: true, file: STATS_FILE };
   let attempts = 0;
-  let retryObservedInFlightFailure = false;
   const startedAt = Date.now();
   while (true) {
     if (_pendingFlush.inFlight) {
@@ -329,7 +330,6 @@ async function drainFlushNow() {
       attempts += 1;
       if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
       if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
-        retryObservedInFlightFailure = true;
         if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
           console.error(`[miser/stats] CRITICAL final stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
           return lastResult;
@@ -345,7 +345,6 @@ async function drainFlushNow() {
     attempts += 1;
     if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
     if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
-      if (!retryObservedInFlightFailure) return lastResult;
       if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
         console.error(`[miser/stats] CRITICAL final stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
         return lastResult;
@@ -868,6 +867,34 @@ function markWeekNonAuthoritative(weekData, reason, extra = null) {
   return weekData;
 }
 
+function hasWeeklyRecordedProvenance(weekData) {
+  if (!isWeeklyContainer(weekData)) return false;
+  const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
+  return !!(meta
+    && meta.authoritative === true
+    && meta.provenance === WEEKLY_RECORDED_PROVENANCE);
+}
+
+function markWeekRecordedFromEventInstant(weekData) {
+  if (!isWeeklyContainer(weekData)) return weekData;
+  const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
+  if (meta && meta.authoritative === false) return weekData;
+  weekData[WEEKLY_META_KEY] = {
+    authoritative: true,
+    provenance: WEEKLY_RECORDED_PROVENANCE,
+  };
+  return weekData;
+}
+
+function markUnprovenancedStoredWeekNonAuthoritative(weekData) {
+  if (!isWeeklyContainer(weekData)) return false;
+  const meta = isWeeklyContainer(weekData[WEEKLY_META_KEY]) ? weekData[WEEKLY_META_KEY] : null;
+  if (meta && meta.authoritative === false) return false;
+  if (hasWeeklyRecordedProvenance(weekData)) return false;
+  markWeekNonAuthoritative(weekData, 'missing_weekly_provenance');
+  return true;
+}
+
 function markAllWeeklyNonAuthoritative(weekly, reason) {
   if (!isWeeklyContainer(weekly)) return;
   for (const [weekKey, weekData] of Object.entries(weekly)) {
@@ -888,17 +915,46 @@ function hasHardFailedWeeklyMigration(statsObj) {
 
 function reconcileWeeklyFromDaily(statsObj, now) {
   requireNow(now, 'reconcileWeeklyFromDaily');
-  if (hasHardFailedWeeklyMigration(statsObj)) return;
+  if (!statsObj || typeof statsObj !== 'object' || Array.isArray(statsObj)) return false;
+  if (hasHardFailedWeeklyMigration(statsObj)) return false;
+  let changed = false;
   const existing = statsObj && statsObj[WEEKLY_KEY];
-  if (isWeeklyContainer(existing) && Object.keys(existing).some(validWeekKey)) return;
+  let hasRecordedWeekly = false;
+  if (isWeeklyContainer(existing)) {
+    for (const [weekKey, weekData] of Object.entries(existing)) {
+      if (!validWeekKey(weekKey) || !isWeeklyContainer(weekData)) continue;
+      if (hasWeeklyRecordedProvenance(weekData)) {
+        hasRecordedWeekly = true;
+        continue;
+      }
+      markUnprovenancedStoredWeekNonAuthoritative(weekData);
+    }
+  }
+  if (hasRecordedWeekly) return changed;
   const rebuilt = buildWeeklyFromDaily(statsObj);
-  const reconciled = {};
+  const oldestExistingWeek = isWeeklyContainer(statsObj[WEEKLY_KEY])
+    ? Object.keys(statsObj[WEEKLY_KEY]).filter(validWeekKey).sort()[0]
+    : null;
+  const currentWeekStart = subscriptionWeekKeyFromDate(now);
+  const retainedPriorBackfill = new Set(Object.keys(rebuilt)
+    .filter(key => validWeekKey(key) && key < currentWeekStart)
+    .sort()
+    .reverse()
+    .slice(0, WEEKLY_MAX_WEEKS));
   for (const [weekKey, weekData] of Object.entries(rebuilt)) {
     if (!validWeekKey(weekKey)) continue;
-    reconciled[weekKey] = markWeekNonAuthoritative(weekData, 'inferred_from_legacy_daily');
+    if (oldestExistingWeek && weekKey < oldestExistingWeek) continue;
+    if (weekKey < currentWeekStart && !retainedPriorBackfill.has(weekKey)) continue;
+    const current = statsObj[WEEKLY_KEY] && statsObj[WEEKLY_KEY][weekKey];
+    if (isWeeklyContainer(current)) continue;
+    if (!statsObj[WEEKLY_KEY] || !isWeeklyContainer(statsObj[WEEKLY_KEY])) statsObj[WEEKLY_KEY] = {};
+    statsObj[WEEKLY_KEY][weekKey] = markWeekNonAuthoritative(weekData, 'inferred_from_legacy_daily');
   }
-  if (Object.keys(reconciled).length > 0) statsObj[WEEKLY_KEY] = reconciled;
-  else delete statsObj[WEEKLY_KEY];
+  if (isWeeklyContainer(statsObj[WEEKLY_KEY]) && Object.keys(statsObj[WEEKLY_KEY]).length === 0) {
+    delete statsObj[WEEKLY_KEY];
+    changed = true;
+  }
+  return changed;
 }
 
 function markRuntimeWeeklyCoverageGaps(statsObj, now) {
@@ -964,7 +1020,10 @@ function ensureProjectBucketForDay(project, day) {
 function ensureProjectBucketForWeek(project, week) {
   const proj = project || 'default';
   if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
-  if (!_stats[WEEKLY_KEY][week] || typeof _stats[WEEKLY_KEY][week] !== 'object') _stats[WEEKLY_KEY][week] = {};
+  if (!_stats[WEEKLY_KEY][week] || typeof _stats[WEEKLY_KEY][week] !== 'object') {
+    _stats[WEEKLY_KEY][week] = {};
+    markWeekRecordedFromEventInstant(_stats[WEEKLY_KEY][week]);
+  }
   if (!_stats[WEEKLY_KEY][week][proj]) _stats[WEEKLY_KEY][week][proj] = {};
   return ensureOptimizerFields(_stats[WEEKLY_KEY][week][proj]);
 }
@@ -983,7 +1042,10 @@ function ensureMeasuredProjectBucketForDay(project, day) {
 function ensureMeasuredProjectBucketForWeek(project, week) {
   const proj = project || 'default';
   if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
-  if (!_stats[WEEKLY_KEY][week] || typeof _stats[WEEKLY_KEY][week] !== 'object') _stats[WEEKLY_KEY][week] = {};
+  if (!_stats[WEEKLY_KEY][week] || typeof _stats[WEEKLY_KEY][week] !== 'object') {
+    _stats[WEEKLY_KEY][week] = {};
+    markWeekRecordedFromEventInstant(_stats[WEEKLY_KEY][week]);
+  }
   if (!_stats[WEEKLY_KEY][week][proj]) _stats[WEEKLY_KEY][week][proj] = {};
   return _stats[WEEKLY_KEY][week][proj];
 }
@@ -1004,7 +1066,10 @@ function ensureGuardrailBucket(project, dayKey) {
 function ensureWeeklyGuardrailBucket(project, weekKey) {
   const proj = project || 'default';
   if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
-  if (!_stats[WEEKLY_KEY][weekKey] || typeof _stats[WEEKLY_KEY][weekKey] !== 'object') _stats[WEEKLY_KEY][weekKey] = {};
+  if (!_stats[WEEKLY_KEY][weekKey] || typeof _stats[WEEKLY_KEY][weekKey] !== 'object') {
+    _stats[WEEKLY_KEY][weekKey] = {};
+    markWeekRecordedFromEventInstant(_stats[WEEKLY_KEY][weekKey]);
+  }
   if (!_stats[WEEKLY_KEY][weekKey][proj]) _stats[WEEKLY_KEY][weekKey][proj] = {};
   return _stats[WEEKLY_KEY][weekKey][proj];
 }
@@ -1369,24 +1434,31 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
   const persistenceMeta = !(persistence.healthy && persistence.durable)
     ? { authoritative: false, reason: 'persistence_degraded' }
     : null;
-  const makeWeek = (weekStart, complete) => {
-    const weekData = weeklyData[weekStart];
-    const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
-      ? weekData[WEEKLY_META_KEY] : null;
-    const storedNonAuthoritativeMeta = storedMeta && storedMeta.authoritative === false;
-    const shouldEvaluateCoverage = !isWeeklyContainer(weekData)
-      && (weekStart === currentWeekStart || observationWeekKeys.has(weekStart));
-    const coverageMeta = storedNonAuthoritativeMeta || !shouldEvaluateCoverage
-      ? null
-      : coverageMetadataForWeek(_stats, weekStart, now);
-    const meta = storedNonAuthoritativeMeta
-      ? storedMeta
-      : coverageMeta && {
-        authoritative: false,
-        reason: coverageMeta.reason,
-        coverage: coverageMeta.coverage,
-      };
-    const effectiveMeta = persistenceMeta || meta;
+	  const makeWeek = (weekStart, complete) => {
+	    const weekData = weeklyData[weekStart];
+	    const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
+	      ? weekData[WEEKLY_META_KEY] : null;
+	    const storedNonAuthoritativeMeta = storedMeta && storedMeta.authoritative === false;
+	    const hasRecordedProvenance = hasWeeklyRecordedProvenance(weekData);
+	    const missingProvenanceMeta = isWeeklyContainer(weekData) && !storedNonAuthoritativeMeta && !hasRecordedProvenance
+	      ? { authoritative: false, reason: 'missing_weekly_provenance' }
+	      : null;
+	    const shouldEvaluateCoverage = !isWeeklyContainer(weekData)
+	      && (weekStart === currentWeekStart || observationWeekKeys.has(weekStart));
+	    const coverageMeta = storedNonAuthoritativeMeta || !shouldEvaluateCoverage
+	      ? null
+	      : coverageMetadataForWeek(_stats, weekStart, now);
+	    const meta = storedNonAuthoritativeMeta
+	      ? storedMeta
+	      : missingProvenanceMeta || (coverageMeta && {
+	        authoritative: false,
+	        reason: coverageMeta.reason,
+	        coverage: coverageMeta.coverage,
+	      }) || (!isWeeklyContainer(weekData) && {
+	        authoritative: false,
+	        reason: 'missing_weekly_provenance',
+	      });
+	    const effectiveMeta = meta || persistenceMeta;
     const authoritative = !(effectiveMeta && effectiveMeta.authoritative === false);
     const out = {
       weekStart,

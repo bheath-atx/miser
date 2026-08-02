@@ -265,7 +265,7 @@ test('panel stats report write failure for unwritable path without throwing', as
     const status = panels.getPersistenceStatus();
     assert.equal(status.healthy, false);
     assert.equal(status.lastFlushErrored, true);
-    assert.equal(status.writeFailures, 1);
+    assert.equal(status.writeFailures, 3);
   } finally {
     try { fs.chmodSync(dir, 0o700); } catch (_) {}
     cleanup(file, prevEnv);
@@ -436,7 +436,7 @@ test('panel stats bound and count mutations after load-failure refusal', async (
   }
 });
 
-test('panel stats final flush retries after a previous write failure', async () => {
+test('panel stats final flush retries a transient non-in-flight write failure before returning', async () => {
   const file = tmpPanelFile('flush-retry');
   const prevEnv = process.env.MISER_PANEL_STATS_FILE;
   const originalWriteFile = fsp.writeFile;
@@ -454,12 +454,8 @@ test('panel stats final flush retries after a previous write failure', async () 
       return originalWriteFile(...args);
     };
 
-    const first = await panels.flushNow();
-    assert.equal(first.ok, false);
-    assert.equal(first.errorCode, 'EIO');
-
-    const second = await panels.flushNow();
-    assert.equal(second.ok, true);
+    const result = await panels.flushNow();
+    assert.equal(result.ok, true);
     const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(persisted['alpha--orch'].input, 1);
     assert.equal(panels.getPersistenceStatus().healthy, true);
@@ -526,7 +522,7 @@ test('panel stats treat chmod failure as flush failure', async () => {
     assert.equal(result.errorCode, 'EACCES');
     const status = panels.getPersistenceStatus();
     assert.equal(status.healthy, false);
-    assert.equal(status.writeFailures, 1);
+    assert.equal(status.writeFailures, 3);
   } finally {
     fsp.chmod = originalChmod;
     cleanup(file, prevEnv);

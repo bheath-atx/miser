@@ -390,7 +390,7 @@ function executeFlush() {
     } finally {
       _pendingFlush.inFlight = false;
       _pendingFlush.currentPromise = null;
-      if (shouldReschedule && !_pendingFlush.lastFlushErrored) scheduleFlush(false);
+      if (shouldReschedule && !_pendingFlush.lastFlushErrored) scheduleFlush(false, 0);
     }
   })();
 
@@ -404,7 +404,6 @@ async function drainFlushNow() {
   clearTimer('retryTimer');
   let lastResult = { ok: true, file: PANEL_STATS_FILE };
   let attempts = 0;
-  let retryObservedInFlightFailure = false;
   const startedAt = Date.now();
   while (true) {
     if (_pendingFlush.inFlight) {
@@ -412,7 +411,6 @@ async function drainFlushNow() {
       attempts += 1;
       if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
       if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
-        retryObservedInFlightFailure = true;
         if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
           console.error(`[miser/panel-stats] CRITICAL final panel stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
           return lastResult;
@@ -428,7 +426,6 @@ async function drainFlushNow() {
     attempts += 1;
     if (_pendingFlush.dirty && _persistence.lastLoadErrored) return lastResult;
     if (_pendingFlush.dirty && _pendingFlush.lastFlushErrored) {
-      if (!retryObservedInFlightFailure) return lastResult;
       if (attempts >= FINAL_FLUSH_MAX_ATTEMPTS || Date.now() - startedAt >= FINAL_FLUSH_MAX_MS) {
         console.error(`[miser/panel-stats] CRITICAL final panel stats flush failed after ${attempts} attempt(s); dirty accounting data remains pending and may be lost on shutdown`);
         return lastResult;
