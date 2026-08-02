@@ -420,8 +420,17 @@ function todayKey(now) {
   return dayKeyFromDate(requireNow(now, 'todayKey'));
 }
 
+function formatDailyKey(parts) {
+  return `${String(parts.year).padStart(4, '0')}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+}
+
 function dayKeyFromDate(date) {
-  return date.toISOString().slice(0, 10);
+  const timeZoneStatus = getSubscriptionTimeZoneStatus();
+  if (!timeZoneStatus.supported) {
+    return new Date(date.getTime() - 12 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  }
+  const local = getZonedParts(date);
+  return formatDailyKey(local.hour < 6 ? localDatePlusDays(local, -1) : local);
 }
 
 function getZonedParts(date, timeZone = SUBSCRIPTION_TIME_ZONE) {
@@ -516,12 +525,16 @@ function subscriptionWeekKeyFromDate(date) {
   return subscriptionWeekStartDate(date).toISOString();
 }
 
+function dailyKeyPlusDays(dayKey, days) {
+  if (!isValidDailyKey(dayKey)) return null;
+  const d = new Date(`${dayKey}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 function cutoffKeyForDays(days, now) {
   requireNow(now, 'cutoffKeyForDays');
-  const cutoff = new Date(now);
-  cutoff.setUTCHours(0, 0, 0, 0);
-  cutoff.setUTCDate(cutoff.getUTCDate() - (days - 1));
-  return dayKeyFromDate(cutoff);
+  return dailyKeyPlusDays(dayKeyFromDate(now), -(days - 1));
 }
 
 function parseDays(daysParam, defaultDays, maxDays = null) {
@@ -1390,12 +1403,16 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
     const weekData = weeklyData[weekStart];
     const storedMeta = isWeeklyContainer(weekData) && isWeeklyContainer(weekData[WEEKLY_META_KEY])
       ? weekData[WEEKLY_META_KEY] : null;
-    const coverageMeta = !isWeeklyContainer(weekData)
-      && !observationWeekKeys.has(weekStart)
-      || (storedMeta && storedMeta.authoritative === false && !isCoverageAuthorityReason(storedMeta.reason))
+    const storedNonCoverageMeta = storedMeta
+      && storedMeta.authoritative === false
+      && !isCoverageAuthorityReason(storedMeta.reason);
+    const shouldEvaluateCoverage = weekStart === currentWeekStart
+      || isWeeklyContainer(weekData)
+      || observationWeekKeys.has(weekStart);
+    const coverageMeta = storedNonCoverageMeta || !shouldEvaluateCoverage
       ? null
       : coverageMetadataForWeek(_stats, weekStart, now);
-    const meta = (storedMeta && storedMeta.authoritative === false && !isCoverageAuthorityReason(storedMeta.reason))
+    const meta = storedNonCoverageMeta
       ? storedMeta
       : coverageMeta && {
         authoritative: false,
@@ -1594,6 +1611,10 @@ function getRawStatsSnapshot() {
   return cloneStats();
 }
 
+function getUnreconciledStatsSnapshotForTest() {
+  return JSON.parse(JSON.stringify(_stats));
+}
+
 function setNowFnForTest(nowFn) {
   if (typeof nowFn !== 'function') throw new TypeError('nowFn must be a function');
   _nowFn = nowFn;
@@ -1631,6 +1652,7 @@ module.exports = {
     ensureDayObserved,
     sealTodayObserved,
     setNowFnForTest,
+    getUnreconciledStatsSnapshotForTest,
     _observationSeal,
     reconcileWeeklyFromDaily,
     dailyCoverageForWeek,

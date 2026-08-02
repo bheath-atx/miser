@@ -154,6 +154,74 @@ test('subscription week key handles CST boundary at Sunday 12:00 UTC', () => {
   }
 });
 
+test('usage before Sunday reset keeps the same subscription week after flush and reload', async () => {
+  const cases = [
+    {
+      label: 'cdt',
+      eventIso: '2026-07-26T01:00:00.000Z',
+      utcDayKey: '2026-07-26',
+      persistedDayKey: '2026-07-25',
+      weekKey: '2026-07-19T11:00:00.000Z',
+    },
+    {
+      label: 'cst',
+      eventIso: '2026-01-04T07:00:00.000Z',
+      utcDayKey: '2026-01-04',
+      persistedDayKey: '2026-01-03',
+      weekKey: '2025-12-28T12:00:00.000Z',
+    },
+  ];
+
+  for (const fixture of cases) {
+    const file = tmpStatsFile(`boundary-round-trip-${fixture.label}`);
+    const prevEnv = process.env.MISER_STATS_FILE;
+    let stats;
+    try {
+      const event = new Date(fixture.eventIso);
+      stats = freshStats(file);
+      stats.__test.setNowFnForTest(() => event);
+
+      assert.equal(stats.__test.subscriptionWeekKeyFromDate(event), fixture.weekKey);
+      stats.recordAnthropicUsage(
+        'alpha',
+        'anthropic',
+        'claude-sonnet-4',
+        { input_tokens: 10, output_tokens: 2 },
+        null,
+        () => event,
+      );
+
+      const live = stats.__test.getUnreconciledStatsSnapshotForTest();
+      assert.equal(live[fixture.persistedDayKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
+      assert.equal(live[fixture.utcDayKey], undefined);
+      assert.deepEqual(Object.keys(live.__weekly || {}).sort(), [fixture.weekKey]);
+      assert.equal(live.__weekly[fixture.weekKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
+
+      await stats.flushNow();
+      const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(persisted[fixture.persistedDayKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
+      assert.equal(persisted[fixture.utcDayKey], undefined);
+      assert.deepEqual(Object.keys(persisted.__weekly || {}).sort(), [fixture.weekKey]);
+      assert.equal(persisted.__weekly[fixture.weekKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
+
+      stats.__resetForTest();
+      delete require.cache[statsPath];
+      stats = freshStats(file);
+      stats.__test.setNowFnForTest(() => event);
+      const reconciled = stats.getRawStatsSnapshot();
+      assert.deepEqual(Object.keys(reconciled.__weekly || {}).sort(), [fixture.weekKey]);
+      assert.equal(reconciled.__weekly[fixture.weekKey].alpha.usage.anthropic['claude-sonnet-4'].input, 10);
+
+      const result = stats.getStats('9999');
+      assert.equal(result.weekly.currentWeekToDate.weekStart, fixture.weekKey);
+      assert.equal(result.weekly.currentWeekToDate.usage.alpha.anthropic['claude-sonnet-4'].input, 10);
+    } finally {
+      if (stats && stats.__resetForTest) stats.__resetForTest();
+      cleanup(file, prevEnv);
+    }
+  }
+});
+
 test('subscription week key handles DST transition Sundays with hard-coded UTC instants', () => {
   const file = tmpStatsFile('dst-transitions');
   const prevEnv = process.env.MISER_STATS_FILE;
@@ -940,6 +1008,48 @@ test('empty daily stats have missing daily observation coverage until a day is o
     cleanup(file, prevEnv);
   }
 });
+
+for (const fixture of [
+  { label: 'empty state', seed: {} },
+  { label: 'recordingStartedAt null', seed: { __meta: { recordingStartedAt: null } } },
+  {
+    label: 'recordingStartedAt invalid',
+    seed: sparseStatsWithRecordingStart('not-a-day', {
+      '2026-07-19': {},
+      '2026-07-20': {},
+      '2026-07-21': {},
+      '2026-07-22': {},
+      '2026-07-23': {},
+      '2026-07-24': {},
+      '2026-07-25': {},
+    }),
+  },
+]) {
+  test(`getStats marks current week non-authoritative for ${fixture.label}`, () => {
+    const file = tmpStatsFile(`current-week-no-boundary-${fixture.label.replace(/[^a-z0-9]/gi, '-')}`);
+    const prevEnv = process.env.MISER_STATS_FILE;
+    try {
+      const stats = freshStats(file, fixture.seed);
+      stats.__test.setNowFnForTest(() => new Date('2026-07-28T15:00:00.000Z'));
+
+      const result = stats.getStats('9999');
+      assert.equal(result.weeklyAuthoritative, false);
+      assert.equal(result.weekly.authoritative, false);
+      assert.equal(result.weekly.currentWeekToDate.weekStart, '2026-07-26T11:00:00.000Z');
+      assert.equal(result.weekly.currentWeekToDate.authoritative, false);
+      assert.equal(result.weekly.currentWeekToDate.degraded, true);
+      assert.equal(result.weekly.currentWeekToDate.nonAuthoritativeReason, 'missing_daily_observation');
+      assert.deepEqual(result.weekly.currentWeekToDate.coverage.presentDays, []);
+      assert.deepEqual(result.weekly.currentWeekToDate.coverage.missingDays, [
+        '2026-07-26',
+        '2026-07-27',
+        '2026-07-28',
+      ]);
+    } finally {
+      cleanup(file, prevEnv);
+    }
+  });
+}
 
 test('fresh install first mid-week write marks earlier current-week days not observed, from a single captured clock', async () => {
   const file = tmpStatsFile('runtime-first-mid-week');
