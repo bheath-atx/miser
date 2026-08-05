@@ -103,6 +103,16 @@ function buildRollupText(stats, now = new Date()) {
   return rows.map(row => row.line).join('\n');
 }
 
+// The ONE implementation of the MISER_PKACHU_* read (§2.6). Both the rollup and
+// alert-routes.js route through this, so there is exactly one reader — the
+// accurate form of R2's overstated "exactly one call site" claim.
+function defaultRouteFromEnv() {
+  const endpoint = process.env.MISER_PKACHU_ENDPOINT;
+  const tokenFile = process.env.MISER_PKACHU_TOKEN;
+  if (!endpoint || !tokenFile) return null;
+  return { endpoint, tokenFile };
+}
+
 async function readToken(tokenPath) {
   return (await fsp.readFile(tokenPath, 'utf8')).trim();
 }
@@ -144,12 +154,16 @@ async function emitDailyRollup(stats, pkachu = postPkachu, opts = {}) {
   try { last = fs.readFileSync(dedupFile, 'utf8').trim(); } catch (_) {}
   if (last === today) return { emitted: false, reason: 'dedup' };
 
-  const endpoint = process.env.MISER_PKACHU_ENDPOINT;
-  const tokenPath = process.env.MISER_PKACHU_TOKEN;
-  if (!endpoint || !tokenPath) {
+  // Route source is INJECTED downward from the composition root (§2.6). The
+  // un-injected path is not a second policy — it is the same policy reached
+  // without the resolver, which is why rollup.test.js passes unmodified.
+  const route = opts.resolveRoute ? opts.resolveRoute(null) : defaultRouteFromEnv();
+  if (!route || !route.endpoint || !route.tokenFile) {
     console.warn('[miser/rollup] WARN daily rollup skipped: MISER_PKACHU_TOKEN or MISER_PKACHU_ENDPOINT not set');
     return { emitted: false, reason: 'no_env' };
   }
+  const endpoint = route.endpoint;
+  const tokenPath = route.tokenFile;
 
   const text = buildRollupText(stats || {}, now);
   if (!text) return { emitted: false, reason: 'no_data' };
@@ -165,23 +179,17 @@ async function emitDailyRollup(stats, pkachu = postPkachu, opts = {}) {
   }
 }
 
-// Shared alert dispatcher (Sprint B §2.5) — the single outbound path for
-// guardrail alerts. Reads env + token on EVERY call (consistent with
-// emitDailyRollup; the token file may rotate). NEVER throws: pkachu failure
-// logs one warn per call (the alert ledger already guarantees at most one
-// call per key per UTC day). Callers invoke it fire-and-forget via
-// Promise.resolve().then(() => sendAlert(text)).catch(() => {}).
-async function sendAlert(text) {
-  const endpoint = process.env.MISER_PKACHU_ENDPOINT;
-  const tokenPath = process.env.MISER_PKACHU_TOKEN;
-  if (!endpoint || !tokenPath) return; // silently skip if not configured
-  try {
-    const token = await readToken(tokenPath);
-    await postPkachu(endpoint, token, text);
-  } catch (err) {
-    console.warn(`[miser/alert] WARN alert send failed: ${err.message}`);
-  }
-}
+// The Sprint-B shared dispatcher that used to live here is GONE. It is replaced
+// by createAlertDispatcher in alert-routes.js, which is now the SINGLE outbound
+// path for guardrail alerts (§2.9a) and which resolves a per-project route
+// instead of reading one env destination per call. This module keeps only the
+// transport (postPkachu), the token read, and the ONE MISER_PKACHU_* read
+// (defaultRouteFromEnv) — §8 forbids changing the wire format, and §2.6 requires
+// exactly one implementation of that env read.
+//
+// Leaving the old function here would have meant a live, network-capable
+// outbound path that nothing calls — precisely the hazard §3.4 Layer 1 removes.
+// See STATUS.md FINDING 2026-08-04 for the reasoning and the AR11 comment fix.
 
 function shouldEmitNow(now = new Date()) {
   return now.getUTCHours() === 0 && now.getUTCMinutes() < 2;
@@ -193,7 +201,7 @@ function startDailyRollupInterval(getStatsSnapshot, opts = {}) {
     const now = new Date();
     if (!shouldEmitNow(now)) return;
     Promise.resolve()
-      .then(() => emitDailyRollup(getStatsSnapshot(), undefined, { now }))
+      .then(() => emitDailyRollup(getStatsSnapshot(), undefined, { now, resolveRoute: opts.resolveRoute }))
       .catch((err) => console.warn(`[miser/rollup] WARN daily rollup skipped: ${err.message}`));
   }
   // Immediate check on startup so process starting within the midnight window doesn't miss it.
@@ -206,9 +214,10 @@ function startDailyRollupInterval(getStatsSnapshot, opts = {}) {
 module.exports = {
   DEFAULT_DEDUP_FILE,
   buildRollupText,
+  defaultRouteFromEnv,
   emitDailyRollup,
   postPkachu,
-  sendAlert,
+  readToken,
   shouldEmitNow,
   startDailyRollupInterval,
 };

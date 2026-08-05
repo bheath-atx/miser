@@ -10,6 +10,7 @@ const { flushNow: flushPanelStatsNow } = require('./panel-stats.js');
 const { startDailyRollupInterval } = require('./daily-rollup.js');
 const { buildGuardDeps } = require('./budgets.js');
 const { wireCacheThrashDeps } = require('./cache-thrash.js');
+const { wireAlertDispatcher, resolveRoute, alertRoutingHealth } = require('./alert-routes.js');
 const config = require('./config.js');
 const { validateStartupConfig } = config;
 
@@ -59,11 +60,25 @@ validateStartupConfig(config);
 // overhead). checkContextBloat is only wired when MISER_POLICY is active.
 const guardDeps = buildGuardDeps(config);
 
+// Alert dispatcher composition root (§3.2). ONE inserted line, no signature
+// change anywhere. Runs after guardDeps exists and before the remaining feature
+// wiring; mutates in place (the wireCacheThrashDeps convention) and returns the
+// §2.3a startup defect report, which production ignores and AR28 asserts.
+wireAlertDispatcher(config, guardDeps);
+
 // B2: wire cache-thrash detector into guardDeps (no-op when MIN_REQUESTS=0).
 wireCacheThrashDeps(config, guardDeps);
 
 const server = http.createServer(createProxy({ guardDeps }));
-startDailyRollupInterval(getRawStatsSnapshot);
+startDailyRollupInterval(getRawStatsSnapshot, {
+  // Route source injected downward from the composition root (§2.6) so
+  // daily-rollup.js never requires config.js or alert-routes.js (AR16).
+  resolveRoute: (project) => resolveRoute(project, {
+    alertRoutes: config.alertRoutes,
+    opsRoute: config.alertRoutesOps,
+    unroutedMax: config.alertRoutesUnroutedMax,
+  }).route,
+});
 
 server.listen(config.port, '127.0.0.1', () => {
   writeLock();
@@ -81,6 +96,14 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log(`[miser] thrash-detector: ${config.cacheThrashMinRequests > 0
     ? `ON (warm after ${config.cacheThrashMinRequests} req, spike=${config.cacheThrashSpikeRatio}×, ring=${config.cacheThrashRingSize})`
     : 'OFF (MISER_CACHE_THRASH_MIN_REQUESTS=0)'}`);
+  const _ar = alertRoutingHealth(config);
+  console.log(`[miser] alert routes: ${config.alertRoutes
+    ? `${_ar.mapped.length} routed (${_ar.mapped.join(', ') || 'none'}); `
+      + `${_ar.defaultDeclared.length} @default (${_ar.defaultDeclared.join(', ') || 'none'})`
+    : 'OFF (MISER_ALERT_ROUTES unset) — all alerts to the default route'}`
+    + `; default ${_ar.defaultConfigured ? 'configured' : 'UNSET'}`
+    + `; ops ${_ar.opsConfigured ? 'configured' : 'unset (falls back to default)'}`
+    + `; status ${_ar.status}`);
   console.log(`[miser] health: GET http://127.0.0.1:${config.port}/api/miser/health`);
   console.log(`[miser] quota:  GET http://127.0.0.1:${config.port}/api/miser/quota`);
   console.log(`[miser] trend:  GET http://127.0.0.1:${config.port}/api/miser/stats/trend`);

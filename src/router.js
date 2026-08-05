@@ -104,11 +104,21 @@ function _maybeAlertSubCap(guardDeps, nowMs) {
     console.warn('[miser] _maybeAlertSubCap sync error (ignored):', e.message);
     return;
   }
-  const sendAlert = guardDeps.sendAlert || require('./daily-rollup.js').sendAlert;
+  // Production fallback DELETED (§3.1). Missing dispatcher is loud (§3.3); this
+  // is a pre-dispatcher check owning its own line + counter (§2.7).
+  if (!guardDeps.sendAlert) {
+    console.warn('[miser/alert] ALERT-DROPPED project=fleet kind=sub-cap reason=no_dispatcher');
+    require('./alert-routes.js').bumpDropped();
+    return;
+  }
   const pctMsg = `Codex ${Math.round(status.capFraction * 100)}% of ${status.cap5h}-req 5h cap`;
   const events429Msg = status.events429In5h > 0 ? ` — ${status.events429In5h} 429s observed` : '';
+  // FLEET scope (§2.6): the subscription cap is a fleet-wide resource and the
+  // ledger key is already global. No project is fabricated for it.
   Promise.resolve()
-    .then(() => sendAlert(`⚠️ miser sub-cap: ${pctMsg}${events429Msg} — deferBackground=true`))
+    .then(() => guardDeps.sendAlert(
+      `⚠️ miser sub-cap: ${pctMsg}${events429Msg} — deferBackground=true`,
+      { scope: 'fleet', kind: 'sub-cap' }))
     .catch(() => {});
 }
 

@@ -2,7 +2,7 @@
 
 const { isValidProjectName } = require('./routing.js');
 const { recordPolicyEvent } = require('./stats.js');
-const { sendAlert: defaultSendAlert } = require('./daily-rollup.js');
+const { bumpDropped } = require('./alert-routes.js');
 
 // B6 — policy watchdog (Sprint B §2). ALERT-ONLY: never blocks, never mutates
 // a request body or header, never rewrites a model. Drift is checked in
@@ -80,9 +80,16 @@ function parsePolicy(env) {
 }
 
 // Fire-and-forget alert dispatch (§2.5) — never awaited, rejections swallowed.
-function dispatchAlert(sendAlert, text) {
-  const send = sendAlert || defaultSendAlert;
-  Promise.resolve().then(() => send(text)).catch(() => {});
+// Production fallback deleted (§3.1); missing dispatcher is loud (§3.3) and is a
+// PRE-DISPATCHER check that owns its own line + counter (§2.7 ownership table).
+function dispatchAlert(sendAlert, text, opts = {}) {
+  if (!sendAlert) {
+    console.warn(`[miser/alert] ALERT-DROPPED project=${opts.project || 'fleet'} `
+      + `kind=${opts.kind || 'unknown'} reason=no_dispatcher`);
+    bumpDropped();
+    return;
+  }
+  Promise.resolve().then(() => sendAlert(text, opts)).catch(() => {});
 }
 
 // Model drift check (§2.2) — proxy.js, pre-compress, read-only. Runs AFTER the
@@ -106,7 +113,8 @@ function checkModelDrift(project, body, guardDeps = {}) {
   if (guardDeps.ledger.shouldSend(key)) {
     guardDeps.ledger.markSent(key);
     dispatchAlert(guardDeps.sendAlert,
-      `👁 miser policy: ${project} model drift — got ${model}, expected ${expected}* (${counts.modelDriftCount}× today)`);
+      `👁 miser policy: ${project} model drift — got ${model}, expected ${expected}* (${counts.modelDriftCount}× today)`,
+      { project, kind: 'drift' });
   }
 }
 
@@ -149,7 +157,8 @@ function checkContextBloat(project, model, rawUsage, guardDeps = {}) {
   if (guardDeps.ledger.shouldSend(key)) {
     guardDeps.ledger.markSent(key);
     dispatchAlert(guardDeps.sendAlert,
-      `👁 miser policy: ${project} context ${contextTokens} > ${maxContextTokens} cap (${counts.contextBloatCount}× today)`);
+      `👁 miser policy: ${project} context ${contextTokens} > ${maxContextTokens} cap (${counts.contextBloatCount}× today)`,
+      { project, kind: 'bloat' });
   }
 }
 

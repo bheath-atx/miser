@@ -19,6 +19,7 @@ const { classifyRoute } = require('./routing.js');
 const { injectContextManagement } = require('./context-management.js');
 const { buildMetricsText } = require('./metrics.js');
 const { getPanelStats, getPersistenceStatus, getRecordRejectionStatus: getPanelRecordRejectionStatus } = require('./panel-stats.js');
+const { alertRoutingHealth } = require('./alert-routes.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -219,8 +220,15 @@ function createProxy(deps = {}) {
       if (gd && gd.subCapTracker) {
         subCapStatus = gd.subCapTracker.getStatus(Date.now());
       }
+      // §2.8: ok flips false when EITHER degraded cause is non-empty (§2.3).
+      // defaultConfigured is no longer only a reported field — it participates
+      // in status via cause 2, so "@default" cannot falsely satisfy completeness.
+      // HTTP stays 200 deliberately: the status code drives supervisors, the body
+      // drives operators, and a non-200 is what gets wired to a restart — which
+      // would recreate the very outage §2.3 exists to prevent.
+      const alertRouting = alertRoutingHealth(config);
       json(res, 200, {
-        ok: true,
+        ok: alertRouting.status !== 'degraded',
         uptimeSecs: Math.floor(process.uptime()),
         reqPerMin: reqPerMin(),
         perLegErrors: getLegErrors(),
@@ -229,6 +237,7 @@ function createProxy(deps = {}) {
         pendingWrites: getPendingWriteCount(),
         circuitBreakers: getBreakersState(),
         subscriptionCap: subCapStatus,
+        alertRouting,
       });
       return;
     }

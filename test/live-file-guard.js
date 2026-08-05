@@ -6,6 +6,100 @@ const os = require('node:os');
 const path = require('node:path');
 
 const GUARD_ENV = 'MISER_LIVE_FILE_GUARD';
+
+// ---------------------------------------------------------------------------
+// EXTENSION for the sendAlert-routing sprint (PROPOSAL §3.4, AR17/AR18).
+//
+// This guard already isolates HOME state files. Two additions here, folded into
+// it rather than shipped as a second preloaded guard: §3.4 was written when main
+// had a bare `node --test` and specified porting sprint/miser-E's
+// `test/_state-guard.js`. Sprint E3 landed this file first, so a port would have
+// meant two overlapping isolation implementations competing for the single
+// `--require` slot. Extending the merged one is strictly better — its companion
+// live-file-guard.test.js scans src/ for HOME-backed defaults, which is a real
+// registry-rot guard E's version lacked.
+//
+// (1) ALERT-ENV SCRUB, BY PREFIX RATHER THAN BY LIST. A hand-maintained list
+//     naming MISER_PKACHU_*, MISER_ALERT_ROUTES and _OPS would have broken the
+//     moment the sprint added _STRICT and _UNROUTED_MAX — which it did. Deleting
+//     every /^MISER_ALERT_ROUTES/ key covers every future route flag on the day
+//     it is invented, with no edit here. AR17 asserts the RULE via a spawned
+//     child carrying an INVENTED variable, not a snapshot of today's names.
+//     This runs FIRST, before any require of src/, because config.js reads the
+//     alert-route env at module load.
+const SCRUBBED_PREFIXES = Object.freeze([/^MISER_ALERT_ROUTES/]);
+const SCRUBBED_KEYS = Object.freeze(['MISER_PKACHU_ENDPOINT', 'MISER_PKACHU_TOKEN']);
+
+function scrubAlertEnv() {
+  for (const key of Object.keys(process.env)) {
+    if (SCRUBBED_PREFIXES.some(re => re.test(key))) delete process.env[key];
+  }
+  for (const key of SCRUBBED_KEYS) delete process.env[key];
+}
+scrubAlertEnv();
+
+// (2) NETWORK GUARD. Destination-shaped, not blanket default-deny: several
+//     existing suites legitimately drive a LOOPBACK ECHO UPSTREAM through the
+//     real createProxy (the AC8/AC10 canaries, compact-hint, breaker, and Sprint
+//     B guardrail integration tests), and AR18 requires the full suite to pass
+//     with the guard armed. So loopback is allowed, egress is blocked, and the
+//     pkachu relay port is blocked EVEN ON LOOPBACK — that is the one loopback
+//     destination whose traffic would be a real alert carrying a real bearer
+//     token, i.e. exactly what this sprint exists to stop misrouting.
+//
+//     This is A NET, not the fix. Layer 1 is the fix: with all four production
+//     fallbacks deleted there is no expression in src/ that can produce a
+//     network-capable dispatcher, so an un-injected guardDeps.sendAlert is
+//     undefined and the §3.3 guard fires. Do not mistake one for the other.
+const NETWORK_ALLOW = 'MISER_TEST_ALLOW_NETWORK';
+const NET_LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '[::1]', '']);
+const NET_RELAY_PORTS = new Set(['8001']);   // pkachu relay (secrets.env:38)
+
+function netDestination(args) {
+  const a = args[0];
+  let host = '';
+  let port = '';
+  if (typeof a === 'string') {
+    try { const u = new URL(a); host = u.hostname; port = u.port; } catch (_) { return { host: '?', port: '' }; }
+  } else if (a instanceof URL) {
+    host = a.hostname; port = a.port;
+  } else if (a && typeof a === 'object') {
+    host = a.hostname || a.host || '';
+    port = a.port == null ? '' : String(a.port);
+    if (host.includes(':')) host = host.split(':')[0];
+  }
+  return { host, port };
+}
+
+function wrapNetwork(mod, modName, name) {
+  const original = mod[name];
+  if (typeof original !== 'function') return;
+  mod[name] = function (...args) {
+    if (process.env[NETWORK_ALLOW] !== '1') {
+      const { host, port } = netDestination(args);
+      const offHost = !NET_LOOPBACK.has(host);
+      const relay = NET_LOOPBACK.has(host) && NET_RELAY_PORTS.has(port);
+      if (offHost || relay) {
+        const err = new Error(
+          `[miser-live-file-guard] blocked ${modName}.${name} to ${host}:${port || '-'} — ` +
+          (relay
+            ? 'that is the pkachu relay port; a test must never post a real alert. '
+            : 'tests must not open off-host sockets. ') +
+          `Inject a transport seam (createAlertDispatcher's {post}) instead; set ` +
+          `${NETWORK_ALLOW}=1 only if a test deliberately needs this destination.`
+        );
+        err.code = 'MISER_TEST_NETWORK_GUARD';
+        throw err;
+      }
+    }
+    return Reflect.apply(original, this, args);
+  };
+}
+
+for (const netName of ['request', 'get']) {
+  wrapNetwork(require('node:http'), 'http', netName);
+  wrapNetwork(require('node:https'), 'https', netName);
+}
 const home = os.homedir();
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), `miser-test-home-guard-${process.pid}-`));
 // Every `process.env.X || path.join(os.homedir(), ...)` default in src/ must
@@ -231,6 +325,12 @@ process.on('beforeExit', () => {
 });
 
 global.__miserLiveFileGuard = {
+  // Exported so AR17/AR18 can assert the RULE rather than a snapshot of today's
+  // variables or a hard-coded host list.
+  SCRUBBED_PREFIXES,
+  SCRUBBED_KEYS,
+  scrubAlertEnv,
+  NETWORK_ALLOW,
   tmpRoot,
   homeDefaults,
   isolatedDefaults,
