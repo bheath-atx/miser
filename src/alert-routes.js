@@ -209,6 +209,23 @@ function parseAlertRoutes(env = {}, config = {}) {
     ? []
     : [...required].filter(p => entries[p] === SENTINEL_DEFAULT).sort();
 
+  // Axis D is the ONE row of the strictness switch whose value varies, so it is
+  // the one row with a call site: the table decides, this asks. Without this the
+  // table was inert and MISER_ALERT_ROUTES_STRICT=1 changed nothing (AR26 asks
+  // for behaviour, not for the table's return value).
+  if (buildFailurePolicy(config).incomplete_map === 'fatal'
+      && (unroutedConfigured.length > 0 || undeliverableDefaultDeclared.length > 0)) {
+    const causes = [];
+    if (unroutedConfigured.length) causes.push(`unrouted=${unroutedConfigured.join(',')}`);
+    if (undeliverableDefaultDeclared.length) {
+      causes.push(`default-declared-but-unconfigured=${undeliverableDefaultDeclared.join(',')}`);
+    }
+    throw new Error(
+      `[miser] fatal: MISER_ALERT_ROUTES is incomplete and MISER_ALERT_ROUTES_STRICT is on (${causes.join(' ')}). ` +
+      `Unset MISER_ALERT_ROUTES_STRICT to downgrade this to the default degraded state.`
+    );
+  }
+
   return {
     entries,
     mapped: mapped.sort(),
@@ -313,7 +330,7 @@ function resolveRoute(project, opts = {}) {
   if (!isValidProjectName(project)) {
     _invalidProjectAlerts += 1;
     if (_invalidSamples.length < 3) {
-      const sample = String(project).replace(/[ -]/g, '').slice(0, 32);
+      const sample = String(project).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 32);
       _invalidSamples.push(sample);
     }
     return { kind: 'withheld', bucket: BUCKET_INVALID, scope, label: BUCKET_INVALID };
