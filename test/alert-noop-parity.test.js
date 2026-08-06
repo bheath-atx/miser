@@ -13,18 +13,38 @@
 // src/cache-thrash.js:75, src/router.js:111) — the same strings the existing
 // budgets/policy/cache-thrash/retry suites pin.
 //
-// SCOPE NOTE: this file covers the drift, bloat and sub-cap kinds end-to-end
-// through the real composition root. The budget-cap/budget-warn rows need a
-// populated stats tree and the cache-thrash row needs a warmed ring buffer;
-// those are mechanical table extensions flagged in STATUS.md as a Codex
-// candidate. What is asserted here is the property that actually carries the
-// risk — routes OFF resolves to the default route, unprefixed, text untouched.
+// SCOPE: all six kinds AR8 names — budget-cap, budget-warn, drift, bloat,
+// thrash and sub-cap — are now driven end-to-end through the real composition
+// root. The budget rows need a populated stats tree and the thrash row needs a
+// warmed ring buffer; both are set up below from the same primitives the
+// existing budgets/cache-thrash suites use, so the expected strings stay pinned
+// to one source of truth rather than being re-typed here.
+
+// stats.js reads MISER_STATS_FILE at require time and budgets.js binds stats at
+// require time, so the path is pinned BEFORE any src require — same convention
+// as test/budgets.test.js:7-11. The §3.4 preload already redirects this key away
+// from HOME; this narrows it further to a per-file path so the tree starts empty.
+const os = require('node:os');
+const path = require('node:path');
+process.env.MISER_STATS_FILE = path.join(os.tmpdir(), `miser-parity-stats-${process.pid}-${Date.now()}.json`);
+// $1 per input token makes the spend arithmetic in the expected strings exact
+// (test/budgets.test.js:22-23 uses the same fixture for the same reason).
+process.env.MISER_PRICING_JSON = JSON.stringify({ testmodel: { inputPerMTok: 1_000_000 } });
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { wireAlertDispatcher, __resetAlertState } = require('../src/alert-routes.js');
 const { checkModelDrift, checkContextBloat } = require('../src/policy-watchdog.js');
+const { createCacheThrashChecker } = require('../src/cache-thrash.js');
+
+// budgets.js binds the stats module at require time, so both are re-required
+// together for a fresh in-memory stats tree per test (test/budgets.test.js:33-42).
+function freshBudgets() {
+  delete require.cache[require.resolve('../src/stats.js')];
+  delete require.cache[require.resolve('../src/budgets.js')];
+  return { stats: require('../src/stats.js'), budgets: require('../src/budgets.js') };
+}
 
 const DEFAULT_ROUTE = { endpoint: 'http://127.0.0.1:8001/v1/orch/nacho-orch/reply', tokenFile: '/tmp/miser-parity-token' };
 
@@ -127,6 +147,79 @@ test('AR8: routes OFF — the FLEET-scope sub-cap alert keeps its exact text', a
   assert.equal(posts.length, 1);
   assert.equal(posts[0].endpoint, DEFAULT_ROUTE.endpoint, 'fleet scope -> default route (case A)');
   assert.equal(posts[0].text, '⚠️ miser sub-cap: Codex 80% of 100-req 5h cap — deferBackground=true');
+  __resetAlertState();
+});
+
+test('AR8: routes OFF — budget-warn and budget-cap texts are byte-identical off a populated stats tree', async () => {
+  // The stats tree is populated the way production populates it —
+  // recordAnthropicUsage, not a hand-written spend figure — so the $ figures in
+  // the expected strings are produced by the real pricing path. At $1/token:
+  // 4 tokens = $4.00 = 80% of the $5.00 cap (warn), the 5th = $5.00 (cap).
+  const { stats, budgets } = freshBudgets();
+  const posts = await drive({ budgets: { alpha: { dailyUSD: 5 } } }, (guardDeps) => {
+    const deps = {
+      budgetsConfig: { alpha: { dailyUSD: 5 } },
+      budgetGraceConfig: [],
+      ledger: ledger(),
+      sendAlert: guardDeps.sendAlert,
+      nowFn: () => new Date(),
+    };
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 4 });
+    assert.equal(budgets.checkBudget('alpha', deps), null, 'warn passes the request');
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'testmodel', { input_tokens: 1 });
+    assert.equal(budgets.checkBudget('alpha', deps).status, 429, 'cap blocks with the 429');
+  });
+
+  assert.equal(posts.length, 2, 'exactly one warn and one cap post');
+  for (const p of posts) {
+    assert.equal(p.endpoint, DEFAULT_ROUTE.endpoint, 'routes OFF resolves to the default route (case D)');
+    assert.ok(!/^\[/.test(p.text), 'no routing prefix is prepended');
+    assert.ok(!/scope=|@default/.test(p.text), 'no scope decoration leaks into the text');
+  }
+  assert.equal(
+    posts[0].text,
+    '⚠️ miser budget: alpha at $4.00/$5.00 (80%) — 1 requests today',
+    'byte-identical to origin/main (src/budgets.js:187) — including the "1 requests" grammar, which is NOT this sprint\'s to fix',
+  );
+  assert.equal(
+    posts[1].text,
+    '⛔ miser budget: alpha EXHAUSTED $5.00/$5.00 — blocking until UTC midnight',
+    'byte-identical to origin/main (src/budgets.js:174)',
+  );
+  __resetAlertState();
+});
+
+test('AR8: routes OFF — cache-thrash text is byte-identical off a warmed ring buffer', async () => {
+  // Warm the ring with 5 identical prior samples so the baseline is exact:
+  // avg cacheWrite1h = 100, avg inputTokens = 1000. The spike then reads
+  // 1000/100 = 10.0× on cacheWrite with input flat at 1.0× — the numbers that
+  // appear literally in the expected string, so a change to either the ring's
+  // averaging or the format breaks this row.
+  const posts = await drive({ cacheThrashMinRequests: 5 }, (guardDeps) => {
+    const checker = createCacheThrashChecker({
+      cacheThrashMinRequests: 5,
+      cacheThrashSpikeRatio: 3.0,
+      cacheThrashInputSpikeRatio: 2.0,
+      cacheThrashRingSize: 50,
+    });
+    const deps = { ledger: ledger(), sendAlert: guardDeps.sendAlert };
+    for (let i = 0; i < 5; i++) {
+      checker.check('alpha', 'claude-opus-4-8', { input_tokens: 1000, cache_creation_input_tokens: 100 }, deps);
+    }
+    const result = checker.check('alpha', 'claude-opus-4-8', { input_tokens: 1000, cache_creation_input_tokens: 1000 }, deps);
+    assert.equal(result.warm, true, 'ring is warm — otherwise this row would pass by never alerting');
+    assert.equal(result.shouldAlert, true, 'the spike is detected');
+  });
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].endpoint, DEFAULT_ROUTE.endpoint, 'routes OFF resolves to the default route (case D)');
+  assert.equal(
+    posts[0].text,
+    '⚠️ miser cache-thrash: project=alpha model=claude-opus-4-8 — cacheWrite1h 1000 vs prior avg 100 (10.0×); '
+    + 'inputTokens=1000 normal (1.0× avg) — prefix mutation suspected',
+    'byte-identical to origin/main (src/cache-thrash.js:75)',
+  );
+  assert.ok(!/^\[/.test(posts[0].text), 'no routing prefix is prepended');
   __resetAlertState();
 });
 
