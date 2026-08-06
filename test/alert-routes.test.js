@@ -348,3 +348,54 @@ test('AR31(a,c): default-missing startup defect has its own unconditional line a
     __resetAlertState();
   }
 });
+
+// AR10 — the orphaned fallback dispatchers are GONE from src/, asserted as a
+// source shape. Added at BUILDER-AUDIT R1: §4 named this file as the oracle and
+// no assertion existed. Modelled on test/alert-ledger.test.js:165-169.
+//
+// This is what stops the old dual-path behaviour creeping back: if either
+// fallback token reappears, alerts can be dispatched by something other than
+// the single composition root, which is precisely the shape that produced the
+// 2026-07-29 misrouting.
+test('AR10: no fallback sendAlert token survives anywhere in src/', () => {
+  const fs = require('node:fs');
+  const p = require('node:path');
+  const dir = p.join(__dirname, '..', 'src');
+  const offenders = [];
+  for (const name of fs.readdirSync(dir).filter(f => f.endsWith('.js'))) {
+    const text = fs.readFileSync(p.join(dir, name), 'utf8');
+    text.split('\n').forEach((line, i) => {
+      if (line.includes("require('./daily-rollup.js').sendAlert")) offenders.push(`${name}:${i + 1} rollup fallback`);
+      if (line.includes('sendAlert: defaultSendAlert')) offenders.push(`${name}:${i + 1} defaultSendAlert`);
+    });
+  }
+  assert.deepEqual(offenders, [], 'the single outbound path is createAlertDispatcher — no fallbacks');
+});
+
+// AR26 companion — every axis-C site resolves a REAL policy row.
+//
+// This exists because of a bug in the axis-C wiring itself: the axis name was
+// passed as the literal string 'axis' instead of the variable, so every lookup
+// resolved to undefined and every fatal fell through to enforceAxisC's
+// "no implemented code path" branch. The full suite stayed green, because that
+// branch embeds the original message and the existing regexes still matched.
+// Asserting the *absence* of the fallback is what distinguishes "the table said
+// fatal" from "the table said nothing and we threw anyway".
+test('AR26: each axis-C condition resolves a real table row, not the unimplemented fallback', () => {
+  const cases = [
+    ['malformed entry', () => parseAlertRoutes(routesEnv({ structural360: { endpoint: 'file:///x', tokenFile: '/tmp/t' } }), {})],
+    ['unsafe endpoint', () => parseAlertRoutes(routesEnv({ structural360: { endpoint: 'https://evil.example.com/x', tokenFile: '/tmp/t' } }), {})],
+    ['unparseable map', () => parseAlertRoutes({ MISER_ALERT_ROUTES: '{' }, {})],
+    ['reserved key', () => parseAlertRoutes({ MISER_ALERT_ROUTES: '{"__proto__":{"endpoint":"http://127.0.0.1:8001/x","tokenFile":"/tmp/t"}}' }, {})],
+    ['bad project key', () => parseAlertRoutes(routesEnv({ 'a b': S360_ROUTE }), {})],
+    ['malformed ops', () => parseOpsRoute({ MISER_ALERT_ROUTES_OPS: '{' }, {})],
+    ['unsafe ops', () => parseOpsRoute({ MISER_ALERT_ROUTES_OPS: JSON.stringify({ endpoint: 'https://evil.example.com/x', tokenFile: '/tmp/t' }) }, {})],
+  ];
+  for (const [name, fn] of cases) {
+    let err = null;
+    try { fn(); } catch (e) { err = e; }
+    assert.ok(err, `${name}: must be fatal`);
+    assert.ok(!/no implemented code path/.test(err.message),
+      `${name}: fell through to the unimplemented-policy branch — the axis name did not resolve to a table row`);
+  }
+});

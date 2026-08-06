@@ -287,3 +287,62 @@ async function drive(handler, req, res) {
   handler(req, res);
   await res.done;
 }
+
+// AR14 — the §2.7 counters move, all five of them. Added at BUILDER-AUDIT R1:
+// §4 named this file as AR14's oracle and only `withheld`/`withheldOverflow`
+// were incidentally covered by AR23. `failed` and `dropped` had no assertion at
+// all, so a dispatcher that never counted a failure would have passed.
+test('AR14: delivered, withheld, withheldOverflow, failed and dropped all move', async () => {
+  const OPS = OPS_ROUTE;
+  async function counters(fn) {
+    __resetAlertState();
+    const prev = console.warn;
+    console.warn = () => {};
+    try { await fn(); await new Promise(r => setImmediate(r)); } finally { console.warn = prev; }
+    return getAlertCounters();
+  }
+
+  // delivered
+  const delivered = await counters(async () => {
+    const send = createAlertDispatcher(
+      { alertRoutes: routeMap({ structural360: S360_ROUTE }), alertRoutesOps: OPS },
+      { post: async () => {}, readToken: async () => 'tok', defaultRoute: DEFAULT_ROUTE, ledger: recordingLedger() },
+    );
+    assert.equal((await send('t', { project: 'structural360', kind: 'drift' })).outcome, 'delivered');
+  });
+  assert.equal(delivered.delivered, 1);
+  assert.equal(delivered.failed, 0, 'a delivered post must not also count as failed');
+
+  // failed — the transport rejects
+  const failed = await counters(async () => {
+    const send = createAlertDispatcher(
+      { alertRoutes: routeMap({ structural360: S360_ROUTE }), alertRoutesOps: OPS },
+      {
+        post: async () => { throw new Error('transport down'); },
+        readToken: async () => 'tok', defaultRoute: DEFAULT_ROUTE, ledger: recordingLedger(),
+      },
+    );
+    const r = await send('t', { project: 'structural360', kind: 'drift' });
+    assert.equal(r.outcome, 'failed', 'a rejecting transport is a failed outcome, never a throw');
+  });
+  assert.equal(failed.failed, 1);
+  assert.equal(failed.delivered, 0);
+
+  // dropped — no destination at all
+  const dropped = await counters(async () => {
+    const send = createAlertDispatcher(
+      { alertRoutes: null, alertRoutesOps: null },
+      { post: async () => {}, readToken: async () => 'tok', defaultRoute: null, ledger: recordingLedger() },
+    );
+    assert.equal((await send('t', { scope: 'fleet', kind: 'drift' })).outcome, 'dropped');
+  });
+  assert.equal(dropped.dropped, 1);
+
+  // withheld + withheldOverflow are exercised in depth by AR23 above; assert
+  // here that they are the same five-counter object AR19's health block reads.
+  assert.deepEqual(
+    Object.keys(getAlertCounters()).sort(),
+    ['delivered', 'dropped', 'failed', 'withheld', 'withheldOverflow'],
+  );
+  __resetAlertState();
+});
