@@ -155,7 +155,12 @@ module.exports = {
   // Fatal when SET and malformed/unsafe EVEN WHEN MISER_ALERT_ROUTES IS OFF
   // (§2.5) — see the operator warning there: this is the one fatal that fires
   // on a variable an operator may believe is inactive. Recovery: unset it.
-  alertRoutesOps: parseOpsRoute(process.env),
+  // Second arg is the failure-policy config (§2.3): parseOpsRoute asks the
+  // table rather than hard-coding its own fatality, so malformed_ops is a real
+  // table row and not a claim about one.
+  alertRoutesOps: parseOpsRoute(process.env, {
+    alertRoutesStrict: /^(1|true|on|yes)$/i.test(process.env.MISER_ALERT_ROUTES_STRICT || ''),
+  }),
   alertRoutesStrict: /^(1|true|on|yes)$/i.test(process.env.MISER_ALERT_ROUTES_STRICT || ''),
   alertRoutesUnrouted: process.env.MISER_ALERT_ROUTES_UNROUTED || 'withhold',
   alertRoutesUnroutedMax: parseInt(process.env.MISER_ALERT_ROUTES_UNROUTED_MAX || '32', 10),

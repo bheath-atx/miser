@@ -25,8 +25,15 @@ const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 // ---------------------------------------------------------------------------
 // THE STRICTNESS SWITCH (§2.3)
 // This table IS the failure policy for alert routing. Nothing else in the
-// module decides fatal-vs-degraded; every call site asks this table.
-// Changing a value here changes the policy — no other edit is required.
+// module decides fatal-vs-degraded; every call site asks this table — axis C
+// via enforceAxisC() below, axis D directly in parseAlertRoutes.
+//
+// Axis D: changing the value changes the policy, no other edit required.
+// Axis C: only 'fatal' has an implemented code path. Flipping one of those
+// rows fails LOUDLY rather than silently admitting a malformed route, because
+// what 'degraded' should mean for a misstated route is a design question §2.3
+// does not answer. The comment here previously claimed a flip was free for all
+// four rows while the table had no callers at all; corrected per CODEX-BA-R1.
 // Axis letters refer to PROPOSAL §2.0.
 // ---------------------------------------------------------------------------
 function buildFailurePolicy(config = {}) {
@@ -36,6 +43,26 @@ function buildFailurePolicy(config = {}) {
     malformed_ops: 'fatal',                                               // axis C
     incomplete_map: config.alertRoutesStrict ? 'fatal' : 'degraded',      // axis D — DEFAULT: degraded
   };
+}
+
+// Axis-C enforcement — the table decides, this asks. Before this existed the
+// three axis-C rows were hard-coded throws that never consulted
+// buildFailurePolicy, which made §2.3's "every call site asks this table" and
+// §11's "overrulable by one line" false as written (CODEX-BA-R1 item 4).
+//
+// Only 'fatal' has an implemented code path for axis C: "degraded" for a
+// malformed route would mean admitting a route the operator stated incorrectly,
+// and what to do instead (drop the entry? fall back to default? which health
+// cause?) is a design question §2.3 does not answer. So a value the table does
+// not implement fails LOUDLY here rather than silently admitting a bad route —
+// the failure mode that a silent no-op branch would have created.
+function enforceAxisC(policy, axis, message) {
+  if (policy[axis] === 'fatal') throw new Error(message);
+  throw new Error(
+    `[miser] fatal: alert-routing failure policy ${axis}='${policy[axis]}' has no implemented code ` +
+    `path — only 'fatal' is implemented for axis C (§2.3). Implement that axis's degraded path before ` +
+    `flipping this row. The condition that triggered it: ${message}`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -86,11 +113,14 @@ function __resetAlertState() {
 // ---------------------------------------------------------------------------
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
 
-function validateRouteValue(label, value, allowRemote) {
+function validateRouteValue(label, value, allowRemote, policy = buildFailurePolicy({}), axis = 'malformed_entry') {
+  // The ops route is governed by its own row; a map entry's unsafe-endpoint
+  // case is governed by unsafe_endpoint, everything else by malformed_entry.
+  const unsafeAxis = axis === 'malformed_ops' ? 'malformed_ops' : 'unsafe_endpoint';
   if (value === SENTINEL_DEFAULT) return SENTINEL_DEFAULT;
 
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(
+    enforceAxisC(policy, axis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" must be the string "${SENTINEL_DEFAULT}" ` +
       `or an object {endpoint, tokenFile} — got ${Array.isArray(value) ? 'an array' : typeof value}.`
     );
@@ -99,7 +129,7 @@ function validateRouteValue(label, value, allowRemote) {
   // but fatal instead of skip (§2.2).
   const keys = Object.keys(value).sort();
   if (keys.length !== 2 || keys[0] !== 'endpoint' || keys[1] !== 'tokenFile') {
-    throw new Error(
+    enforceAxisC(policy, axis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" must have exactly the keys ` +
       `{endpoint, tokenFile} — got {${keys.join(', ')}}.`
     );
@@ -110,12 +140,12 @@ function validateRouteValue(label, value, allowRemote) {
   try {
     url = new URL(endpoint);
   } catch (_) {
-    throw new Error(
+    enforceAxisC(policy, axis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" endpoint is not a parseable URL: ${endpoint}`
     );
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error(
+    enforceAxisC(policy, axis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" endpoint protocol must be http: or https: ` +
       `— got ${url.protocol}`
     );
@@ -124,14 +154,14 @@ function validateRouteValue(label, value, allowRemote) {
     // Not theoretical: alert bodies carry per-project spend figures and model
     // names, and a typo'd or poisoned endpoint would exfiltrate them with a
     // valid bearer token attached (§2.2).
-    throw new Error(
+    enforceAxisC(policy, axis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" endpoint host "${url.hostname}" is not ` +
       `loopback. Alert bodies carry per-project spend and model names plus a bearer token; sending ` +
       `them off-host requires MISER_ALERT_ROUTES_ALLOW_REMOTE=1 as an explicit opt-in.`
     );
   }
   if (typeof tokenFile !== 'string' || !tokenFile.startsWith('/')) {
-    throw new Error(
+    enforceAxisC(policy, unsafeAxis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" tokenFile must be an absolute path ` +
       `(a path, not a token value) — got ${JSON.stringify(tokenFile)}`
     );
@@ -149,6 +179,9 @@ function validateRouteValue(label, value, allowRemote) {
 // degraded decision without a new env read (§2.3 cause 2).
 // ---------------------------------------------------------------------------
 function parseAlertRoutes(env = {}, config = {}) {
+  // One policy object per parse: the §2.3 table is consulted for every fatal
+  // decision in this module, axis C and axis D alike.
+  const policy = buildFailurePolicy(config);
   const raw = env.MISER_ALERT_ROUTES;
   if (typeof raw !== 'string' || !raw.trim()) return null; // null is the exclusive OFF signal
 
@@ -156,10 +189,10 @@ function parseAlertRoutes(env = {}, config = {}) {
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    throw new Error(`[miser] fatal: MISER_ALERT_ROUTES is not parseable JSON: ${e.message}`);
+    enforceAxisC(policy, 'malformed_entry', `[miser] fatal: MISER_ALERT_ROUTES is not parseable JSON: ${e.message}`);
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('[miser] fatal: MISER_ALERT_ROUTES must be a JSON object of project -> route.');
+    enforceAxisC(policy, 'malformed_entry', '[miser] fatal: MISER_ALERT_ROUTES must be a JSON object of project -> route.');
   }
   const projectKeys = Object.keys(parsed);
   if (projectKeys.length === 0) return null; // empty map == OFF, never {}
@@ -171,17 +204,17 @@ function parseAlertRoutes(env = {}, config = {}) {
 
   for (const key of projectKeys) {
     if (RESERVED_KEYS.has(key)) {
-      throw new Error(`[miser] fatal: MISER_ALERT_ROUTES key "${key}" is a reserved prototype key.`);
+      enforceAxisC(policy, 'malformed_entry', `[miser] fatal: MISER_ALERT_ROUTES key "${key}" is a reserved prototype key.`);
     }
     if (!isValidProjectName(key)) {
-      throw new Error(
+      enforceAxisC(policy, 'malformed_entry',
         `[miser] fatal: MISER_ALERT_ROUTES key "${key}" is not a valid project name ` +
         `(must match /^[A-Za-z0-9._-]{1,80}$/ — note this excludes the reserved "@" namespace).`
       );
     }
     // '--' collision is delegated to validateStartupConfig via a new maps row
     // (config.js), matching the shared contract in §1.5. Not re-implemented here.
-    const value = validateRouteValue(key, parsed[key], allowRemote);
+    const value = validateRouteValue(key, parsed[key], allowRemote, policy);
     entries[key] = value;
     if (value === SENTINEL_DEFAULT) defaultDeclared.push(key);
     else mapped.push(key);
@@ -213,7 +246,7 @@ function parseAlertRoutes(env = {}, config = {}) {
   // the one row with a call site: the table decides, this asks. Without this the
   // table was inert and MISER_ALERT_ROUTES_STRICT=1 changed nothing (AR26 asks
   // for behaviour, not for the table's return value).
-  if (buildFailurePolicy(config).incomplete_map === 'fatal'
+  if (policy.incomplete_map === 'fatal'
       && (unroutedConfigured.length > 0 || undeliverableDefaultDeclared.length > 0)) {
     const causes = [];
     if (unroutedConfigured.length) causes.push(`unrouted=${unroutedConfigured.join(',')}`);
@@ -241,7 +274,8 @@ function parseAlertRoutes(env = {}, config = {}) {
 // the safety path is first needed is strictly worse. See the operator warning
 // in §2.5: this is the one fatal that fires on a variable an operator may
 // believe is inactive. Escape hatch is symmetrical with everything else: unset it.
-function parseOpsRoute(env = {}) {
+function parseOpsRoute(env = {}, config = {}) {
+  const policy = buildFailurePolicy(config);
   const raw = env.MISER_ALERT_ROUTES_OPS;
   if (typeof raw !== 'string' || !raw.trim()) return null; // unset -> fall back to default route
   const allowRemote = /^(1|true|on|yes)$/i.test(env.MISER_ALERT_ROUTES_ALLOW_REMOTE || '');
@@ -252,9 +286,9 @@ function parseOpsRoute(env = {}) {
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    throw new Error(`[miser] fatal: MISER_ALERT_ROUTES_OPS is not parseable JSON: ${e.message}`);
+    enforceAxisC(policy, 'malformed_ops', `[miser] fatal: MISER_ALERT_ROUTES_OPS is not parseable JSON: ${e.message}`);
   }
-  return validateRouteValue('MISER_ALERT_ROUTES_OPS', parsed, allowRemote);
+  return validateRouteValue('MISER_ALERT_ROUTES_OPS', parsed, allowRemote, policy, 'malformed_ops');
 }
 
 // ---------------------------------------------------------------------------
