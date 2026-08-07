@@ -89,10 +89,29 @@ module.exports = {
     cacheWrite1h: parseFloat(process.env.MISER_WEIGHT_CACHE_WRITE_1H ?? '2.0'),
     output: parseFloat(process.env.MISER_WEIGHT_OUTPUT ?? '5.0'),
   },
+  // Per-exact-model-ID context windows (mirrors the fleet's independently
+  // maintained truth table in ~/bin/orch-token-gauge.py / orch-token-watchdog.py).
+  // Window size varies WITHIN the sonnet/opus prefix families by generation —
+  // a broad 'claude-sonnet'/'claude-opus' prefix silently mislabels newer
+  // releases, e.g. sonnet-5 is a 1M-context model but a bare 'claude-sonnet'
+  // prefix would cap it at 200K. Matched by modelWindow() via startsWith(), so
+  // entries whose id is a prefix of another entry's id MUST be listed after
+  // the more specific (longer) one — see 'claude-haiku-4-5-20251001' vs
+  // 'claude-haiku-4-5' below. Unmatched models fall through to the
+  // modelWindow() default (1_000_000, matching the fleet scripts' default).
   modelWindows: {
-    'claude-opus': 1_000_000,
-    'claude-sonnet': 200_000,
-    'claude-haiku': 200_000,
+    'claude-haiku-4-5-20251001': 200_000,
+    'claude-haiku-4-5': 200_000,
+    'claude-opus-4-8': 1_000_000,
+    'claude-opus-4-7': 1_000_000,
+    'claude-opus-4-6': 1_000_000,
+    'claude-opus-4-5': 200_000,
+    'claude-opus-5': 1_000_000,
+    'claude-sonnet-4-6': 1_000_000,
+    'claude-sonnet-4-5': 200_000,
+    'claude-sonnet-5': 1_000_000,
+    'claude-fable-5': 1_000_000,
+    'claude-3-7-sonnet': 200_000,
     'gpt': 128_000,
   },
   // Hard cap (rough tokens) applied to the Ollama fallback leg so a

@@ -127,7 +127,7 @@ async function proxyOnce(body, opts = {}) {
 }
 
 test('compact hint is none for a small Sonnet request and raw token estimate matches compress()', async () => {
-  const body = { model: 'claude-sonnet-4-20250514', max_tokens: 10, messages: [{ role: 'user', content: 'hello' }] };
+  const body = { model: 'claude-sonnet-4-5', max_tokens: 10, messages: [{ role: 'user', content: 'hello' }] };
   const { res, captured } = await proxyOnce(body);
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers['x-miser-compact-hint'], 'none');
@@ -139,25 +139,35 @@ test('compact hint is none for a small Sonnet request and raw token estimate mat
 });
 
 test('compact hint is recommend above 40% of the Sonnet window', async () => {
-  const { res } = await proxyOnce(bodyForRawTokens('claude-sonnet-4-20250514', 82_000));
+  const { res } = await proxyOnce(bodyForRawTokens('claude-sonnet-4-5', 82_000));
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers['x-miser-compact-hint'], 'recommend');
 });
 
 test('compact hint is urgent above 70% of the Sonnet window', async () => {
-  const { res } = await proxyOnce(bodyForRawTokens('claude-sonnet-4-20250514', 142_000));
+  const { res } = await proxyOnce(bodyForRawTokens('claude-sonnet-4-5', 142_000));
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers['x-miser-compact-hint'], 'urgent');
 });
 
 test('same absolute token estimate is none on the larger Opus window', async () => {
-  const { res } = await proxyOnce(bodyForRawTokens('claude-opus-4-20250514', 82_000));
+  const { res } = await proxyOnce(bodyForRawTokens('claude-opus-4-8', 82_000));
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers['x-miser-compact-hint'], 'none');
 });
 
-test('unknown model defaults to the 200K window', async () => {
-  const { res } = await proxyOnce(bodyForRawTokens('unknown-model', 82_000));
+test('claude-sonnet-5 gets the 1M window like Opus, not the 200K legacy-Sonnet window', async () => {
+  // Regression test for the bug this change fixes: sonnet-5 is a 1M-context
+  // model, same generation as opus-5, but a broad 'claude-sonnet' prefix
+  // used to cap it at 200K and would have flagged this as 'urgent' (>70% of
+  // 200K). At 82K raw tokens it should read 'none' against the true 1M window.
+  const { res } = await proxyOnce(bodyForRawTokens('claude-sonnet-5', 82_000));
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-miser-compact-hint'], 'none');
+});
+
+test('unknown model defaults to the 1M window', async () => {
+  const { res } = await proxyOnce(bodyForRawTokens('unknown-model', 450_000));
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers['x-miser-compact-hint'], 'recommend');
 });

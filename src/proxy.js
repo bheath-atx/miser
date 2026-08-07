@@ -86,7 +86,10 @@ function modelWindow(model) {
   for (const [prefix, window] of Object.entries(config.modelWindows)) {
     if (name.startsWith(prefix)) return window;
   }
-  return 200_000;
+  // Unmatched model: default to 1M, matching the fleet's independently
+  // maintained truth table (orch-token-gauge.py / orch-token-watchdog.py),
+  // which defaults unlisted model IDs to 1_000_000, not 200_000.
+  return 1_000_000;
 }
 
 function lastUserText(messages) {
