@@ -11,6 +11,7 @@ const {
   parseAlertRoutes,
   parseOpsRoute,
   buildFailurePolicy,
+  validateRouteValue,
   resolveRoute,
   createAlertDispatcher,
   alertRoutingHealth,
@@ -397,5 +398,63 @@ test('AR26: each axis-C condition resolves a real table row, not the unimplement
     assert.ok(err, `${name}: must be fatal`);
     assert.ok(!/no implemented code path/.test(err.message),
       `${name}: fell through to the unimplemented-policy branch — the axis name did not resolve to a table row`);
+  }
+});
+
+// AR26 companion #2 — WHICH row fired, per condition.
+//
+// CODEX-BA-R2 blocker A: the companion above asserts only that no condition
+// falls through to the unimplemented branch, which is a per-OUTCOME oracle. It
+// stayed green while `unsafe_endpoint` and `malformed_entry` were wired to each
+// other's conditions — the non-loopback exfiltration case, the one the row is
+// named for, was resolving through malformed_entry, and the tokenFile
+// absolute-path case through unsafe_endpoint. Both still threw, so absence-of-
+// fallback could not see it.
+//
+// The oracle here is row IDENTITY: inject a policy whose target row holds a
+// sentinel, and the unimplemented-branch message names the row that was
+// actually consulted. validateRouteValue takes `policy` as a parameter, so this
+// needs no seam that production does not already have.
+test('AR26: each condition resolves the SPECIFIC policy row it is documented to use', () => {
+  const FATAL = { malformed_entry: 'fatal', unsafe_endpoint: 'fatal', malformed_ops: 'fatal', incomplete_map: 'degraded' };
+  const REMOTE = { endpoint: 'https://evil.example.com/x', tokenFile: '/tmp/t' };
+  const BAD_TOKEN = { endpoint: 'http://127.0.0.1:8001/x', tokenFile: 'relative' };
+  const BAD_PROTO = { endpoint: 'file:///x', tokenFile: '/tmp/t' };
+  const BAD_KEYS = { endpoint: 'http://127.0.0.1:8001/x' };
+
+  // Which row does this condition consult? Sentinel the candidate row; if that
+  // is the row consulted, enforceAxisC names it in the fallback message.
+  function rowFor(value, expected, axis = 'malformed_entry') {
+    const policy = { ...FATAL, [expected]: 'SENTINEL' };
+    try {
+      validateRouteValue('lbl', value, false, policy, axis);
+      return 'NO THROW';
+    } catch (e) {
+      const m = e.message.match(/policy (\w+)=/);
+      return m ? m[1] : 'a-different-row';
+    }
+  }
+
+  // Map entries: the exfiltration case is unsafe_endpoint's whole reason to
+  // exist; everything else about a malformed statement is malformed_entry.
+  assert.equal(rowFor(REMOTE, 'unsafe_endpoint'), 'unsafe_endpoint',
+    'the non-loopback case must consult unsafe_endpoint, not malformed_entry');
+  assert.equal(rowFor(BAD_TOKEN, 'malformed_entry'), 'malformed_entry',
+    'a non-absolute tokenFile is a malformed entry, not an unsafe endpoint');
+  assert.equal(rowFor(BAD_PROTO, 'malformed_entry'), 'malformed_entry');
+  assert.equal(rowFor(BAD_KEYS, 'malformed_entry'), 'malformed_entry');
+
+  // ...and the two rows are not interchangeable: sentinel the OTHER row and the
+  // condition must NOT fall through, i.e. it genuinely reads only its own row.
+  assert.equal(rowFor(REMOTE, 'malformed_entry'), 'a-different-row',
+    'non-loopback must be unaffected by the malformed_entry row');
+  assert.equal(rowFor(BAD_TOKEN, 'unsafe_endpoint'), 'a-different-row',
+    'tokenFile must be unaffected by the unsafe_endpoint row');
+
+  // The ops route is governed by its own single row for every condition,
+  // including the exfiltration one (§2.5).
+  for (const value of [REMOTE, BAD_TOKEN, BAD_PROTO, BAD_KEYS]) {
+    assert.equal(rowFor(value, 'malformed_ops', 'malformed_ops'), 'malformed_ops',
+      'every ops-route condition consults malformed_ops');
   }
 });

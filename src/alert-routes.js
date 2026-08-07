@@ -154,14 +154,14 @@ function validateRouteValue(label, value, allowRemote, policy = buildFailurePoli
     // Not theoretical: alert bodies carry per-project spend figures and model
     // names, and a typo'd or poisoned endpoint would exfiltrate them with a
     // valid bearer token attached (§2.2).
-    enforceAxisC(policy, axis,
+    enforceAxisC(policy, unsafeAxis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" endpoint host "${url.hostname}" is not ` +
       `loopback. Alert bodies carry per-project spend and model names plus a bearer token; sending ` +
       `them off-host requires MISER_ALERT_ROUTES_ALLOW_REMOTE=1 as an explicit opt-in.`
     );
   }
   if (typeof tokenFile !== 'string' || !tokenFile.startsWith('/')) {
-    enforceAxisC(policy, unsafeAxis,
+    enforceAxisC(policy, axis,
       `[miser] fatal: MISER_ALERT_ROUTES entry "${label}" tokenFile must be an absolute path ` +
       `(a path, not a token value) — got ${JSON.stringify(tokenFile)}`
     );
