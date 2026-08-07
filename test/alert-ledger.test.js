@@ -175,44 +175,69 @@ test('require(alert-ledger) alone performs zero file I/O (factory-only contract)
   assert.match(src, /module\.exports = \{ createLedger \}/);
 });
 
-// --- Production sendAlert failure behavior (AC8: unit-tested here only) -----
+// --- Dispatcher failure behaviour (AR12 / AR32) ----------------------------
+//
+// DELIBERATE CONTRACT CHANGE (§2.7, AR12). This block previously asserted that
+// sendAlert with no env produces ZERO warns — the silent skip at the old
+// daily-rollup.js:176. That silence was a deliberate choice once, and this
+// sprint reverses it deliberately: no destination is now LOUD. The assertion is
+// INVERTED, not deleted, and it now drives createAlertDispatcher (the single
+// outbound path, §2.9a) rather than the removed legacy function.
+const { createAlertDispatcher, getAlertCounters, __resetAlertState } = require('../src/alert-routes.js');
 
-test('sendAlert with no env silently skips (no warn, no throw)', async () => {
-  const prev = { endpoint: process.env.MISER_PKACHU_ENDPOINT, token: process.env.MISER_PKACHU_TOKEN };
+test('AR12: no destination is LOUD — one ALERT-DROPPED, dropped+1, zero network, no throw', async () => {
+  __resetAlertState();
   const prevWarn = console.warn;
   const warns = [];
   console.warn = (line) => warns.push(String(line));
+  let posts = 0;
   try {
-    delete process.env.MISER_PKACHU_ENDPOINT;
-    delete process.env.MISER_PKACHU_TOKEN;
-    await sendAlert('test alert');
-    assert.equal(warns.length, 0);
+    // No route map, no default route, no ops route.
+    const sendAlert = createAlertDispatcher(
+      { alertRoutes: null, alertRoutesOps: null },
+      { post: () => { posts += 1; }, readToken: async () => 'tok', defaultRoute: null },
+    );
+    const before = getAlertCounters().dropped;
+    let result;
+    await assert.doesNotReject(async () => { result = await sendAlert('test alert', { kind: 'budget-cap' }); });
+    assert.equal(warns.filter(w => /\[miser\/alert\] ALERT-DROPPED/.test(w)).length, 1);
+    assert.equal(getAlertCounters().dropped, before + 1);
+    assert.equal(posts, 0, 'zero network calls');
+    // §2.9a: resolves to an AlertResult, never rejects.
+    assert.equal(result.ok, false);
+    assert.equal(result.outcome, 'dropped');
+    assert.equal(result.reason, 'no_destination');
   } finally {
     console.warn = prevWarn;
-    if (prev.endpoint === undefined) delete process.env.MISER_PKACHU_ENDPOINT;
-    else process.env.MISER_PKACHU_ENDPOINT = prev.endpoint;
-    if (prev.token === undefined) delete process.env.MISER_PKACHU_TOKEN;
-    else process.env.MISER_PKACHU_TOKEN = prev.token;
+    __resetAlertState();
   }
 });
 
-test('sendAlert failure logs one warn per call and never throws', async () => {
-  const prev = { endpoint: process.env.MISER_PKACHU_ENDPOINT, token: process.env.MISER_PKACHU_TOKEN };
+test('AR32: delivery failure resolves (never rejects), warns once with kind=, bumps failed', async () => {
+  __resetAlertState();
   const prevWarn = console.warn;
   const warns = [];
   console.warn = (line) => warns.push(String(line));
   try {
-    // Token path points at a file that does not exist → readToken throws →
-    // sendAlert catches, warns once, resolves. No socket is ever opened.
-    process.env.MISER_PKACHU_ENDPOINT = 'http://127.0.0.1:1/hook';
-    process.env.MISER_PKACHU_TOKEN = path.join(os.tmpdir(), `miser-no-such-token-${Date.now()}`);
-    await assert.doesNotReject(() => sendAlert('test alert'));
-    assert.equal(warns.filter(w => /\[miser\/alert\] WARN alert send failed/.test(w)).length, 1);
+    const sendAlert = createAlertDispatcher(
+      { alertRoutes: null },
+      {
+        // Token path points at a file that does not exist -> readToken throws ->
+        // the dispatcher catches, warns once, RESOLVES. No socket is opened.
+        readToken: () => { throw new Error('ENOENT: no such token file'); },
+        post: () => { throw new Error('should not be reached'); },
+        defaultRoute: { endpoint: 'http://127.0.0.1:1/hook', tokenFile: path.join(os.tmpdir(), `miser-no-such-token-${Date.now()}`) },
+      },
+    );
+    let result;
+    await assert.doesNotReject(async () => { result = await sendAlert('test alert', { kind: 'sub-cap' }); });
+    const failLines = warns.filter(w => /\[miser\/alert\] WARN alert send failed/.test(w));
+    assert.equal(failLines.length, 1, 'exactly one failure line');
+    assert.match(failLines[0], /kind=sub-cap/, 'FAILED token carries kind= so the send is attributable');
+    assert.equal(result.outcome, 'failed');
+    assert.equal(getAlertCounters().failed, 1);
   } finally {
     console.warn = prevWarn;
-    if (prev.endpoint === undefined) delete process.env.MISER_PKACHU_ENDPOINT;
-    else process.env.MISER_PKACHU_ENDPOINT = prev.endpoint;
-    if (prev.token === undefined) delete process.env.MISER_PKACHU_TOKEN;
-    else process.env.MISER_PKACHU_TOKEN = prev.token;
+    __resetAlertState();
   }
 });

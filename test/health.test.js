@@ -214,3 +214,90 @@ test('health exposes leg errors, c1 disabled projects, and pending writes', asyn
     cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// AR19 / AR20 / AR25 — alert-routing health block, startup inventory line, and
+// the degraded-is-inert contract. Added at BUILDER-AUDIT R1: the
+// implementations existed (src/proxy.js alertRoutingHealth, src/index.js
+// inventory log) but nothing asserted them, so §4's oracle column named this
+// file for three ACs it did not actually cover.
+// ---------------------------------------------------------------------------
+
+const { alertRoutingHealth, parseAlertRoutes, __resetAlertState } = require('../src/alert-routes.js');
+
+test('AR19: health exposes the full §2.8 alertRouting block, every field', async () => {
+  const { proxy, cleanup } = freshModules();
+  try {
+    const handler = proxy.createProxy();
+    const { payload } = await drive(handler, fakeReq('GET', '/api/miser/health'));
+    assert.ok('alertRouting' in payload, 'health carries an alertRouting block');
+    // The AC enumerates twelve fields; assert the exact key set so a field
+    // silently dropped (or added without updating §2.8) fails here.
+    assert.deepEqual(
+      Object.keys(payload.alertRouting).sort(),
+      [
+        'counters', 'defaultConfigured', 'defaultDeclared', 'invalidProjectAlerts',
+        'mapped', 'opsConfigured', 'status', 'strict', 'undeliverableDefaultDeclared',
+        'unroutedConfigured', 'unroutedRuntime', 'unroutedRuntimeOverflow',
+      ],
+      'the §2.8 block is exactly these twelve fields',
+    );
+    assert.deepEqual(
+      Object.keys(payload.alertRouting.counters).sort(),
+      ['delivered', 'dropped', 'failed', 'withheld', 'withheldOverflow'],
+      'counters carries the five §2.7 counters',
+    );
+    assert.equal(payload.alertRouting.status, 'ok', 'routes OFF is not degraded');
+  } finally {
+    cleanup();
+  }
+});
+
+test('AR25: degraded is visible in health and inert on the request path', async () => {
+  // Routes ON with a required project missing -> degraded. health must be
+  // HTTP 200 with ok:false, and the request path must be untouched.
+  const routes = parseAlertRoutes(
+    { MISER_ALERT_ROUTES: JSON.stringify({ alpha: { endpoint: 'http://127.0.0.1:8001/a', tokenFile: '/tmp/a' } }) },
+    { budgets: { alpha: {}, beta: {} } },
+  );
+  const health = alertRoutingHealth({ alertRoutes: routes });
+  assert.equal(health.status, 'degraded');
+  assert.deepEqual(health.unroutedConfigured, ['beta'], 'the unrouted project is named, not just counted');
+
+  // ...and the complete/OFF cases stay ok:true, which is what keeps
+  // '/api/miser/health returns all vitals fields' above (payload.ok === true)
+  // and test/proxy.test.js passing UNMODIFIED. That is the load-bearing half:
+  // the obvious over-broad fix would have flipped ok:false on every process.
+  const complete = parseAlertRoutes(
+    { MISER_ALERT_ROUTES: JSON.stringify({ alpha: { endpoint: 'http://127.0.0.1:8001/a', tokenFile: '/tmp/a' } }) },
+    { budgets: { alpha: {} } },
+  );
+  assert.equal(alertRoutingHealth({ alertRoutes: complete }).status, 'ok');
+  assert.equal(alertRoutingHealth({ alertRoutes: null }).status, 'ok', 'routes OFF is never degraded');
+  __resetAlertState();
+});
+
+test('AR20: startup emits the alert-routes INVENTORY line, distinct from the degraded line', () => {
+  // Source-shape rather than a spawned process: the line is emitted inside
+  // index.js's listen callback, which cannot be driven without binding a port.
+  // What AR20 protects is that the inventory line exists, is separate from
+  // AR28(c)'s ALERT-ROUTING-DEGRADED line, and reports the four things §2.8
+  // says it reports — all checkable in the source.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.js'), 'utf8');
+  const line = src.split('\n').find(l => l.includes('[miser] alert routes:'));
+  assert.ok(line, 'the inventory line exists');
+
+  const block = src.slice(src.indexOf('[miser] alert routes:'));
+  const stanza = block.slice(0, block.indexOf('[miser] health:'));
+  assert.match(stanza, /mapped/, 'enumerates mapped projects');
+  assert.match(stanza, /defaultDeclared/, 'enumerates @default declarations');
+  assert.match(stanza, /defaultConfigured/, 'reports whether the default route is configured');
+  assert.match(stanza, /MISER_ALERT_ROUTES unset/, 'says so plainly when routing is OFF');
+
+  // Two lines, two owners (§2.8 / AR28(c)): the inventory line must NOT be the
+  // degraded line, or one could be silently dropped in favour of the other.
+  assert.ok(!stanza.includes('ALERT-ROUTING-DEGRADED'),
+    'the inventory line is not the degraded line');
+  assert.ok(!src.includes("console.log(`[miser/alert] ALERT-ROUTING-DEGRADED"),
+    'the degraded line is owned by reportStartupAlertDefects, not by index.js');
+});

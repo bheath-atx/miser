@@ -3,6 +3,7 @@
 const { parseContextEditProjects } = require('./context-management.js');
 const { parseBudgets, parseBudgetGrace } = require('./budgets.js');
 const { parsePolicy } = require('./policy-watchdog.js');
+const { parseAlertRoutes, parseOpsRoute } = require('./alert-routes.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
 // (which collides with the panel routing grammar). Exported for unit tests so
@@ -13,6 +14,9 @@ function validateStartupConfig(cfg) {
     ['policy',              cfg.policy],
     ['contextEditProjects', cfg.contextEditProjects],
     ['toolAllowlists',      cfg.toolAllowlists],
+    // MISER_ALERT_ROUTES inherits the '--' collision fatal from the shared
+    // contract (§1.5) via this row — not re-implemented in alert-routes.js.
+    ['alertRoutes',         cfg.alertRoutes && cfg.alertRoutes.entries],
   ];
   for (const [label, map] of maps) {
     if (!map || typeof map !== 'object') continue;
@@ -135,6 +139,31 @@ module.exports = {
   cacheThrashInputSpikeRatio: parseFloat(process.env.MISER_CACHE_THRASH_INPUT_SPIKE_RATIO ?? '2.0'),
   cacheThrashMinRequests:     parseInt(process.env.MISER_CACHE_THRASH_MIN_REQUESTS        || '10', 10),
   cacheThrashRingSize:        parseInt(process.env.MISER_CACHE_THRASH_RING_SIZE            || '50', 10),
+  // Alert routing (PROPOSAL §2.2-§2.5). null is the exclusive OFF signal.
+  // parseAlertRoutes is PURE: it reads only the env object handed to it, which
+  // is what lets defaultConfigured participate in the degraded decision (§2.3
+  // cause 2) without a new env read. Malformed/unsafe entries are startup-fatal
+  // (axis C); a merely MISSING entry is degraded, never fatal (axis D).
+  alertRoutes: parseAlertRoutes(process.env, {
+    budgets: parseBudgets(process.env.MISER_BUDGETS || ''),
+    policy: parsePolicy(process.env.MISER_POLICY || ''),
+    // pollRewriteProjects does not exist on main; it becomes live when E rebases
+    // (§3.5) with zero further edits here.
+    pollRewriteProjects: undefined,
+    alertRoutesStrict: /^(1|true|on|yes)$/i.test(process.env.MISER_ALERT_ROUTES_STRICT || ''),
+  }),
+  // Fatal when SET and malformed/unsafe EVEN WHEN MISER_ALERT_ROUTES IS OFF
+  // (§2.5) — see the operator warning there: this is the one fatal that fires
+  // on a variable an operator may believe is inactive. Recovery: unset it.
+  // Second arg is the failure-policy config (§2.3): parseOpsRoute asks the
+  // table rather than hard-coding its own fatality, so malformed_ops is a real
+  // table row and not a claim about one.
+  alertRoutesOps: parseOpsRoute(process.env, {
+    alertRoutesStrict: /^(1|true|on|yes)$/i.test(process.env.MISER_ALERT_ROUTES_STRICT || ''),
+  }),
+  alertRoutesStrict: /^(1|true|on|yes)$/i.test(process.env.MISER_ALERT_ROUTES_STRICT || ''),
+  alertRoutesUnrouted: process.env.MISER_ALERT_ROUTES_UNROUTED || 'withhold',
+  alertRoutesUnroutedMax: parseInt(process.env.MISER_ALERT_ROUTES_UNROUTED_MAX || '32', 10),
 };
 
 module.exports.validateStartupConfig = validateStartupConfig;

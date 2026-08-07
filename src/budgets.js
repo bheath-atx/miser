@@ -3,7 +3,7 @@
 const { isValidProjectName } = require('./routing.js');
 const { computeCost } = require('./pricing.js');
 const { getRawStatsSnapshot, recordBudgetBlock } = require('./stats.js');
-const { sendAlert: defaultSendAlert } = require('./daily-rollup.js');
+const { bumpDropped } = require('./alert-routes.js');
 
 // G3 — per-project daily USD budget caps (Sprint B §1).
 //
@@ -90,10 +90,22 @@ function parseBudgetGrace(env) {
 }
 
 // Alert dispatch is ALWAYS fire-and-forget: never awaited on the request path,
-// outer .catch swallows any rejection from the production or injected sendAlert.
-function dispatchAlert(sendAlert, text) {
-  const send = sendAlert || defaultSendAlert;
-  Promise.resolve().then(() => send(text)).catch(() => {});
+// outer .catch swallows any rejection from an injected sendAlert double.
+//
+// The production fallback is GONE (§3.1): there is no expression here that can
+// produce a network-capable dispatcher, so an un-injected dependency cannot
+// reach the network whatever the environment contains. A missing dispatcher is
+// LOUD and fail-closed (§3.3) — this guard is a PRE-DISPATCHER check and owns
+// its own log line and counter bump, because a dispatcher that does not exist
+// cannot log its own absence (§2.7 ownership table).
+function dispatchAlert(sendAlert, text, opts = {}) {
+  if (!sendAlert) {
+    console.warn(`[miser/alert] ALERT-DROPPED project=${opts.project || 'fleet'} `
+      + `kind=${opts.kind || 'unknown'} reason=no_dispatcher`);
+    bumpDropped();
+    return;
+  }
+  Promise.resolve().then(() => sendAlert(text, opts)).catch(() => {});
 }
 
 // Sum of measured Anthropic-leg .requests — anthropic provider only (§1.5).
@@ -171,7 +183,7 @@ function checkBudget(project, guardDeps = {}) {
     if (ledger.shouldSend(key)) {
       ledger.markSent(key); // mark BEFORE send (normative): failed send is not retried that day
       const suffix = grace ? ' — GRACE: alerting only, not blocking' : ' — blocking until UTC midnight';
-      dispatchAlert(sendAlert, `⛔ miser budget: ${project} EXHAUSTED $${spend.toFixed(2)}/$${dailyUSD.toFixed(2)}${suffix}`);
+      dispatchAlert(sendAlert, `⛔ miser budget: ${project} EXHAUSTED $${spend.toFixed(2)}/$${dailyUSD.toFixed(2)}${suffix}`, { project, kind: 'budget-cap' });
     }
     if (grace) return null; // grace-listed: alerts only, never the 429
     recordBudgetBlock(project, () => now); // pass captured now — single clock read, no midnight split
@@ -184,7 +196,7 @@ function checkBudget(project, guardDeps = {}) {
     if (ledger.shouldSend(key)) {
       ledger.markSent(key);
       const n = requestsToday(usage);
-      dispatchAlert(sendAlert, `⚠️ miser budget: ${project} at $${spend.toFixed(2)}/$${dailyUSD.toFixed(2)} (80%) — ${n} requests today`);
+      dispatchAlert(sendAlert, `⚠️ miser budget: ${project} at $${spend.toFixed(2)}/$${dailyUSD.toFixed(2)} (80%) — ${n} requests today`, { project, kind: 'budget-warn' });
     }
   }
 

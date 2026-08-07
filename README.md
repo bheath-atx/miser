@@ -183,8 +183,45 @@ Relevant env vars:
 | `MISER_STATS_FILE` | Stats file path, default `~/.miser-stats.json` |
 | `MISER_DEDUP_FORCE` | Test/emergency override for the cache-safety dedup gate |
 | `MISER_PRICING_JSON` | JSON map of model pricing overrides merged over the built-in Anthropic table |
-| `MISER_PKACHU_TOKEN` | File path containing the bearer token for daily rollup posts |
-| `MISER_PKACHU_ENDPOINT` | HTTP(S) endpoint for daily rollup JSON posts |
+| `MISER_PKACHU_TOKEN` | File path containing the bearer token for the **default route** — daily rollup posts *and* every alert not routed elsewhere |
+| `MISER_PKACHU_ENDPOINT` | HTTP(S) endpoint for the **default route**: daily rollup JSON posts, plus the destination for all fleet-scope alerts and for any project without a route of its own |
+| `MISER_ALERT_ROUTES` | JSON map of `project -> {endpoint, tokenFile}` (or the string `"@default"`) sending that project's alerts to its own channel. **Unset = OFF**, and OFF is fully inert: every alert goes to the default route exactly as before |
+| `MISER_ALERT_ROUTES_OPS` | Destination for miser's *own* routing/config defect alerts. Same value grammar as one route-map entry. Unset falls back to the default route. **See the warning below** |
+| `MISER_ALERT_ROUTES_ALLOW_REMOTE` | `1` permits non-loopback alert endpoints. Default off: a remote endpoint is rejected at startup, because an alert route carries a live bearer token |
+| `MISER_ALERT_ROUTES_UNROUTED` | `withhold` (default) or `escalate` — whether the ops defect alert for a valid-but-unmapped project **includes** the withheld alert text. `withhold` omits it, so a project's content never reaches a channel that was not configured for it. Text from an *invalid* project name is never included in either mode |
+| `MISER_ALERT_ROUTES_UNROUTED_MAX` | Cap on distinct unroutable project names reported per UTC day, default `32`. Beyond it names collapse into a single `@overflow` bucket, so a bad map cannot storm the ops channel |
+| `MISER_ALERT_ROUTES_STRICT` | `1` makes an **incomplete** route map fatal at startup instead of degraded. Default off: a configured project missing from the map degrades — proxy keeps serving, `health.ok` goes false, that project's alerts are withheld and reported — rather than stopping miser |
+
+> **⚠ Operator warning — `MISER_ALERT_ROUTES_OPS` is validated even when alert routing is off.**
+> A malformed or non-loopback `MISER_ALERT_ROUTES_OPS` **will block miser from starting even when
+> `MISER_ALERT_ROUTES` is unset and alert routing is otherwise entirely off.** With
+> `Restart=on-failure` / `RestartSec=5` in the unit file, that is a five-second crash loop ending in a
+> `failed` unit. This is deliberate, and it is the one fatal that fires on a variable an operator may
+> believe is inactive: the alternative is discovering a bad ops route at the exact moment the safety
+> path is first needed, with a live bearer token pointed at the wrong host.
+>
+> **Recovery: `unset MISER_ALERT_ROUTES_OPS` (or remove it from the unit's environment), then restart.**
+>
+> The asymmetry is intentional — a route you stated *incorrectly* is fatal; a route you merely *omitted*
+> is not. Missing a project from `MISER_ALERT_ROUTES` degrades and keeps serving.
+
+### Alert destinations
+
+`sendAlert(text, opts)` has three destination classes. `opts.kind` is a free-form diagnostic label and
+**never** affects routing.
+
+| Class | How to express it | Destination |
+|---|---|---|
+| **project** | `{ project: 'structural360' }` | that project's route from `MISER_ALERT_ROUTES`, else the default route |
+| **fleet** | `{ scope: 'fleet' }` — `{}` and `{ project: null }` are equivalent | the default route (`MISER_PKACHU_*`) |
+| **ops** | `{ scope: 'ops' }` — must be explicit, never inferred | `MISER_ALERT_ROUTES_OPS`, else the default route |
+
+`opts.project` is a **project name, not a route selector.** Passing a route, an endpoint or a channel
+name there is a category error rather than a style preference: the value fails project-name validation,
+collapses into the `@invalid` bucket, and the alert is **withheld**. The loss is loud — one ops defect
+alert, a counter, a log line and a health field — but the alert does not reach its intended reader. An
+explicit `scope` always wins over an inferred one, and a `scope`/`project` conflict logs exactly one
+`ALERT-SCOPE-CONFLICT` line before honouring the explicit scope.
 
 ---
 

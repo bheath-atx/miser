@@ -71,13 +71,20 @@ function createCacheThrashChecker(config) {
           && guardDeps.ledger.shouldSend('thrash:' + project)) {
         guardDeps.ledger.markSent('thrash:' + project);
         const { details } = result;
+        if (!guardDeps.sendAlert) {
+          // Pre-dispatcher check (§3.3 / §2.7 ownership table).
+          console.warn(`[miser/alert] ALERT-DROPPED project=${project} kind=cache-thrash reason=no_dispatcher`);
+          require('./alert-routes.js').bumpDropped();
+          return result;
+        }
         Promise.resolve()
           .then(() => guardDeps.sendAlert(
             `⚠️ miser cache-thrash: project=${project} model=${model} — ` +
             `cacheWrite1h ${details.cacheWrite1h} vs prior avg ${details.avgCacheWrite1hPrior.toFixed(0)} ` +
             `(${(details.cacheWrite1h / details.avgCacheWrite1hPrior).toFixed(1)}×); ` +
             `inputTokens=${details.inputTokens} normal ` +
-            `(${(details.inputTokens / (details.avgInputTokensPrior || 1)).toFixed(1)}× avg) — prefix mutation suspected`
+            `(${(details.inputTokens / (details.avgInputTokensPrior || 1)).toFixed(1)}× avg) — prefix mutation suspected`,
+            { project, kind: 'cache-thrash' }
           ))
           .catch(e => console.warn('[miser] thrash alert error:', e.message));
       }
@@ -101,13 +108,18 @@ function createCacheThrashChecker(config) {
 function wireCacheThrashDeps(config, guardDeps, seams) {
   if (config.cacheThrashMinRequests === 0) return;
 
+  // Pure CONSUMER now (§3.2): wireAlertDispatcher owns dispatcher + ledger
+  // construction. The absence-guards remain so a cache-thrash-only config that
+  // somehow reaches here without the composition root still gets a ledger, but
+  // the PRODUCTION FALLBACK to daily-rollup.sendAlert is DELETED (§3.1) — there
+  // is no expression here that can produce a network-capable dispatcher.
   if (!guardDeps.ledger) {
     const mkLedger = (seams && seams.createLedger) || require('./alert-ledger.js').createLedger;
     guardDeps.ledger = mkLedger();
     guardDeps.nowFn = () => new Date();
   }
-  if (!guardDeps.sendAlert) {
-    guardDeps.sendAlert = (seams && seams.sendAlert) || require('./daily-rollup.js').sendAlert;
+  if (!guardDeps.sendAlert && seams && seams.sendAlert) {
+    guardDeps.sendAlert = seams.sendAlert;
   }
   const factory = (seams && seams.createCacheThrashChecker) || createCacheThrashChecker;
   const thrash = factory(config);
