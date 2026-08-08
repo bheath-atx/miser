@@ -86,10 +86,16 @@ function modelWindow(model) {
   for (const [prefix, window] of Object.entries(config.modelWindows)) {
     if (name.startsWith(prefix)) return window;
   }
-  // Unmatched model: default to 1M, matching the fleet's independently
-  // maintained truth table (orch-token-gauge.py / orch-token-watchdog.py),
-  // which defaults unlisted model IDs to 1_000_000, not 200_000.
-  return 1_000_000;
+  // Unmatched model: default to 200K, the conservative/safe assumption for a
+  // genuinely unknown model ID, and the SAME default the fleet's own scripts
+  // use (~/bin/orch-token-gauge.py DEFAULT_WINDOW, orch-token-watchdog.py
+  // DEFAULT_WINDOW are both 200_000). Every model actually known to have a 1M
+  // window (opus-5, sonnet-5, fable-5, opus/sonnet-4-6+, etc.) is listed
+  // explicitly above with its own entry — only truly unlisted/legacy IDs
+  // (e.g. 'claude-sonnet-4-20250514', still referenced in this repo's own
+  // tests) fall through to this default, and for those, overstating the
+  // window as 1M would silently suppress the compact-hint urgency signal.
+  return 200_000;
 }
 
 function lastUserText(messages) {

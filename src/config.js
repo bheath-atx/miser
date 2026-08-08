@@ -98,7 +98,8 @@ module.exports = {
   // entries whose id is a prefix of another entry's id MUST be listed after
   // the more specific (longer) one — see 'claude-haiku-4-5-20251001' vs
   // 'claude-haiku-4-5' below. Unmatched models fall through to the
-  // modelWindow() default (1_000_000, matching the fleet scripts' default).
+  // modelWindow() default (200_000, matching the fleet scripts' default —
+  // the safe/conservative assumption for a genuinely unknown model ID).
   modelWindows: {
     'claude-haiku-4-5-20251001': 200_000,
     'claude-haiku-4-5': 200_000,

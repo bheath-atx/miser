@@ -166,10 +166,14 @@ test('claude-sonnet-5 gets the 1M window like Opus, not the 200K legacy-Sonnet w
   assert.equal(res.headers['x-miser-compact-hint'], 'none');
 });
 
-test('unknown model defaults to the 1M window', async () => {
+test('unknown model defaults to the 200K window (safe/conservative default)', async () => {
+  // Matches the fleet's own truth table (orch-token-gauge.py /
+  // orch-token-watchdog.py DEFAULT_WINDOW = 200_000): a genuinely unknown
+  // model ID is assumed to have the SMALLER window so the compact-hint
+  // urgency signal never silently understates itself for a legacy model.
   const { res } = await proxyOnce(bodyForRawTokens('unknown-model', 450_000));
   assert.equal(res.statusCode, 200);
-  assert.equal(res.headers['x-miser-compact-hint'], 'recommend');
+  assert.equal(res.headers['x-miser-compact-hint'], 'urgent');
 });
 
 test('poll class is unlikely for a first-time long user message', async () => {
