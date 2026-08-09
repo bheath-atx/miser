@@ -18,7 +18,7 @@ function restoreEnv(prev) {
   else process.env.MISER_PRICING_JSON = prev;
 }
 
-test('Anthropic pricing table pins sonnet, opus, and haiku all five axes', () => {
+test('Anthropic pricing table pins sonnet, opus, haiku, opus-5, sonnet-5, and fable-5 all five axes', () => {
   const prev = process.env.MISER_PRICING_JSON;
   try {
     const { getPricingTable } = freshPricing(undefined);
@@ -51,6 +51,27 @@ test('Anthropic pricing table pins sonnet, opus, and haiku all five axes', () =>
       cacheReadPerMTok: 0.1,
       cacheWrite5mPerMTok: 1.25,
       cacheWrite1hPerMTok: 2,
+    });
+    assert.deepEqual(table['claude-opus-5'], {
+      inputPerMTok: 5,
+      outputPerMTok: 25,
+      cacheReadPerMTok: 0.5,
+      cacheWrite5mPerMTok: 6.25,
+      cacheWrite1hPerMTok: 10,
+    });
+    assert.deepEqual(table['claude-sonnet-5'], {
+      inputPerMTok: 3,
+      outputPerMTok: 15,
+      cacheReadPerMTok: 0.3,
+      cacheWrite5mPerMTok: 3.75,
+      cacheWrite1hPerMTok: 6,
+    });
+    assert.deepEqual(table['claude-fable-5'], {
+      inputPerMTok: 10,
+      outputPerMTok: 50,
+      cacheReadPerMTok: 1,
+      cacheWrite5mPerMTok: 12.5,
+      cacheWrite1hPerMTok: 20,
     });
   } finally {
     restoreEnv(prev);

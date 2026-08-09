@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const { computeCost } = require('./pricing.js');
+const { computeCost, hasExplicitPriceForModel } = require('./pricing.js');
+const { readWeeklyCapsFile, MISER_METHOD_ID } = require('./weekly-caps.js');
 
 // Persisted per-day x per-project x per-technique stats.
 // Atomic write (temp+rename) so process restarts do not corrupt the file.
@@ -14,6 +15,8 @@ const WEEKLY_KEY = '__weekly';
 const WEEKLY_META_KEY = '__meta';
 const STATS_META_KEY = '__meta';
 const WEEKLY_RECORDED_PROVENANCE = 'recorded_event_instant';
+const UNPRICED_MODELS_KEY = 'unpriced_models';
+const LIMIT_EVENTS_KEY = 'limit_events';
 // Historical E3-only key name retained only so unshipped snapshots can be cleaned.
 const DAILY_RETENTION_WATERMARK_KEY = 'dailyRetentionWatermark';
 // Daily buckets remain the rolling-window observation log. Weekly authority is
@@ -212,6 +215,15 @@ function cloneStats() {
   pruneWeeklyRetention(_stats, now);
   markRuntimeWeeklyCoverageGaps(_stats, now);
   return JSON.parse(JSON.stringify(_stats));
+}
+
+function getObservationContainer(statsObj, key, create = false) {
+  if (!statsObj || typeof statsObj !== 'object') return null;
+  const existing = statsObj[key];
+  if (existing && typeof existing === 'object' && !Array.isArray(existing)) return existing;
+  if (!create) return null;
+  statsObj[key] = {};
+  return statsObj[key];
 }
 
 async function writeSnapshot(snapshot) {
@@ -1066,6 +1078,59 @@ function ensureMeasuredProjectBucket(project, now) {
   return ensureMeasuredProjectBucketForDay(project, dayKeyFromDate(requireNow(now, 'ensureMeasuredProjectBucket')));
 }
 
+function recordUnpricedModelObservation(model, day, weekKey) {
+  const modelKey = model || 'unknown';
+  const daily = getObservationContainer(_stats, UNPRICED_MODELS_KEY, true);
+  if (!daily[modelKey] || typeof daily[modelKey] !== 'object') daily[modelKey] = {};
+  daily[modelKey][day] = (daily[modelKey][day] || 0) + 1;
+
+  if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
+  if (!_stats[WEEKLY_KEY][weekKey] || typeof _stats[WEEKLY_KEY][weekKey] !== 'object') {
+    _stats[WEEKLY_KEY][weekKey] = {};
+    markWeekRecordedFromEventInstant(_stats[WEEKLY_KEY][weekKey]);
+  }
+  const week = _stats[WEEKLY_KEY][weekKey];
+  if (!week[UNPRICED_MODELS_KEY] || typeof week[UNPRICED_MODELS_KEY] !== 'object') week[UNPRICED_MODELS_KEY] = {};
+  if (!week[UNPRICED_MODELS_KEY][modelKey] || typeof week[UNPRICED_MODELS_KEY][modelKey] !== 'object') {
+    week[UNPRICED_MODELS_KEY][modelKey] = {};
+  }
+  week[UNPRICED_MODELS_KEY][modelKey][day] = (week[UNPRICED_MODELS_KEY][modelKey][day] || 0) + 1;
+}
+
+function recordProviderLimitEvent(project, provider = 'anthropic', model = 'unknown', event = {}, nowFn = defaultNow) {
+  const now = nowFn();
+  if (!isAllowedRecordTime(now, 'limit_event')) return null;
+  if (!canRetainMutationAfterLoadFailure('limit_event')) return null;
+  const day = dayKeyFromDate(now);
+  const weekKey = subscriptionWeekKeyFromDate(now);
+  const currentWeekly = getSubscriptionWeeks(undefined, DEFAULT_WEIGHTS, now).currentWeekToDate;
+  const observed = {
+    at: now.toISOString(),
+    day,
+    weekStart: weekKey,
+    project: project || 'default',
+    provider: provider || 'anthropic',
+    model: model || 'unknown',
+    status: event.status || event.statusCode || null,
+    errorType: event.errorType || event.type || null,
+    weightedConsumptionAtObservation: currentWeekly.weightedTokenEquivalents.total,
+    raw: event.raw || null,
+  };
+  const root = getObservationContainer(_stats, LIMIT_EVENTS_KEY, true);
+  if (!Array.isArray(root[day])) root[day] = [];
+  root[day].push(observed);
+  if (!_stats[WEEKLY_KEY] || typeof _stats[WEEKLY_KEY] !== 'object') _stats[WEEKLY_KEY] = {};
+  if (!_stats[WEEKLY_KEY][weekKey] || typeof _stats[WEEKLY_KEY][weekKey] !== 'object') {
+    _stats[WEEKLY_KEY][weekKey] = {};
+    markWeekRecordedFromEventInstant(_stats[WEEKLY_KEY][weekKey]);
+  }
+  const week = _stats[WEEKLY_KEY][weekKey];
+  if (!Array.isArray(week[LIMIT_EVENTS_KEY])) week[LIMIT_EVENTS_KEY] = [];
+  week[LIMIT_EVENTS_KEY].push(observed);
+  scheduleFlush();
+  return observed;
+}
+
 // Sprint B guardrail writers. Takes an EXPLICIT day string (not todayKey()) so
 // an injected nowFn fully controls the day bucket — no midnight-split risk.
 function ensureGuardrailBucket(project, dayKey) {
@@ -1254,6 +1319,9 @@ function recordAnthropicUsage(project, provider, model, rawUsage = {}, appliedEd
 
   applyMeasuredUsage(bucket, providerKey, modelKey, usage, editStats);
   applyMeasuredUsage(weekBucket, providerKey, modelKey, usage, editStats);
+  if (providerKey === 'anthropic' && !hasExplicitPriceForModel(modelKey)) {
+    recordUnpricedModelObservation(modelKey, day, subscriptionWeekKeyFromDate(now));
+  }
 
   if (hasMeasuredAxis || editStats || observedChanged) scheduleFlush(true, observedChanged ? 0 : 5000);
   if (usage.cacheWrite5m > 0) {
@@ -1422,6 +1490,34 @@ function finalizeAggregate(perProject, weights = DEFAULT_WEIGHTS) {
   };
 }
 
+function unpricedModelsInWindow(cutoffKey) {
+  const source = getObservationContainer(_stats, UNPRICED_MODELS_KEY);
+  const out = {};
+  let total = 0;
+  if (!source) return { models: out, total };
+  for (const [model, days] of Object.entries(source)) {
+    if (!days || typeof days !== 'object') continue;
+    for (const [day, count] of Object.entries(days)) {
+      if (!isValidDailyKey(day) || day < cutoffKey || !Number.isFinite(count)) continue;
+      if (!out[model]) out[model] = {};
+      out[model][day] = count;
+      total += count;
+    }
+  }
+  return { models: out, total };
+}
+
+function limitEventsInWindow(cutoffKey) {
+  const source = getObservationContainer(_stats, LIMIT_EVENTS_KEY);
+  const out = [];
+  if (!source) return out;
+  for (const [day, events] of Object.entries(source)) {
+    if (!isValidDailyKey(day) || day < cutoffKey || !Array.isArray(events)) continue;
+    out.push(...events);
+  }
+  return out;
+}
+
 function aggregatePeriod(periodData, projectFilter, weights = DEFAULT_WEIGHTS) {
   const perProject = {};
   if (periodData && typeof periodData === 'object') {
@@ -1472,13 +1568,21 @@ function getSubscriptionWeeks(projectFilter, weights = DEFAULT_WEIGHTS, now) {
 	      });
 	    const effectiveMeta = meta || persistenceMeta;
     const authoritative = !(effectiveMeta && effectiveMeta.authoritative === false);
+    const aggregate = aggregatePeriod(weekData, projectFilter, weights);
     const out = {
       weekStart,
       complete,
       authoritative,
       degraded: !authoritative,
-      ...aggregatePeriod(weekData, projectFilter, weights),
+      ...aggregate,
     };
+    if (isWeeklyContainer(weekData) && isWeeklyContainer(weekData[UNPRICED_MODELS_KEY])) {
+      out[UNPRICED_MODELS_KEY] = JSON.parse(JSON.stringify(weekData[UNPRICED_MODELS_KEY]));
+      out.degradedReasons = [...new Set([...(out.degradedReasons || []), 'unpriced-models'])];
+    }
+    if (isWeeklyContainer(weekData) && Array.isArray(weekData[LIMIT_EVENTS_KEY])) {
+      out[LIMIT_EVENTS_KEY] = JSON.parse(JSON.stringify(weekData[LIMIT_EVENTS_KEY]));
+    }
     if (effectiveMeta && typeof effectiveMeta.reason === 'string') out.nonAuthoritativeReason = effectiveMeta.reason;
     if (meta && isWeeklyContainer(meta.coverage)) out.coverage = meta.coverage;
     return out;
@@ -1527,6 +1631,72 @@ function weeklyAuthorityRollup(weekly) {
   };
 }
 
+const COVERAGE_NOTE = 'miser-routed traffic only; this is a floor because unrouted Anthropic callers and non-transcript traffic are not counted here.';
+const PACE_ALERTING_REASON = 'deferred by design; run weekly-pace.py for the current transcript-visible-fleet verdict';
+
+function elapsedFractionForWeek(weekStart, now) {
+  const start = new Date(weekStart);
+  const next = new Date(subscriptionWeekKeyFromDate(new Date(start.getTime() + 8 * 24 * 60 * 60 * 1000)));
+  const denom = next.getTime() - start.getTime();
+  if (!Number.isFinite(denom) || denom <= 0) return null;
+  return Math.max(0, Math.min(1, (now.getTime() - start.getTime()) / denom));
+}
+
+function buildPaceBundle(weekly, now) {
+  const current = weekly.currentWeekToDate;
+  const cap = readWeeklyCapsFile(now);
+  const weightedRoutedConsumed = current.weightedTokenEquivalents.total;
+  const degradedReasons = [];
+  if (cap.capSource === 'configured') degradedReasons.push('cap-is-declared');
+  if (cap.capSource === 'estimated') degradedReasons.push('cap-is-estimated');
+  const unpriced = current[UNPRICED_MODELS_KEY] || {};
+  if (Object.keys(unpriced).length > 0) degradedReasons.push('unpriced-models');
+
+  let routedConsumedFrac = null;
+  let routedPaceDelta = null;
+  let reason = null;
+  const elapsedFrac = elapsedFractionForWeek(current.weekStart, now);
+
+  if (cap.capSource === 'absent') {
+    reason = cap.reason || 'cap-absent';
+  } else if (!cap.unitMatches) {
+    reason = cap.mismatchReason || 'unit-mismatch';
+  } else if (current.authoritative === false) {
+    reason = 'numerator-not-authoritative';
+  } else if (Number.isFinite(cap.weeklyCap) && cap.weeklyCap > 0) {
+    routedConsumedFrac = weightedRoutedConsumed / cap.weeklyCap;
+    routedPaceDelta = elapsedFrac == null ? null : routedConsumedFrac - elapsedFrac;
+  } else {
+    reason = 'cap-absent';
+  }
+  if (reason) degradedReasons.push(reason);
+
+  return {
+    scope: 'miser-routed',
+    methodId: MISER_METHOD_ID,
+    weeklyCap: cap.capSource === 'absent' ? null : cap.weeklyCap,
+    capUnit: cap.capUnit || null,
+    capMethodId: cap.capMethodId || null,
+    capSource: cap.capSource,
+    capAsOf: cap.capAsOf || cap.asOf || null,
+    capRange: cap.capRange || null,
+    weightedRoutedConsumed,
+    routedConsumedFrac,
+    elapsedFrac,
+    routedPaceDelta,
+    unavailableReason: reason,
+    numeratorAuthority: {
+      authoritative: current.authoritative !== false,
+      reason: current.nonAuthoritativeReason || null,
+    },
+    coverageNote: COVERAGE_NOTE,
+    degradedReasons: [...new Set(degradedReasons)],
+    limitEvents: Array.isArray(current[LIMIT_EVENTS_KEY]) ? current[LIMIT_EVENTS_KEY] : [],
+    paceAlerting: 'none',
+    paceAlertingReason: PACE_ALERTING_REASON,
+  };
+}
+
 function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   const now = defaultNow();
   const days = parseDays(daysParam, 7);
@@ -1546,6 +1716,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   const authoritative = persistence.healthy && persistence.durable;
   const weekly = getSubscriptionWeeks(projectFilter, weights, now);
   const weeklyRollup = weeklyAuthorityRollup(weekly);
+  const unpricedWindow = unpricedModelsInWindow(cutoffKey);
 
   return {
     ok: authoritative,
@@ -1553,12 +1724,20 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     since: cutoffKey,
     ...aggregate,
     recordRejections: getRecordRejectionStatus(),
+    unpriced_models: unpricedWindow.models,
+    unpricedModelRequestCount: unpricedWindow.total,
+    limitEvents: limitEventsInWindow(cutoffKey),
     durable: persistence.durable,
     degraded: !persistence.healthy,
+    degradedReasons: unpricedWindow.total > 0 ? ['unpriced-models'] : [],
     authoritative,
     persistence,
     ...weeklyRollup,
     weekly,
+    pace: buildPaceBundle(weekly, now),
+    coverageNote: COVERAGE_NOTE,
+    paceAlerting: 'none',
+    paceAlertingReason: PACE_ALERTING_REASON,
   };
 }
 
@@ -1676,6 +1855,7 @@ module.exports = {
   recordAnthropicUsage,
   recordBudgetBlock,
   recordPolicyEvent,
+  recordProviderLimitEvent,
   getStats,
   getDailyTrend,
   loadStats,
@@ -1715,5 +1895,7 @@ module.exports = {
     STATS_META_KEY,
     DAILY_RETENTION_WATERMARK_KEY,
     RECORDING_STARTED_AT_KEY,
+    MISER_METHOD_ID,
+    COVERAGE_NOTE,
   },
 };

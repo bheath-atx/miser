@@ -1,7 +1,9 @@
 'use strict';
 
-// Source snapshot: Anthropic pricing docs, https://docs.anthropic.com/en/docs/about-claude/pricing
-// Pinned 2026-07-22; re-verified unchanged 2026-07-23. Values are USD per million tokens.
+// Source snapshot: Anthropic pricing docs, https://platform.claude.com/docs/en/about-claude/pricing
+// Pinned 2026-07-22; re-verified 2026-07-23 and 2026-08-09. Values are USD per million tokens.
+// Claude Sonnet 5 has time-tiered docs pricing. DEFAULT_PRICING carries the standard
+// 2026-09-01+ rate so this static table does not silently age out after the intro window.
 // Dated API response model IDs (e.g. claude-haiku-4-5-20251001) are aliased to the base ID so
 // priceForModel() never falls through to the * fallback for known models.
 const _HAIKU_4_5 = Object.freeze({
@@ -25,6 +27,27 @@ const DEFAULT_PRICING = Object.freeze({
     cacheReadPerMTok: 0.500000,
     cacheWrite5mPerMTok: 6.250000,
     cacheWrite1hPerMTok: 10.000000,
+  }),
+  'claude-opus-5': Object.freeze({
+    inputPerMTok: 5.000000,
+    outputPerMTok: 25.000000,
+    cacheReadPerMTok: 0.500000,
+    cacheWrite5mPerMTok: 6.250000,
+    cacheWrite1hPerMTok: 10.000000,
+  }),
+  'claude-sonnet-5': Object.freeze({
+    inputPerMTok: 3.000000,
+    outputPerMTok: 15.000000,
+    cacheReadPerMTok: 0.300000,
+    cacheWrite5mPerMTok: 3.750000,
+    cacheWrite1hPerMTok: 6.000000,
+  }),
+  'claude-fable-5': Object.freeze({
+    inputPerMTok: 10.000000,
+    outputPerMTok: 50.000000,
+    cacheReadPerMTok: 1.000000,
+    cacheWrite5mPerMTok: 12.500000,
+    cacheWrite1hPerMTok: 20.000000,
   }),
   'claude-haiku-4-5': _HAIKU_4_5,
   'claude-haiku-4-5-20251001': _HAIKU_4_5,
@@ -104,6 +127,11 @@ function priceForModel(model) {
   return table['*'];
 }
 
+function hasExplicitPriceForModel(model) {
+  const table = getPricingTable();
+  return !!(model && Object.prototype.hasOwnProperty.call(table, model) && model !== '*');
+}
+
 function computeCost(usageTree) {
   let total = 0;
   for (const [provider, models] of Object.entries(usageTree || {})) {
@@ -130,6 +158,7 @@ module.exports = {
   DEFAULT_PRICING,
   getPricingTable,
   priceForModel,
+  hasExplicitPriceForModel,
   computeCost,
   round6,
   __resetForTest,

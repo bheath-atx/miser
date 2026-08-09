@@ -56,7 +56,9 @@ test('rollup baseline excludes today and fires anomaly above two times trailing 
     stats[offsetDay(now, i)] = { alpha: usage('claude-sonnet-4-6', { input: 1_000_000 }) };
   }
   const text = buildRollupText(stats, now);
-  assert.match(text, /alpha: \$9\.00/);
+  assert.match(text, /week to date: 0 weighted tokens across miser-routed traffic/);
+  assert.match(text, /fleet pace: NOT ALERTED/);
+  assert.match(text, /alpha: 3\.00M weighted tokens .* \$9\.00 est/);
   assert.match(text, /alpha 2× baseline/);
 });
 
@@ -104,10 +106,10 @@ test('Sprint B: guardrail fields append to a usage line only when nonzero', () =
   };
   const text = buildRollupText(stats, now);
   // Existing token fields preserved; blocked/drift appended; bloat omitted (zero).
-  assert.match(text, /alpha: \$3\.00 \(1000k input \/ 0k output \/ 0k cacheRead tokens\) blocked:1 drift:3$/m);
+  assert.match(text, /alpha: 1\.00M weighted tokens \(1000k input \/ 0k output \/ 0k cacheRead tokens; \$3\.00 est\) blocked:1 drift:3$/m);
   assert.doesNotMatch(text, /alpha.*bloat:/);
   // Untouched projects keep the exact legacy line shape.
-  assert.match(text, /beta: \$3\.00 \(1000k input \/ 0k output \/ 0k cacheRead tokens\)$/m);
+  assert.match(text, /beta: 1\.00M weighted tokens \(1000k input \/ 0k output \/ 0k cacheRead tokens; \$3\.00 est\)$/m);
 });
 
 test('Sprint B: anomaly marker and guardrail fields coexist in order', () => {
@@ -124,7 +126,7 @@ test('Sprint B: anomaly marker and guardrail fields coexist in order', () => {
     stats[offsetDay(now, i)] = { alpha: usage('claude-sonnet-4-6', { input: 1_000_000 }) };
   }
   const text = buildRollupText(stats, now);
-  assert.match(text, /alpha: \$9\.00 .* ⚠️ alpha 2× baseline bloat:2$/m);
+  assert.match(text, /alpha: 3\.00M weighted tokens .* \$9\.00 est\) ⚠️ alpha 2× baseline bloat:2$/m);
 });
 
 test('Sprint B: guardrail-only project emits a $0.00 line with no token fields', () => {
@@ -150,7 +152,15 @@ test('Sprint B: zeroed guardrail nodes produce no rollup line for usage-less pro
       ghost: { policy: { modelDriftCount: 0, contextBloatCount: 0 } },
     },
   };
-  assert.equal(buildRollupText(stats, now), '');
+  assert.match(buildRollupText(stats, now), /fleet pace: NOT ALERTED/);
+});
+
+test('Fact B: rollup renders a scoped miser-routed cap fraction only when supplied', () => {
+  const text = buildRollupText({}, new Date('2026-07-23T00:00:30Z'), {
+    pace: { weightedRoutedConsumed: 250, routedConsumedFrac: 0.25 },
+  });
+  assert.match(text, /miser-routed 25\.0% of cap/);
+  assert.doesNotMatch(text, /(^|[^-])% weekly/);
 });
 
 test('emitDailyRollup no-env no-ops and HTTP failure does not throw', async () => {
@@ -212,6 +222,32 @@ test('emitDailyRollup writes dedup marker after successful post and skips same U
     assert.equal(second.reason, 'dedup');
     assert.equal(calls.length, 1);
     assert.equal(fs.readFileSync(dedupFile, 'utf8'), '2026-07-23');
+  } finally {
+    restoreEnv(prev);
+    try { fs.unlinkSync(dedupFile); } catch (_) {}
+    try { fs.unlinkSync(tokenFile); } catch (_) {}
+  }
+});
+
+test('Fact B: unpriced-model rollup tick sends fleet-scoped alert', async () => {
+  const prev = { endpoint: process.env.MISER_PKACHU_ENDPOINT, token: process.env.MISER_PKACHU_TOKEN };
+  const dedupFile = tmpFile('dedup-unpriced');
+  const tokenFile = tmpFile('token-unpriced');
+  const alerts = [];
+  try {
+    fs.writeFileSync(tokenFile, 'tok', 'utf8');
+    process.env.MISER_PKACHU_ENDPOINT = 'http://127.0.0.1:1/hook';
+    process.env.MISER_PKACHU_TOKEN = tokenFile;
+    const result = await emitDailyRollup({}, async () => {}, {
+      now: new Date('2026-07-23T00:00:30Z'),
+      dedupFile,
+      pace: { degradedReasons: ['unpriced-models'], weightedRoutedConsumed: 0 },
+      sendAlert: (text, opts) => alerts.push({ text, opts }),
+    });
+    assert.equal(result.emitted, true);
+    assert.equal(alerts.length, 1);
+    assert.equal(alerts[0].opts.scope, 'fleet');
+    assert.equal(alerts[0].opts.kind, 'unpriced-models');
   } finally {
     restoreEnv(prev);
     try { fs.unlinkSync(dedupFile); } catch (_) {}

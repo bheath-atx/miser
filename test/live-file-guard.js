@@ -110,6 +110,7 @@ const homeDefaults = new Map([
   ['MISER_PANEL_STATS_FILE', path.join(home, '.miser-panel-stats.json')],
   ['MISER_ALERT_LEDGER_FILE', path.join(home, '.miser-alert-ledger.json')],
   ['MISER_ROLLUP_DEDUP_FILE', path.join(home, '.miser-rollup-last.txt')],
+  ['MISER_WEEKLY_CAPS_FILE', path.join(home, '.claude', 'weekly-caps.json')],
   ['CODEX_AUTH_PATH', path.join(home, '.codex', 'auth.json')],
 ]);
 
@@ -118,6 +119,7 @@ const isolatedDefaults = {
   MISER_PANEL_STATS_FILE: path.join(tmpRoot, 'miser-panel-stats.json'),
   MISER_ALERT_LEDGER_FILE: path.join(tmpRoot, 'miser-alert-ledger.json'),
   MISER_ROLLUP_DEDUP_FILE: path.join(tmpRoot, 'miser-rollup-last.txt'),
+  MISER_WEEKLY_CAPS_FILE: path.join(tmpRoot, 'weekly-caps.json'),
   CODEX_AUTH_PATH: path.join(tmpRoot, 'codex-auth.json'),
 };
 
@@ -244,7 +246,7 @@ patchPromiseFs();
 const originalHomedir = os.homedir;
 os.homedir = function guardedHomedir() {
   const stack = new Error().stack || '';
-  if (/src[\/\\](stats|panel-stats|alert-ledger|daily-rollup|oauth)\.js/.test(stack)) {
+  if (/src[\/\\](stats|panel-stats|alert-ledger|daily-rollup|oauth|weekly-caps)\.js/.test(stack)) {
     throw new Error('[miser-live-file-guard] blocked HOME default resolution from protected miser module');
   }
   return originalHomedir.call(this);

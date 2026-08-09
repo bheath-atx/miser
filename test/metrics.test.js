@@ -137,6 +137,25 @@ test('R8: authority and rejection gauges expose concrete stats authority state',
   assert.ok(text.includes('miser_record_rejections_by_label{label="usage"} 3'));
 });
 
+test('Fact B: metrics expose unpriced and routed-scope pace gauges without verdicts', () => {
+  const text = buildMetricsText({
+    usage: {},
+    unpriced_models: { 'claude-test-unknown': { '2026-08-09': 2 } },
+    limitEvents: [{ status: 429 }],
+    pace: {
+      weightedRoutedConsumed: 250,
+      routedConsumedFrac: 0.25,
+      routedPaceDelta: -0.1,
+    },
+  });
+  assert.match(text, /miser_unpriced_requests_7d\{model="claude-test-unknown"\} 2/);
+  assert.match(text, /# HELP miser_routed_consumed_frac Miser-routed fraction of weekly cap; floor scope only/);
+  assert.match(text, /miser_routed_consumed_frac 0\.25/);
+  assert.match(text, /miser_routed_pace_delta -0\.1/);
+  assert.match(text, /miser_limit_events_7d 1/);
+  assert.doesNotMatch(text, /UNDER-PACE|OVER-PACE|NEAR-CAP|ON-PACE/);
+});
+
 // ---- AC3: Prometheus compliance (comprehensive) -----------------------------
 
 test('AC3: Prometheus compliance — label escaping, format, and trailing newline', () => {
