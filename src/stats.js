@@ -1642,13 +1642,72 @@ function elapsedFractionForWeek(weekStart, now) {
   return Math.max(0, Math.min(1, (now.getTime() - start.getTime()) / denom));
 }
 
+function findWeeklyAnchor(weekly, anchorWeekStart) {
+  if (!weekly || !anchorWeekStart) return null;
+  const weeks = [
+    weekly.currentWeekToDate,
+    ...((Array.isArray(weekly.priorCompleteWeeks)) ? weekly.priorCompleteWeeks : []),
+  ].filter(Boolean);
+  return weeks.find(week => week.weekStart === anchorWeekStart) || null;
+}
+
+function estimateRangeFromAnchor(anchorNumerator, observedRange) {
+  if (!observedRange || typeof observedRange !== 'object') return null;
+  const low = Number(observedRange.low);
+  const high = Number(observedRange.high);
+  if (!Number.isFinite(low) || !Number.isFinite(high) || low <= 0 || high <= 0) return null;
+  const minFraction = Math.min(low, high);
+  const maxFraction = Math.max(low, high);
+  return {
+    low: anchorNumerator / maxFraction,
+    high: anchorNumerator / minFraction,
+  };
+}
+
+function resolveEstimatedCap(cap, weekly) {
+  if (!cap || cap.capSource !== 'estimated') return cap;
+  const calibration = cap.calibration || {};
+  const anchor = findWeeklyAnchor(weekly, calibration.anchorWeekStart);
+  if (!anchor) return { ...cap, capSource: 'absent', reason: 'anchor-week-unrecorded' };
+  if (anchor.authoritative === false) return { ...cap, capSource: 'absent', reason: 'anchor-week-not-authoritative' };
+
+  const anchorNumerator = anchor.weightedTokenEquivalents && anchor.weightedTokenEquivalents.total;
+  if (!Number.isFinite(anchorNumerator) || anchorNumerator <= 0) {
+    return { ...cap, capSource: 'absent', reason: 'anchor-week-unrecorded' };
+  }
+  const weeklyCap = anchorNumerator / calibration.observedFraction;
+  const capRange = estimateRangeFromAnchor(anchorNumerator, calibration.range);
+  const estimateNotes = [...(Array.isArray(cap.estimateNotes) ? cap.estimateNotes : [])];
+  const currentStartMs = new Date(weekly.currentWeekStart).getTime();
+  const anchorStartMs = new Date(calibration.anchorWeekStart).getTime();
+  const ageWeeks = Math.floor((currentStartMs - anchorStartMs) / (7 * 24 * 60 * 60 * 1000));
+  if (Number.isFinite(ageWeeks)
+    && Number.isFinite(calibration.stalenessWeeks)
+    && ageWeeks > calibration.stalenessWeeks) {
+    estimateNotes.push(`STALE ESTIMATE (${ageWeeks} weeks old)`);
+  }
+  return {
+    ...cap,
+    weeklyCap,
+    capRange,
+    estimateNotes,
+    anchorWeekStart: calibration.anchorWeekStart,
+    observedFraction: calibration.observedFraction,
+  };
+}
+
 function buildPaceBundle(weekly, now) {
   const current = weekly.currentWeekToDate;
-  const cap = readWeeklyCapsFile(now);
+  const cap = resolveEstimatedCap(readWeeklyCapsFile(now), weekly);
   const weightedRoutedConsumed = current.weightedTokenEquivalents.total;
   const degradedReasons = [];
   if (cap.capSource === 'configured') degradedReasons.push('cap-is-declared');
   if (cap.capSource === 'estimated') degradedReasons.push('cap-is-estimated');
+  if (Array.isArray(cap.estimateNotes)) {
+    for (const note of cap.estimateNotes) {
+      if (typeof note === 'string' && note.includes('STALE ESTIMATE')) degradedReasons.push(note);
+    }
+  }
   const unpriced = current[UNPRICED_MODELS_KEY] || {};
   if (Object.keys(unpriced).length > 0) degradedReasons.push('unpriced-models');
 
@@ -1670,16 +1729,23 @@ function buildPaceBundle(weekly, now) {
     reason = 'cap-absent';
   }
   if (reason) degradedReasons.push(reason);
+  const includeDenominator = cap.capSource !== 'absent'
+    && cap.unitMatches !== false
+    && Number.isFinite(cap.weeklyCap)
+    && cap.weeklyCap > 0;
 
   return {
     scope: 'miser-routed',
     methodId: MISER_METHOD_ID,
-    weeklyCap: cap.capSource === 'absent' ? null : cap.weeklyCap,
-    capUnit: cap.capUnit || null,
-    capMethodId: cap.capMethodId || null,
+    weeklyCap: includeDenominator ? cap.weeklyCap : null,
+    capUnit: includeDenominator ? (cap.capUnit || null) : null,
+    capMethodId: includeDenominator ? (cap.capMethodId || null) : null,
     capSource: cap.capSource,
     capAsOf: cap.capAsOf || cap.asOf || null,
-    capRange: cap.capRange || null,
+    capRange: includeDenominator ? (cap.capRange || null) : null,
+    estimateNotes: cap.capSource === 'estimated' ? (cap.estimateNotes || []) : [],
+    anchorWeekStart: includeDenominator && cap.capSource === 'estimated' ? (cap.anchorWeekStart || null) : null,
+    observedFraction: includeDenominator && cap.capSource === 'estimated' ? (cap.observedFraction || null) : null,
     weightedRoutedConsumed,
     routedConsumedFrac,
     elapsedFrac,

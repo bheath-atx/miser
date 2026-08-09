@@ -87,20 +87,29 @@ function configuredCap(doc, now) {
 function calibrationCap(doc, now) {
   const cal = doc && doc.calibration;
   if (!cal || typeof cal !== 'object') return null;
-  if (!Number.isFinite(cal.cap_est) || cal.cap_est <= 0) return null;
+  const observedFraction = Number(cal.observed_fraction);
+  const anchorWeekStart = typeof cal.anchor_week_start === 'string' ? cal.anchor_week_start : '';
+  if (!Number.isFinite(observedFraction) || observedFraction <= 0) return null;
+  if (!anchorWeekStart) return null;
   const range = cal.range && typeof cal.range === 'object'
-    ? { low: cal.range.low, high: cal.range.high }
+    ? { low: Number(cal.range.low), high: Number(cal.range.high) }
     : null;
+  const stalenessWeeks = Number.isFinite(cal.staleness_weeks) && cal.staleness_weeks >= 0
+    ? cal.staleness_weeks
+    : 8;
   return {
     capSource: 'estimated',
-    weeklyCap: cal.cap_est,
     capUnit: unitForMethod(MISER_METHOD_ID),
     capMethodId: MISER_METHOD_ID,
     capAsOf: now.toISOString(),
-    capRange: range,
+    calibration: {
+      anchorWeekStart,
+      observedFraction,
+      range,
+      stalenessWeeks,
+    },
     estimate: true,
     unitMatches: true,
-    raw: { calibration: cal },
     estimateNotes: ['mix drift: not evaluated'],
   };
 }

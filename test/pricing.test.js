@@ -60,11 +60,11 @@ test('Anthropic pricing table pins sonnet, opus, haiku, opus-5, sonnet-5, and fa
       cacheWrite1hPerMTok: 10,
     });
     assert.deepEqual(table['claude-sonnet-5'], {
-      inputPerMTok: 3,
-      outputPerMTok: 15,
-      cacheReadPerMTok: 0.3,
-      cacheWrite5mPerMTok: 3.75,
-      cacheWrite1hPerMTok: 6,
+      inputPerMTok: 2,
+      outputPerMTok: 10,
+      cacheReadPerMTok: 0.2,
+      cacheWrite5mPerMTok: 2.5,
+      cacheWrite1hPerMTok: 4,
     });
     assert.deepEqual(table['claude-fable-5'], {
       inputPerMTok: 10,
@@ -76,6 +76,13 @@ test('Anthropic pricing table pins sonnet, opus, haiku, opus-5, sonnet-5, and fa
   } finally {
     restoreEnv(prev);
   }
+});
+
+test('Sonnet 5 default pricing documents the 2026-09-01 rollover', () => {
+  const fs = require('node:fs');
+  const text = fs.readFileSync(require.resolve('../src/pricing.js'), 'utf8');
+  assert.match(text, /through 2026-08-31/);
+  assert.match(text, /2026-09-01\+ standard rate/);
 });
 
 test('unknown model uses fallback pricing and returns 6dp number', () => {
