@@ -8,7 +8,7 @@ const { translateToResponses, validateResponsesRequest, translateResponsesStream
 const { hardCapOllamaBody } = require('./hardcap.js');
 const { getCodexBearer } = require('./oauth.js');
 const { recordUsage } = require('./quota.js');
-const { recordAnthropicUsage } = require('./stats.js');
+const { recordAnthropicUsage, recordProviderLimitEvent } = require('./stats.js');
 const { recordPanelUsage } = require('./panel-stats.js');
 const { AnthropicUsageParser } = require('./usage.js');
 const { createBreaker } = require('./circuit-breaker.js');
@@ -120,6 +120,18 @@ function _maybeAlertSubCap(guardDeps, nowMs) {
       `⚠️ miser sub-cap: ${pctMsg}${events429Msg} — deferBackground=true`,
       { scope: 'fleet', kind: 'sub-cap' }))
     .catch(() => {});
+}
+
+function limitEventCapText(observed) {
+  if (!observed) return 'cap=unknown';
+  if (Number.isFinite(observed.weeklyCapAtObservation)) {
+    const range = observed.capRangeAtObservation;
+    const rangeText = range && Number.isFinite(range.low) && Number.isFinite(range.high)
+      ? ` range=${Math.round(range.low)}-${Math.round(range.high)}`
+      : '';
+    return `cap=${Math.round(observed.weeklyCapAtObservation)} weighted routed tokens source=${observed.capSourceAtObservation || 'unknown'}${rangeText}`;
+  }
+  return `cap=unavailable(${observed.capUnavailableReasonAtObservation || observed.capSourceAtObservation || 'unknown'})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,10 +397,32 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
     const anthTransport = anthURL.protocol === 'https:' ? https : http;
     const req = anthTransport.request(options, (upstream) => {
       if (upstream.statusCode === 429) {
-        const err = new Error('anthropic quota exhausted');
-        err.statusCode = 429;
-        upstream.resume();
-        reject(err);
+        const chunks = [];
+        upstream.on('data', chunk => chunks.push(chunk));
+        upstream.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          let errorType = null;
+          try {
+            const parsed = JSON.parse(raw);
+            errorType = parsed && parsed.error && parsed.error.type;
+          } catch (_) {}
+          const observed = recordProviderLimitEvent(project, 'anthropic', originalBody.model || 'unknown', {
+            status: upstream.statusCode,
+            errorType,
+            raw: raw || null,
+          });
+          if (guardDeps && guardDeps.sendAlert) {
+            Promise.resolve()
+              .then(() => guardDeps.sendAlert(
+                `miser provider limit event: anthropic ${upstream.statusCode} model=${originalBody.model || 'unknown'} project=${project || 'default'} consumed=${observed ? observed.weightedConsumptionAtObservation : 'unknown'} weighted routed tokens ${limitEventCapText(observed)}`,
+                { scope: 'fleet', kind: 'limit-event' }))
+              .catch(() => {});
+          }
+          const err = new Error('anthropic quota exhausted');
+          err.statusCode = 429;
+          reject(err);
+        });
+        upstream.on('error', reject);
         return;
       }
       // §2.3A (M3 visual inspection): 529/5xx intercepted BEFORE proxyAnthropicResponse.

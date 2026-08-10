@@ -171,6 +171,38 @@ function buildMetricsText(statsResult) {
     }
   }
 
+  const unpriced = (statsResult && statsResult.unpriced_models) || {};
+  lines.push('# HELP miser_unpriced_requests_7d Fallback-priced Anthropic request count in the last 7 days, by model.');
+  lines.push('# TYPE miser_unpriced_requests_7d gauge');
+  for (const [model, days] of Object.entries(unpriced)) {
+    if (!days || typeof days !== 'object') continue;
+    const total = Object.values(days).reduce((sum, n) => sum + (Number.isFinite(n) ? n : 0), 0);
+    if (total > 0) lines.push(`miser_unpriced_requests_7d{model="${labelEscape(model)}"} ${total}`);
+  }
+
+  const pace = statsResult && statsResult.pace;
+  lines.push('# HELP miser_routed_weighted_tokens_week_to_date Weighted token equivalents for miser-routed Anthropic traffic only; this is a floor because unrouted panels are not counted.');
+  lines.push('# TYPE miser_routed_weighted_tokens_week_to_date gauge');
+  if (pace && Number.isFinite(pace.weightedRoutedConsumed)) {
+    lines.push(`miser_routed_weighted_tokens_week_to_date ${pace.weightedRoutedConsumed}`);
+  }
+  const estimatedCap = pace && pace.capSource === 'estimated';
+  lines.push('# HELP miser_routed_consumed_frac Miser-routed fraction of configured weekly cap; estimated denominators are omitted because Prometheus cannot render the required range marker.');
+  lines.push('# TYPE miser_routed_consumed_frac gauge');
+  if (!estimatedCap && pace && Number.isFinite(pace.routedConsumedFrac)) {
+    lines.push(`miser_routed_consumed_frac ${pace.routedConsumedFrac}`);
+  }
+  lines.push('# HELP miser_routed_pace_delta Miser-routed configured-cap consumed fraction minus elapsed week fraction; estimated denominators are omitted because Prometheus cannot render the required range marker.');
+  lines.push('# TYPE miser_routed_pace_delta gauge');
+  if (!estimatedCap && pace && Number.isFinite(pace.routedPaceDelta)) {
+    lines.push(`miser_routed_pace_delta ${pace.routedPaceDelta}`);
+  }
+  lines.push('# HELP miser_limit_events_7d Provider usage-limit events observed by miser in the last 7 days.');
+  lines.push('# TYPE miser_limit_events_7d gauge');
+  if (Array.isArray(statsResult && statsResult.limitEvents)) {
+    lines.push(`miser_limit_events_7d ${statsResult.limitEvents.length}`);
+  }
+
   return lines.join('\n') + '\n';
 }
 

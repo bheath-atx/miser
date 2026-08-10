@@ -25,7 +25,7 @@ function runGuarded(script) {
 // Driven off the guard's own list rather than a copy of it: a hardcoded list
 // here is what let MISER_PANEL_STATS_FILE ship unguarded.
 test('live file guard isolates every HOME-backed default through env', () => {
-  assert.ok(guard.homeDefaults.size >= 5, 'guard must cover at least the five known HOME defaults');
+  assert.ok(guard.homeDefaults.size >= 6, 'guard must cover at least the six known HOME defaults');
   for (const envName of guard.homeDefaults.keys()) {
     assert.ok(process.env[envName], `${envName} should be set by the test guard`);
     assert.doesNotThrow(() => guard.assertSafeResolvedPath(envName, process.env[envName]));
@@ -67,6 +67,7 @@ test('protected modules cannot resolve HOME defaults when their env is unset', (
     ['MISER_PANEL_STATS_FILE', "require('./src/panel-stats.js')"],
     ['MISER_ALERT_LEDGER_FILE', "require('./src/alert-ledger.js').createLedger()"],
     ['MISER_ROLLUP_DEDUP_FILE', "require('./src/daily-rollup.js')"],
+    ['MISER_WEEKLY_CAPS_FILE', "require('./src/weekly-caps.js')"],
     ['CODEX_AUTH_PATH', "require('./src/oauth.js')"],
   ];
   for (const [envName, body] of cases) {

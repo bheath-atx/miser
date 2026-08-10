@@ -1,0 +1,42 @@
+✖ Anthropic pricing table pins sonnet, opus, haiku, opus-5, sonnet-5, and fable-5 all five axes (4.553718ms)
+✔ Sonnet 5 default pricing documents the 2026-09-01 rollover (0.578592ms)
+✔ unknown model uses fallback pricing and returns 6dp number (0.840694ms)
+✔ MISER_PRICING_JSON partial override merges over defaults (0.60249ms)
+✔ malformed MISER_PRICING_JSON falls back to defaults without throwing (4.380846ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 4
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 110.116717
+
+✖ failing tests:
+
+test at test/pricing.test.js:21:1
+✖ Anthropic pricing table pins sonnet, opus, haiku, opus-5, sonnet-5, and fable-5 all five axes (4.553718ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+      cacheReadPerMTok: 0.2,
+      cacheWrite1hPerMTok: 4,
+      cacheWrite5mPerMTok: 2.5,
+  +   inputPerMTok: 3,
+  -   inputPerMTok: 2,
+      outputPerMTok: 10
+    }
+  
+      at TestContext.<anonymous> (/home/nacho/miser-factb-build/test/pricing.test.js:62:12)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1382:25)
+      at Test.start (node:internal/test_runner/test:1242:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { inputPerMTok: 3, outputPerMTok: 10, cacheReadPerMTok: 0.2, cacheWrite5mPerMTok: 2.5, cacheWrite1hPerMTok: 4 },
+    expected: { inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.2, cacheWrite5mPerMTok: 2.5, cacheWrite1hPerMTok: 4 },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

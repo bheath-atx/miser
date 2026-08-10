@@ -1,0 +1,39 @@
+✔ Fact B: configured cap_source is derived and weekly routed fraction is scoped (54.95574ms)
+✔ Fact B: method mismatch refuses to divide and keeps numerator (9.589887ms)
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+✖ Fact B: estimated cap derives from authoritative anchor week and observed fraction (13.801682ms)
+✔ Fact B: estimated cap refuses missing anchor week (5.138398ms)
+✔ Fact B: estimated cap refuses non-authoritative anchor week (6.065646ms)
+✔ Fact B: unknown model counter records once on response path and reads are idempotent (12.769363ms)
+✔ Fact B: provider limit event records and alerts without cap (27.972676ms)
+✔ Fact B: source does not reintroduce a second cap source or pace verdict (3.025918ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 7
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 231.450138
+
+✖ failing tests:
+
+test at test/factb-consumption.test.js:118:1
+✖ Fact B: estimated cap derives from authoritative anchor week and observed fraction (13.801682ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  50 !== 800
+  
+      at TestContext.<anonymous> (/home/nacho/miser-factb-build/test/factb-consumption.test.js:135:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 50,
+    expected: 800,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

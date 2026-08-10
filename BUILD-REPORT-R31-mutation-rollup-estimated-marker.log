@@ -1,0 +1,49 @@
+[miser/rollup] WARN daily rollup skipped: MISER_PKACHU_TOKEN or MISER_PKACHU_ENDPOINT not set
+✔ rollup baseline excludes today and fires anomaly above two times trailing average (4.697007ms)
+✔ rollup suppresses anomaly with fewer than three history days (0.441278ms)
+✔ rollup sparse missing days count as zero in the seven-day denominator (0.365449ms)
+✔ Sprint B: guardrail fields append to a usage line only when nonzero (12.958615ms)
+✔ Sprint B: anomaly marker and guardrail fields coexist in order (0.499356ms)
+✔ Sprint B: guardrail-only project emits a $0.00 line with no token fields (0.463784ms)
+✔ Sprint B: zeroed guardrail nodes produce no rollup line for usage-less projects (0.242223ms)
+✔ Fact B: rollup renders a scoped miser-routed cap fraction only when supplied (0.36494ms)
+✖ Fact B: rollup marks estimated cap fractions and renders the range (1.346154ms)
+✔ Fact B: rollup withholds estimated cap fraction when range is absent (0.383847ms)
+[miser/rollup] WARN daily rollup skipped: boom
+✔ emitDailyRollup no-env no-ops and HTTP failure does not throw (16.060647ms)
+✔ emitDailyRollup writes dedup marker after successful post and skips same UTC date (2.224364ms)
+✔ Fact B: unpriced-model rollup tick sends fleet-scoped alert (1.754596ms)
+✔ emitDailyRollup default dedup marker is isolated by MISER_ROLLUP_DEDUP_FILE (2.360315ms)
+✔ rollup interval window is the first two UTC minutes after midnight (0.263378ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 14
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 148.267333
+
+✖ failing tests:
+
+test at test/rollup.test.js:166:1
+✖ Fact B: rollup marks estimated cap fractions and renders the range (1.346154ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /miser-routed estimated 12\.5% of cap \(range 10\.0%-20\.0%\)/. Input:
+  
+  'week to date: 100 weighted tokens across miser-routed traffic (a floor - unrouted panels not counted); transcript-visible fleet % of cap: see weekly-pace.py; miser-routed 12.5% of cap (range 10.0%-20.0%)\n' +
+    'fleet pace: NOT ALERTED (deferred by design — see PROPOSAL-FACTB §4.3.7); run weekly-pace.py for the current transcript-visible-fleet verdict'
+  
+      at TestContext.<anonymous> (/home/nacho/miser-factb-build/test/rollup.test.js:175:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1382:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:960:18)
+      at Test.postRun (node:internal/test_runner/test:1522:19)
+      at Test.run (node:internal/test_runner/test:1447:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'week to date: 100 weighted tokens across miser-routed traffic (a floor - unrouted panels not counted); transcript-visible fleet % of cap: see weekly-pace.py; miser-routed 12.5% of cap (range 10.0%-20.0%)\nfleet pace: NOT ALERTED (deferred by design — see PROPOSAL-FACTB §4.3.7); run weekly-pace.py for the current transcript-visible-fleet verdict',
+    expected: /miser-routed estimated 12\.5% of cap \(range 10\.0%-20\.0%\)/,
+    operator: 'match',
+    diff: 'simple'
+  }

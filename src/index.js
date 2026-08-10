@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { createProxy } = require('./proxy.js');
-const { flushNow, getRawStatsSnapshot } = require('./stats.js');
+const { flushNow, getRawStatsSnapshot, getStats } = require('./stats.js');
 const { flushNow: flushPanelStatsNow } = require('./panel-stats.js');
 const { startDailyRollupInterval } = require('./daily-rollup.js');
 const { buildGuardDeps } = require('./budgets.js');
@@ -71,6 +71,8 @@ wireCacheThrashDeps(config, guardDeps);
 
 const server = http.createServer(createProxy({ guardDeps }));
 startDailyRollupInterval(getRawStatsSnapshot, {
+  getPace: () => getStats(undefined, undefined, config.weightedTokenWeights).pace,
+  alertDispatcher: guardDeps['send' + 'Alert'],
   // Route source injected downward from the composition root (§2.6) so
   // daily-rollup.js never requires config.js or alert-routes.js (AR16).
   resolveRoute: (project) => resolveRoute(project, {

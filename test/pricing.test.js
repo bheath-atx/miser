@@ -18,7 +18,7 @@ function restoreEnv(prev) {
   else process.env.MISER_PRICING_JSON = prev;
 }
 
-test('Anthropic pricing table pins sonnet, opus, and haiku all five axes', () => {
+test('Anthropic pricing table pins sonnet, opus, haiku, opus-5, sonnet-5, and fable-5 all five axes', () => {
   const prev = process.env.MISER_PRICING_JSON;
   try {
     const { getPricingTable } = freshPricing(undefined);
@@ -52,9 +52,37 @@ test('Anthropic pricing table pins sonnet, opus, and haiku all five axes', () =>
       cacheWrite5mPerMTok: 1.25,
       cacheWrite1hPerMTok: 2,
     });
+    assert.deepEqual(table['claude-opus-5'], {
+      inputPerMTok: 5,
+      outputPerMTok: 25,
+      cacheReadPerMTok: 0.5,
+      cacheWrite5mPerMTok: 6.25,
+      cacheWrite1hPerMTok: 10,
+    });
+    assert.deepEqual(table['claude-sonnet-5'], {
+      inputPerMTok: 2,
+      outputPerMTok: 10,
+      cacheReadPerMTok: 0.2,
+      cacheWrite5mPerMTok: 2.5,
+      cacheWrite1hPerMTok: 4,
+    });
+    assert.deepEqual(table['claude-fable-5'], {
+      inputPerMTok: 10,
+      outputPerMTok: 50,
+      cacheReadPerMTok: 1,
+      cacheWrite5mPerMTok: 12.5,
+      cacheWrite1hPerMTok: 20,
+    });
   } finally {
     restoreEnv(prev);
   }
+});
+
+test('Sonnet 5 default pricing documents the 2026-09-01 rollover', () => {
+  const fs = require('node:fs');
+  const text = fs.readFileSync(require.resolve('../src/pricing.js'), 'utf8');
+  assert.match(text, /through 2026-08-31/);
+  assert.match(text, /2026-09-01\+ standard rate/);
 });
 
 test('unknown model uses fallback pricing and returns 6dp number', () => {

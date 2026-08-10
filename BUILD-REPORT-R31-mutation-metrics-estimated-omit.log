@@ -1,0 +1,105 @@
+[miser/pricing] WARN unknown Anthropic model model-with-"quote; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model-with-\slash; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model-with-
+newline; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model1; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model1; using fallback pricing
+✔ AC9: labelEscape — double-quote (1.73494ms)
+✔ AC9: labelEscape — backslash (0.231493ms)
+✔ AC9: labelEscape — newline (0.221565ms)
+✔ AC9: labelEscape — clean string is a no-op (0.220312ms)
+✔ AC2: HELP and TYPE headers present for all three metric families (1.360974ms)
+✔ R8: authority and rejection gauges expose concrete stats authority state (12.915295ms)
+✔ Fact B: metrics expose unpriced and routed-scope pace gauges without verdicts (0.608636ms)
+✖ Fact B: metrics omit estimated cap percentage gauges because range cannot render (1.548197ms)
+✔ AC3: Prometheus compliance — label escaping, format, and trailing newline (1.795527ms)
+✔ AC3b: cost value matches computeCost(statsResult.usage[project]) (0.505861ms)
+✔ AC4: type label values are exactly from the allowed vocabulary (0.450919ms)
+✔ AC5: lines with value 0 are not emitted (sparse) (0.423944ms)
+✔ AC6: miser_requests_7d lines appear for buckets with requests > 0 (0.224147ms)
+✔ AC7: empty stats produces only HELP/TYPE headers, ends with newline (0.246005ms)
+✔ AC7: null/undefined stats produces only headers (0.227489ms)
+✔ AC1: GET /api/miser/metrics returns 200 with correct content-type (18.481194ms)
+✔ AC8: GET /api/miser/stats still returns JSON (no regression) (3.324167ms)
+✔ routing: classifyRoute GET /api/miser/metrics → metrics kind (1.061616ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 17
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 186.6944
+
+✖ failing tests:
+
+test at test/metrics.test.js:159:1
+✖ Fact B: metrics omit estimated cap percentage gauges because range cannot render (1.548197ms)
+  AssertionError [ERR_ASSERTION]: The input was expected to not match the regular expression /^miser_routed_consumed_frac /m. Input:
+  
+  '# HELP miser_tokens_7d Token usage in the last 7 days (rolling window), by project/provider/model/type.\n' +
+    '# TYPE miser_tokens_7d gauge\n' +
+    '# HELP miser_requests_7d Request count in the last 7 days (rolling window), by project/provider/model.\n' +
+    '# TYPE miser_requests_7d gauge\n' +
+    '# HELP miser_cost_usd_7d Estimated cost in USD in the last 7 days (rolling window), by project.\n' +
+    '# TYPE miser_cost_usd_7d gauge\n' +
+    '# HELP miser_authoritative Stats rolling-window aggregate authority state (1 authoritative, 0 non-authoritative).\n' +
+    '# TYPE miser_authoritative gauge\n' +
+    '# HELP miser_degraded Stats persistence degradation state (1 degraded, 0 healthy).\n' +
+    '# TYPE miser_degraded gauge\n' +
+    '# HELP miser_persistence_healthy Stats persistence health state (1 healthy, 0 unhealthy).\n' +
+    '# TYPE miser_persistence_healthy gauge\n' +
+    '# HELP miser_persistence_durable Stats persistence durability state (1 durable, 0 pending or degraded).\n' +
+    '# TYPE miser_persistence_durable gauge\n' +
+    '# HELP miser_persistence_pending Stats persistence pending-write state (1 pending, 0 not pending).\n' +
+    '# TYPE miser_persistence_pending gauge\n' +
+    '# HELP miser_persistence_dirty Stats persistence dirty state (1 has unwritten changes, 0 clean).\n' +
+    '# TYPE miser_persistence_dirty gauge\n' +
+    '# HELP miser_persistence_in_flight Stats persistence write-in-flight state (1 writing, 0 idle).\n' +
+    '# TYPE miser_persistence_in_flight gauge\n' +
+    '# HELP miser_persistence_last_flush_errored Stats persistence last-flush error state (1 errored, 0 clean).\n' +
+    '# TYPE miser_persistence_last_flush_errored gauge\n' +
+    '# HELP miser_persistence_last_load_errored Stats persistence last-load error state (1 errored, 0 clean).\n' +
+    '# TYPE miser_persistence_last_load_errored gauge\n' +
+    '# HELP miser_persistence_write_failures Consecutive stats persistence write failure count.\n' +
+    '# TYPE miser_persistence_write_failures gauge\n' +
+    '# HELP miser_persistence_last_error Stats persistence last error code presence.\n' +
+    '# TYPE miser_persistence_last_error gauge\n' +
+    '# HELP miser_weekly_authoritative Stats weekly payload authority state (1 all exposed weeks authoritative, 0 some weeks non-authoritative).\n' +
+    '# TYPE miser_weekly_authoritative gauge\n' +
+    '# HELP miser_non_authoritative_weeks Non-authoritative week count in the stats payload.\n' +
+    '# TYPE miser_non_authoritative_weeks gauge\n' +
+    '# HELP miser_non_authoritative_week_reasons Non-authoritative week reason presence in the stats payload.\n' +
+    '# TYPE miser_non_authoritative_week_reasons gauge\n' +
+    '# HELP miser_record_rejections Rejected or dropped stats record count, by reason.\n' +
+    '# TYPE miser_record_rejections gauge\n' +
+    '# HELP miser_record_rejections_by_label Rejected or dropped stats record count, by stats label.\n' +
+    '# TYPE miser_record_rejections_by_label gauge\n' +
+    '# HELP miser_unpriced_requests_7d Fallback-priced Anthropic request count in the last 7 days, by model.\n' +
+    '# TYPE miser_unpriced_requests_7d gauge\n' +
+    '# HELP miser_routed_weighted_tokens_week_to_date Weighted token equivalents for miser-routed Anthropic traffic only; this is a floor because unrouted panels are not counted.\n' +
+    '# TYPE miser_routed_weighted_tokens_week_to_date gauge\n' +
+    'miser_routed_weighted_tokens_week_to_date 250\n' +
+    '# HELP miser_routed_consumed_frac Miser-routed fraction of configured weekly cap; estimated denominators are omitted because Prometheus cannot render the required range marker.\n' +
+    '# TYPE miser_routed_consumed_frac gauge\n' +
+    'miser_routed_consumed_frac 0.25\n' +
+    '# HELP miser_routed_pace_delta Miser-routed configured-cap consumed fraction minus elapsed week fraction; estimated denominators are omitted because Prometheus cannot render the required range marker.\n' +
+    '# TYPE miser_routed_pace_delta gauge\n' +
+    'miser_routed_pace_delta -0.1\n' +
+    '# HELP miser_limit_events_7d Provider usage-limit events observed by miser in the last 7 days.\n' +
+    '# TYPE miser_limit_events_7d gauge\n'
+  
+      at TestContext.<anonymous> (/home/nacho/miser-factb-build/test/metrics.test.js:171:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1382:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:960:18)
+      at Test.postRun (node:internal/test_runner/test:1522:19)
+      at Test.run (node:internal/test_runner/test:1447:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '# HELP miser_tokens_7d Token usage in the last 7 days (rolling window), by project/provider/model/type.\n# TYPE miser_tokens_7d gauge\n# HELP miser_requests_7d Request count in the last 7 days (rolling window), by project/provider/model.\n# TYPE miser_requests_7d gauge\n# HELP miser_cost_usd_7d Estimated cost in USD in the last 7 days (rolling window), by project.\n# TYPE miser_cost_usd_7d gauge\n# HELP miser_authoritative Stats rolling-window aggregate authority state (1 authoritative, 0 non-authoritative).\n# TYPE miser_authoritative gauge\n# HELP miser_degraded Stats persistence degradation state (1 degraded, 0 healthy).\n# TYPE miser_degraded gauge\n# HELP miser_persistence_healthy Stats persistence health state (1 healthy, 0 unhealthy).\n# TYPE miser_persistence_healthy gauge\n# HELP miser_persistence_durable Stats persistence durability state (1 durable, 0 pending or degraded).\n# TYPE miser_persistence_durable gauge\n# HELP miser_persistence_pending Stats persistence pending-write state (1 pending, 0 not pending).\n# TYPE miser_persistence_pending gauge\n# HELP miser_persistence_dirty Stats persistence dirty state (1 has unwritten changes, 0 clean).\n# TYPE miser_persistence_dirty gauge\n# HELP miser_persistence_in_flight Stats persistence write-in-flight state (1 writing, 0 idle).\n# TYPE miser_persistence_in_flight gauge\n# HELP miser_persistence_last_flush_errored Stats persistence last-flush error state (1 errored, 0 clean).\n# TYPE miser_persistence_last_flush_errored gauge\n# HELP miser_persistence_last_load_errored Stats persistence last-load error state (1 errored, 0 clean).\n# TYPE miser_persistence_last_load_errored gauge\n# HELP miser_persistence_write_failures Consecutive stats persistence write failure count.\n# TYPE miser_persistence_write_failures gauge\n# HELP miser_persistence_last_error Stats persistence last error code presence.\n# TYPE miser_persistence_last_error gauge\n# HELP miser_weekly_authoritative Stats weekly payload authority state (1 all exposed weeks authoritative, 0 some weeks non-authoritative).\n# TYPE miser_weekly_authoritative gauge\n# HELP miser_non_authoritative_weeks Non-authoritative week count in the stats payload.\n# TYPE miser_non_authoritative_weeks gauge\n# HELP miser_non_authoritative_week_reasons Non-authoritative week reason presence in the stats payload.\n# TYPE miser_non_authoritative_week_reasons gauge\n# HELP miser_record_rejections Rejected or dropped stats record count, by reason.\n# TYPE miser_record_rejections gauge\n# HELP miser_record_rejections_by_label Rejected or dropped stats record count, by stats label.\n# TYPE miser_record_rejections_by_label gauge\n# HELP miser_unpriced_requests_7d Fallback-priced Anthropic request count in the last 7 days, by model.\n# TYPE miser_unpriced_requests_7d gauge\n# HELP miser_routed_weighted_tokens_week_to_date Weighted token equivalents for miser-routed Anthropic traffic only; this is a floor because unrouted panels are not counted.\n# TYPE miser_routed_weighted_tokens_week_to_date gauge\nmiser_routed_weighted_tokens_week_to_date 250\n# HELP miser_routed_consumed_frac Miser-routed fraction of configured weekly cap; estimated denominators are omitted because Prometheus cannot render the required range marker.\n# TYPE miser_routed_consumed_frac gauge\nmiser_routed_consumed_frac 0.25\n# HELP miser_routed_pace_delta Miser-routed configured-cap consumed fraction minus elapsed week fraction; estimated denominators are omitted because Prometheus cannot render the required range marker.\n# TYPE miser_routed_pace_delta gauge\nmiser_routed_pace_delta -0.1\n# HELP miser_limit_events_7d Provider usage-limit events observed by miser in the last 7 days.\n# TYPE miser_limit_events_7d gauge\n',
+    expected: /^miser_routed_consumed_frac /m,
+    operator: 'doesNotMatch',
+    diff: 'simple'
+  }
