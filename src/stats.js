@@ -1696,9 +1696,9 @@ function resolveEstimatedCap(cap, weekly) {
   };
 }
 
-function buildPaceBundle(weekly, now) {
+function buildPaceBundle(weekly, now, capWeekly = weekly) {
   const current = weekly.currentWeekToDate;
-  const cap = resolveEstimatedCap(readWeeklyCapsFile(now), weekly);
+  const cap = resolveEstimatedCap(readWeeklyCapsFile(now), capWeekly);
   const weightedRoutedConsumed = current.weightedTokenEquivalents.total;
   const degradedReasons = [];
   if (cap.capSource === 'configured') degradedReasons.push('cap-is-declared');
@@ -1734,6 +1734,8 @@ function buildPaceBundle(weekly, now) {
     && Number.isFinite(cap.weeklyCap)
     && cap.weeklyCap > 0;
 
+  // Keep these denominator fields in the JSON shape. A null value means the
+  // denominator is unavailable or incommensurable, never zero.
   return {
     scope: 'miser-routed',
     methodId: MISER_METHOD_ID,
@@ -1781,6 +1783,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
   const persistence = getPersistenceStatus();
   const authoritative = persistence.healthy && persistence.durable;
   const weekly = getSubscriptionWeeks(projectFilter, weights, now);
+  const capWeekly = projectFilter ? getSubscriptionWeeks(undefined, weights, now) : weekly;
   const weeklyRollup = weeklyAuthorityRollup(weekly);
   const unpricedWindow = unpricedModelsInWindow(cutoffKey);
 
@@ -1800,7 +1803,7 @@ function getStats(daysParam, projectFilter, weights = DEFAULT_WEIGHTS) {
     persistence,
     ...weeklyRollup,
     weekly,
-    pace: buildPaceBundle(weekly, now),
+    pace: buildPaceBundle(weekly, now, capWeekly),
     coverageNote: COVERAGE_NOTE,
     paceAlerting: 'none',
     paceAlertingReason: PACE_ALERTING_REASON,

@@ -145,6 +145,36 @@ test('Fact B: estimated cap derives from authoritative anchor week and observed 
   }
 });
 
+test('Fact B: project-filtered stats derive estimated cap from shared unfiltered anchor', async () => {
+  const statsFile = tmpFile('stats');
+  const capsFile = tmpFile('caps');
+  const prev = { stats: process.env.MISER_STATS_FILE, caps: process.env.MISER_WEEKLY_CAPS_FILE };
+  let stats;
+  try {
+    stats = freshStats(statsFile, capsFile);
+    const anchorInstant = new Date('2026-08-03T12:00:00.000Z');
+    const now = new Date('2026-08-09T12:00:00.000Z');
+    const anchorWeekStart = stats.__test.subscriptionWeekKeyFromDate(anchorInstant);
+    writeCalibration(capsFile, anchorWeekStart, 0.25);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-5', { input_tokens: 200 }, null, () => anchorInstant);
+    stats.recordAnthropicUsage('beta', 'anthropic', 'claude-sonnet-5', { input_tokens: 600 }, null, () => anchorInstant);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-5', { input_tokens: 100 }, null, () => now);
+    stats.recordAnthropicUsage('beta', 'anthropic', 'claude-sonnet-5', { input_tokens: 300 }, null, () => now);
+    stats.__test.setNowFnForTest(() => now);
+    await stats.flushNow();
+    const alpha = stats.getStats('7', 'alpha');
+    const beta = stats.getStats('7', 'beta');
+    assert.equal(alpha.pace.weightedRoutedConsumed, 100);
+    assert.equal(beta.pace.weightedRoutedConsumed, 300);
+    assert.equal(alpha.pace.weeklyCap, 3200);
+    assert.equal(beta.pace.weeklyCap, 3200);
+    assert.equal(alpha.pace.routedConsumedFrac, 0.03125);
+    assert.equal(beta.pace.routedConsumedFrac, 0.09375);
+  } finally {
+    cleanup(stats, [statsFile, capsFile], prev);
+  }
+});
+
 test('Fact B: estimated cap refuses missing anchor week', () => {
   const statsFile = tmpFile('stats');
   const capsFile = tmpFile('caps');

@@ -1,0 +1,789 @@
+
+> @bheath-atx/miser@0.1.0 test
+> node --require ./test/live-file-guard.js --test test/*.test.js
+
+✔ AR9: every single-feature config wires a dispatcher AND lands a live alert (4.505046ms)
+✔ AR9: with ALL features off, guardDeps stays {} and createLedger is NEVER called (1.139975ms)
+✔ AR9: createLedger runs AT MOST ONCE per composition, and the instance is SHARED (0.572505ms)
+✔ AR11(a): no src/ file contains the token sendAlert unless allowlisted or registered (3.512381ms)
+✔ AR11(b): registry is not rotted — every module exists, every predicate is false for {} (0.488149ms)
+✔ AR13: every alert site with NO dispatcher logs one ALERT-DROPPED, counts it, opens no socket (70.296054ms)
+✔ AR16: daily-rollup.js requires only builtins + pricing.js; no config/alert-routes cycle (1.354251ms)
+✔ AR28: startup defect alert fires from the REAL composition root, with the two-call ledger protocol (2.95223ms)
+✔ AR28(e): a complete map (or routes OFF) yields no_defect, zero posts, zero warns (0.820022ms)
+✔ AR28(f): a rejecting transport still dispatches, resolves, and reports via the dispatcher token (1.548453ms)
+✔ AR30: required-set key sources are a SUBSET of the ALERTING_FEATURES predicates (1.23209ms)
+✔ AR30: positively — budgets/policy/(E)poll-rewrite-only with an incomplete map all emit (1.111389ms)
+✔ AR31a: index.js sequences buildGuardDeps -> wireAlertDispatcher -> wireCacheThrashDeps (0.767598ms)
+✔ AR31a: behavioural companion — every single-feature config has a function dispatcher after the sequence (3.675441ms)
+[miser/alert] ALERT-ROUTING-DEGRADED unrouted=pkachu — alerts for these projects are WITHHELD until MISER_ALERT_ROUTES covers them
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-test-home-guard-1757551-wUSR8K/miser-alert-ledger.json'); starting empty
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-test-home-guard-1757551-wUSR8K/miser-alert-ledger.json'); starting empty
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-test-home-guard-1757551-wUSR8K/miser-alert-ledger.json'); starting empty
+✔ AR29(a-b): project scope routes to project; all fleet spellings resolve identically; kind has no effect (8.184229ms)
+✔ AR29(c): ops scope uses ops route when set, default when unset, and is never withheld (1.924235ms)
+✔ AR29(d-e): explicit ops/fleet scope wins over project and logs one scope-conflict warn (1.885468ms)
+✔ AR29(f): route-shaped string in project slot collapses to @invalid and is withheld (1.819625ms)
+✔ AR32(a): sendAlert NEVER rejects and resolves to a matching AlertResult (all failure modes) (3.675835ms)
+✔ AR32(b): every outcome bumps one counter; only NON-delivered outcomes log; delivered logs NOTHING (1.980936ms)
+✔ AR32(b2): pre-dispatcher guard owns no_dispatcher; dispatcher owns the rest; never both; same counter (33.119282ms)
+✔ AR33(a): wireAlertDispatcher({post}) yields the REAL dispatcher and opens zero sockets (0.968823ms)
+✔ AR33(b): with NEITHER seam, createAlertDispatcher defaults to postPkachu (production unchanged) (0.683699ms)
+✔ AR33(c): seams.sendAlert still wins outright (Layer-1 hermeticity, AR13 mechanism) (0.330682ms)
+✔ AR33(d): source shape — wireAlertDispatcher PASSES a post seam into createAlertDispatcher (0.557337ms)
+✔ AC7a: same key same UTC day fires exactly once (26.558282ms)
+✔ AC7b: restart durability — flushNow() persists, a new instance stays suppressed (20.240781ms)
+✔ AC7c: next UTC day re-arms (new instance AND same instance) (13.412227ms)
+✔ AC7d: corrupt ledger file → warning + empty in-memory ledger, still functional (12.557116ms)
+✔ non-object ledger JSON (array) → warning + empty ledger (9.480918ms)
+✔ missing file emits one warning and starts empty (spec §3 / AC7) (9.463397ms)
+✔ entries older than 2 days are pruned on load and on write (12.75178ms)
+✔ require(alert-ledger) alone performs zero file I/O (factory-only contract) (2.42743ms)
+✔ AR12: no destination is LOUD — one ALERT-DROPPED, dropped+1, zero network, no throw (1.821386ms)
+✔ AR32: delivery failure resolves (never rejects), warns once with kind=, bumps failed (1.33035ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-test-ledger-1757566-once-1786334107377-0.38338751356809164.json'); starting empty
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-test-ledger-1757566-restart-1786334107404-0.7981676267027167.json'); starting empty
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-test-ledger-1757566-rearm-1786334107425-0.35006951910220185.json'); starting empty
+✔ AR8: routes OFF — drift alert text is byte-identical and goes to the DEFAULT route unprefixed (69.12542ms)
+✔ AR8: routes OFF — context-bloat alert text is byte-identical (28.890341ms)
+✔ AR8: routes OFF — the FLEET-scope sub-cap alert keeps its exact text (0.937998ms)
+✔ AR8: routes OFF — budget-warn and budget-cap texts are byte-identical off a populated stats tree (37.881647ms)
+✔ AR8: routes OFF — cache-thrash text is byte-identical off a warmed ring buffer (21.893283ms)
+✔ AR8: no alert text anywhere in src/ gained a routing prefix or a new unit (2.602229ms)
+✔ AR24: an injected resolveRoute BEATS a decoy MISER_PKACHU_ENDPOINT (13.963254ms)
+✔ AR24/AR15: WITHOUT injection the env path still yields reason:no_env (unchanged) (1.269477ms)
+✔ AR24: source shape — index.js injects resolveRoute, and the interval threads it (1.317662ms)
+✔ src/ is greppable: no source file carries raw control bytes (21.29695ms)
+✔ AR1: parseAlertRoutes returns null for unset, empty, and empty-object route config (0.527269ms)
+✔ AR2/AR22: malformed and unsafe route values are fatal for main map and ops map (4.602897ms)
+✔ AR2/AR27: double-dash and @ namespace keys are rejected at startup (1.211696ms)
+✔ AR4/AR6/AR7(a-b): route resolution uses mapped routes, fleet defaults, and routes-OFF is inert (1.176652ms)
+✔ AR7(c): startup validation accepts the live seven-project budgets/policy set with routes OFF (0.470044ms)
+✔ AR22: ops route fallback rows resolve to default, and unset-with-no-default drops loudly (0.931339ms)
+✔ AR26: strictness policy defaults degraded, flips fatal, and malformed entries ignore the switch (1.237177ms)
+✔ AR31(a-b,d-e): @default only degrades when declared by a required project with no default destination (0.497169ms)
+✔ AR31(a,c): default-missing startup defect has its own unconditional line and ledger key (1.558804ms)
+✔ AR10: no fallback sendAlert token survives anywhere in src/ (5.442699ms)
+✔ AR26: each axis-C condition resolves a real table row, not the unimplemented fallback (1.164095ms)
+✔ AR26: each condition resolves the SPECIFIC policy row it is documented to use (1.185127ms)
+✔ AR5: case E never misroutes, dedupes by bucket, and controls withheld text exposure (13.078333ms)
+✔ AR23: 600 unroutable project names mint at most cap+2 ops posts and ledger keys (14.505262ms)
+✔ AR7(d): an incomplete route map leaves POST forwarding and health HTTP availability intact (80.309815ms)
+✔ AR31(c): both startup degraded causes produce exactly two ops posts and two keys in one UTC day (1.345823ms)
+✔ AR14: delivered, withheld, withheldOverflow, failed and dropped all move (16.472909ms)
+✔ AC1: parseBudgets unset/empty → null (OFF), no warning (10.992554ms)
+✔ AC1: parseBudgets malformed JSON / array / non-object → null + warn (1.638745ms)
+✔ AC1: invalid projects are ignored+warned; all-invalid → null; empty object never returned (1.492371ms)
+✔ AC1: valid budgets survive alongside ignored invalid ones (2.408664ms)
+✔ AC1: parseBudgetGrace always returns an array ([]-as-empty, never null) (1.674865ms)
+✔ AC1a: both features OFF → empty guardDeps and NO createLedger() call (1.609312ms)
+✔ AC1b: G3-on/B6-off → ledger created, checkContextBloat key ABSENT (2.025373ms)
+✔ AC1c: both active → ledger created once, both hooks present (2.568027ms)
+✔ B6-only → ledger + checkContextBloat, no budgets keys (3.884521ms)
+✔ AC11: cap-only (budgets=null, policy=null, codex5hCap=40) → ledger + subCapTracker wired (2.928218ms)
+✔ AC11: all three features OFF (codex5hCap=0) → empty deps, no spies called (1.663966ms)
+✔ AC11: cap + budgets both active → both wired alongside each other (1.515621ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-budgets-1757601-sm-ledger-1786334107424-0.22994814141014208.json'); starting empty
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-budgets-1757601-grace-ledger-1786334107595-0.6621466533828796.json'); starting empty
+✔ AC3: warn once at 80%, cap once at 100%, block repeats without re-alerting, next day re-arms (171.310326ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-budgets-1757601-off-ledger-1786334107617-0.7049480806447377.json'); starting empty
+✔ grace project at cap: cap alert fires with GRACE text, request passes, no block counter (21.908898ms)
+✔ unbudgeted project and budgets-OFF are state OFF: no check, no alert (9.086507ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-budgets-1757601-unflushed-ledger-1786334107643-0.5256213091846416.json'); starting empty
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-budgets-1757601-boundary-cap-ledger-1786334107650-0.7188459355055505.json'); starting empty
+✔ missing ledger → skip entirely: no alert, no block, no counter (normative §2.5) (15.804742ms)
+✔ AC4: budget check sees un-flushed usage (no flushNow anywhere) (7.381288ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-budgets-1757601-ac8-ledger-1786334107668-0.685162710187696.json'); starting empty
+✔ budget cap sees boundary usage recorded under the same UTC day key (12.344778ms)
+✔ AC4: non-Anthropic measured legs accrue $0 toward the budget (3.896834ms)
+✔ block response: retry-after is ceil(seconds to next UTC midnight), min 1 (1.078116ms)
+✔ block response: exact Anthropic error wire shape with toFixed(2) dollars (0.994178ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-budgets-1757601-reject-ledger-1786334107687-0.9272201243393399.json'); starting empty
+✔ AC8: checkBudget returns before a pending sendAlert resolves; second event does not re-call (18.330109ms)
+✔ AC8: a rejecting injected sendAlert is swallowed by the dispatch wrapper (5.845757ms)
+✔ AC21: first 5 calls return warm:false (minRequests=5 prior samples required) (7.424973ms)
+✔ AC22: Nth call (N-1 prior samples) blocked; (N+1)th call with 10× spike triggers alert (8.2432ms)
+✔ AC23: input spike alongside cacheWrite spike → no alert (1.104569ms)
+✔ AC24: ledger shouldSend=false prevents duplicate alert (1.016759ms)
+✔ AC25: rawUsage=null returns warm:false without calling sendAlert (2.076969ms)
+✔ AC25: rawUsage={} (no keys) returns without error and without alert (0.86798ms)
+✔ AC26: createCacheThrashChecker with minRequests=0 returns no-op (0.359607ms)
+✔ AC27: throwing sendAlert is isolated — console.warn fires, no crash (1.288207ms)
+[miser] thrash-detector: first cache-write observed for project=proj, establishing baseline
+✔ AC28: all-mutated cold-start — no alert fires for 6 identical high requests (2.545001ms)
+✔ AC29: zero prior baseline guard prevents false positive (2.040854ms)
+✔ AC30: spike after established nonzero baseline triggers alert (1.404736ms)
+✔ starts CLOSED, acquire() returns true (4.275332ms)
+✔ recordSuccess resets failure counter in CLOSED state (0.4286ms)
+✔ trips to OPEN at threshold consecutive failures (0.400931ms)
+✔ OPEN acquire() returns false before resetMs elapses (0.389307ms)
+✔ OPEN → HALF_OPEN → single probe after resetMs (AC7) (0.411538ms)
+✔ HALF_OPEN: recordSuccess → CLOSED, failures reset (0.37999ms)
+✔ HALF_OPEN: recordFailure → re-OPEN with new openedAt (0.382624ms)
+✔ getState returns state, failures, openedAt accurately (1.796463ms)
+✔ success in CLOSED does not change state or openedAt (0.387473ms)
+✔ injectable nowFn drives time without mocking Date.now (0.590777ms)
+✔ real forwardToCodex rejects on 401 WITHOUT writing headers (enables Ollama failover) (82.271417ms)
+✔ real forwardToCodex rejects on 403 WITHOUT writing headers (enables Ollama failover) (8.901478ms)
+✔ real forwardToCodex rejects on 500 without writing headers (6.259687ms)
+✔ real forwardToCodex sends subscription Bearer + codex headers, never OPENAI_API_KEY (3.98557ms)
+✔ real forwardToCodex translates Responses SSE → Anthropic SSE on 200 (9.607323ms)
+✔ compact hint is none for a small Sonnet request and raw token estimate matches compress() (147.031207ms)
+✔ compact hint is recommend above 40% of the Sonnet window (21.602265ms)
+✔ compact hint is urgent above 70% of the Sonnet window (20.238337ms)
+✔ same absolute token estimate is none on the larger Opus window (15.946319ms)
+✔ claude-sonnet-5 gets the 1M window like Opus, not the 200K legacy-Sonnet window (17.513372ms)
+✔ unknown model defaults to the 200K window (safe/conservative default) (42.42328ms)
+✔ poll class is unlikely for a first-time long user message (7.046092ms)
+✔ poll class is likely for a repeated long last-user fingerprint in the same project (9.34018ms)
+✔ oversized tool_result header lists the correct message index (11.489604ms)
+✔ oversized tool_result header is absent when no tool_result exceeds 32KB (9.296618ms)
+✔ compact headers are absent on upstream 400 (7.315437ms)
+[miser] error: anthropic 500
+✔ compact headers are absent on upstream 500 (503.369482ms)
+✔ /api/miser/stats includes per-project pollClass likely/work counts (22.657ms)
+[miser] compress: dedup rejected (orphaned or misordered tool_result: tool_use_id never_paired has no corresponding tool_use in the immediately preceding assistant turn); reverting dedup, forwarding normalized messages
+[miser] compress: dedup rejected (orphaned or misordered tool_result: tool_use_id tu1 has no corresponding tool_use in the immediately preceding assistant turn); reverting dedup, forwarding normalized messages
+[miser] compress: dedup rejected (orphaned or misordered tool_result: tool_use_id CORRUPTED has no corresponding tool_use in the immediately preceding assistant turn); reverting dedup, forwarding normalized messages
+✔ estimateTokens returns 0 for empty/null (5.659236ms)
+✔ estimateTokens approximates sensibly (0.593226ms)
+✔ compress returns the reduced-body contract { body, messages, tokens, rawTokens } (1.862903ms)
+✔ compress does not throw on object-form system {text} (0.382577ms)
+✔ compress does not throw on null block inside content array (0.49845ms)
+✔ compress does not throw on circular block content (0.418717ms)
+✔ normalizeAnthropicBody hoists leading role:system into top-level system (0.397384ms)
+✔ normalizeAnthropicBody merges existing top-level system with role:system messages (0.964524ms)
+✔ AC1: 200K request with heavy duplicate tool_results is deduped + forwarded (never 413) (9.607619ms)
+✔ v4 S1: Anthropic dedup skips when client cache_control is present at top-level body.cache_control (1.259891ms)
+✔ v4 S1: Anthropic dedup skips when client cache_control is present at system[] block (0.53929ms)
+✔ v4 S1: Anthropic dedup skips when client cache_control is present at messages[].content[] block (0.51809ms)
+✔ v4 S1: Anthropic dedup skips when client cache_control is present at tools[] entry (0.458265ms)
+✔ v4 S1: Anthropic dedup still runs without client cache_control (0.610103ms)
+✔ v4 S1: MISER_DEDUP_FORCE=1 restores Anthropic dedup with client cache_control (0.991841ms)
+✔ AC2: no-truncation ⇒ no brick — a large body forwards with messages[0] unchanged (0.492276ms)
+✔ AC2: client-illegal opener (directive-only block at index 0) is forwarded AS-IS (1.503394ms)
+✔ AC2: role:system hoist that EXPOSES an illegal opener still forwards as-is (no repair) (0.301145ms)
+✔ AC2: directive-block brick class — no truncation keeps a legal messages[0] (directive stays mid-transcript) (0.611097ms)
+✔ AC2: orphan tool_result at index 0 forwarded as-is (miser emits no rejection) (1.607589ms)
+✔ AC2: empty messages[] forwarded as-is (0.25737ms)
+✔ AC2: all-assistant messages forwarded as-is (0.274419ms)
+✔ AC3: Read(f)=A … Edit … Read(f)=B keeps BOTH (different content, same file) (0.651073ms)
+✔ AC3: Read(f)=A … Read(f)=A stubs the older, newest authoritative & reconstructable (0.485688ms)
+✔ AC3: identical bytes from DIFFERENT tools/files → BOTH kept (paired identity) (0.489066ms)
+✔ AC3: identical text with OPPOSITE is_error → BOTH kept (0.51828ms)
+✔ AC3: same content AND same is_error collapses, preserving is_error on the stub (0.481986ms)
+✔ AC3: image/document blocks are NEVER touched (out of scope) (0.782428ms)
+✔ AC4: cacheHint=off → byte-identical system + preserve set (0.282577ms)
+✔ AC4: cacheHint=on → system TEXT byte-identical, only cache_control added (0.8632ms)
+✔ AC4: cache-hint SKIPPED when no system (no tools/user placement) (0.371943ms)
+✔ AC4: cache-hint NOT inserted when the client already sent a breakpoint (≤1 breakpoint) (0.655754ms)
+✔ AC4: cache-hint NOT inserted for a short conversation (≤ MIN_KEEP turns) (0.249532ms)
+✔ AC4: cache-hint NOT inserted when the client breakpoint is on tools[] (MF2) (0.820517ms)
+✔ AC4: system-hoist preserves a client cache_control breakpoint on block-array system (MF1, cacheHint off) (0.745216ms)
+✔ MF1: no top-level system + role:system block with cache_control → block-array system preserves BP (cacheHint off) (0.582794ms)
+✔ MF1: string top-level system + structured role:system BP → block-array system preserves the role:system BP (0.778057ms)
+✔ MF1: block-array top-level BP + structured role:system BP → BOTH breakpoints preserved as blocks (0.420557ms)
+✔ MF1: block-array top-level (no BP) + structured role:system BP → NOT string-merged; role:system BP preserved (0.422272ms)
+✔ MF1 + §3.4: cacheHint ON does not insert a duplicate BP when role:system already carried one (0.520561ms)
+✔ MF1: block-array system WITHOUT any BP + role:system hoist → preserved as blocks, not string-flattened (0.338143ms)
+✔ AC5: client OWN malformed pairing forwarded as-is (no miser_integrity_error) (0.375807ms)
+✔ AC5: validateMessageIntegrity (internal) rejects a non-adjacent pair (0.22658ms)
+✔ AC5: validateMessageIntegrity rejects an unanswered tool_use (0.502794ms)
+✔ AC5: compress() reverts dedup when miser's OWN dedup would break adjacency (1.475125ms)
+✔ AC6: 100K zero-duplicate request forwards unchanged (minus normalization) (0.542647ms)
+✔ AC6: a >200K-token zero-duplicate request forwards byte-for-byte (no reintroduced ceiling) (3.276144ms)
+✔ AC8: role:system hoist puts top-level system on the FORWARDED body (0.347978ms)
+✔ AC10: middle duplicate tool_result (locatable pair, outside preserve set) → stub forwarded (0.542486ms)
+✔ §8.6 grep-guard: no primary source branches on a compression threshold (47.596528ms)
+✔ §8.6 behavioral: a 100K request forwards unchanged regardless of any (absent) threshold env (0.31545ms)
+✔ messageTokens counts content + turn overhead (0.123823ms)
+✔ v4 C1: malformed env, array, and non-object disable all projects with warnings (3.97955ms)
+✔ v4 C1: false/null/string/array project values disable that project (2.982613ms)
+✔ v4 C1: unknown keys, out-of-bounds knobs, and bad project keys fail closed (1.143495ms)
+✔ v4 C1: valid flat knobs map to the fixed Anthropic fragment (0.669109ms)
+✔ v4 C1: beta header merge preserves existing entries without duplicates (0.454221ms)
+✔ v4 C1: injection is skipped for client-supplied context_management (0.421086ms)
+✔ v4 D1: docs do not retain percentage-reduction compression claims (12.372153ms)
+✔ AR21: every MISER_ALERT_ROUTES* var src/ reads is documented in README.md (6.129181ms)
+✔ Fact B: configured cap_source is derived and weekly routed fraction is scoped (88.571557ms)
+✔ Fact B: method mismatch refuses to divide and keeps numerator (18.758412ms)
+✔ Fact B: estimated cap derives from authoritative anchor week and observed fraction (26.119771ms)
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-test-unknown; using fallback pricing
+✔ Fact B: project-filtered stats derive estimated cap from shared unfiltered anchor (36.401568ms)
+✔ Fact B: estimated cap refuses missing anchor week (5.54428ms)
+✔ Fact B: estimated cap refuses non-authoritative anchor week (6.692765ms)
+✔ Fact B: unknown model counter records once on response path and reads are idempotent (13.275647ms)
+✔ Fact B: provider limit event records and alerts without cap (27.541869ms)
+✔ Fact B: source does not reintroduce a second cap source or pace verdict (3.224289ms)
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex 429 — hard-capped Ollama fallback
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex auth/client error (401) — Ollama fallback
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex auth/client error (401) — Ollama fallback
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex auth/client error (403) — Ollama fallback
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex auth/client error (400) — Ollama fallback
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex/OpenAI unavailable (502) — Ollama fallback
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex auth/client error (400) — Ollama fallback
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex 429 — hard-capped Ollama fallback
+[miser] OpenAI 429 — falling back to hard-capped Ollama
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Anthropic breaker OPEN — skipping to Codex
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex breaker OPEN — skipping to Ollama
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+[miser] Codex 429 — hard-capped Ollama fallback
+✔ happy path: Anthropic succeeds, no failover (8.847206ms)
+✔ Anthropic 429 → Codex success → Ollama NOT called (3.102236ms)
+✔ Anthropic 429 → Codex 429 → Ollama IS called (0.927999ms)
+✔ Anthropic 429 → no bearer (fail closed) → Ollama IS called (Codex skipped) (1.075205ms)
+✔ Anthropic 429 → Codex 401 → fails over to Ollama (no auth error streamed) (1.323028ms)
+✔ Anthropic 429 → Codex 403 → fails over to Ollama (no auth error streamed) (0.809031ms)
+✔ Anthropic 429 → Codex 400 → fails over to Ollama (no auth error streamed) (2.245834ms)
+✔ Anthropic 429 → Codex 502 (retryable 5xx) → fails over to Ollama after retries (0.942742ms)
+✔ Codex leg receives a validated Responses request + the subscription bearer (1.045103ms)
+✔ empty-flattening messages skip Codex and fail over to Ollama (1.247242ms)
+✔ AC9/MF3: Anthropic 429 → Leg 2 (Codex) receives the reduced body — hoisted system + dedup stub (4.420097ms)
+✔ AC9/MF3: Anthropic 429 → Codex 429 → Leg 3 (Ollama) receives the reduced body — hoisted system + dedup stub (2.031324ms)
+✔ non-429 Anthropic error propagates (no failover on a hard error) (1.284759ms)
+✔ openai passthrough format: 429 → Ollama (Codex leg not used) (0.626289ms)
+✔ teardownResponse destroys the response on post-header upstream error (0.386813ms)
+✔ teardownResponse falls back to end() when destroy() is unavailable (0.312898ms)
+✔ teardownResponse is a no-op on an already-destroyed response (0.253363ms)
+✔ SF3: proxy request → compress → routeRequest(Anthropic 429) → fails over to Leg 2 (Codex) (52.605531ms)
+✔ server entrypoint (the only .listen on :20128) is never loaded during tests (0.573511ms)
+✔ AC5-A: Anthropic breaker OPEN skips Anthropic transport, routes to Codex (0.656046ms)
+✔ AC5-B: Codex breaker OPEN skips Codex transport (B1), routes to Ollama (M1) (0.60466ms)
+✔ AC5-C: Ollama breaker OPEN surfaces 503 error; Ollama transport never called (0.839203ms)
+✔ no-op when already under cap (3.213326ms)
+✔ drops oldest whole messages when over cap (0.525402ms)
+✔ trims INSIDE an oversized final message (single huge message) (0.793175ms)
+✔ oversized double-fallback payload: Ollama body ends up <= 32k (translate→cap) (1.068702ms)
+✔ system message alone, if huge, is trimmed below cap (0.548659ms)
+✔ hard-cap clamps an oversized num_predict (0.274655ms)
+✔ hard-cap leaves a small num_predict untouched (0.226209ms)
+✔ hard-cap clamps a negative/unbounded num_predict (0.327289ms)
+✔ num_predict clamp survives the truncation path too (1.339039ms)
+✔ estimate math sanity: capped token estimate matches char length (2.129138ms)
+[miser] error: anthropic down
+✔ /api/miser/health returns all vitals fields (53.102501ms)
+✔ health reqPerMin prunes old requests and counts current window (6.237557ms)
+✔ AC6-A: circuitBreakers in health payload matches injected getBreakersState (7.547331ms)
+✔ AC6-B: safeAcquire fail-open — throwing breaker returns true, logs warning (4.638732ms)
+✔ AC9-a: subscriptionCap is null when no subCapTracker in guardDeps (6.646736ms)
+✔ AC9-b: subscriptionCap matches getStatus() output when subCapTracker present (7.149928ms)
+✔ health exposes leg errors, c1 disabled projects, and pending writes (61.915983ms)
+✔ AR19: health exposes the full §2.8 alertRouting block, every field (5.02377ms)
+✔ AR25: degraded is visible in health and inert on the request path (1.5661ms)
+✔ AR20: startup emits the alert-routes INVENTORY line, distinct from the degraded line (1.150622ms)
+✔ live file guard isolates every HOME-backed default through env (2.630542ms)
+✔ every HOME default in src/ is covered by the guard (8.61599ms)
+✔ live file guard fails loudly when a guarded path resolves to its HOME default (1.518529ms)
+✔ protected modules cannot resolve HOME defaults when their env is unset (434.764934ms)
+✔ stats observation seal writes only to the isolated stats path under test (118.522885ms)
+[miser/pricing] WARN unknown Anthropic model model-with-"quote; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model-with-\slash; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model-with-
+newline; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model1; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model1; using fallback pricing
+✔ AC9: labelEscape — double-quote (3.045518ms)
+✔ AC9: labelEscape — backslash (0.54449ms)
+✔ AC9: labelEscape — newline (0.310142ms)
+✔ AC9: labelEscape — clean string is a no-op (0.297775ms)
+✔ AC2: HELP and TYPE headers present for all three metric families (2.337687ms)
+✔ R8: authority and rejection gauges expose concrete stats authority state (24.721433ms)
+✔ Fact B: metrics expose unpriced and routed-scope pace gauges without verdicts (1.437453ms)
+✔ AC3: Prometheus compliance — label escaping, format, and trailing newline (2.927515ms)
+✔ AC3b: cost value matches computeCost(statsResult.usage[project]) (0.629082ms)
+✔ AC4: type label values are exactly from the allowed vocabulary (2.493601ms)
+✔ AC5: lines with value 0 are not emitted (sparse) (0.590965ms)
+✔ AC6: miser_requests_7d lines appear for buckets with requests > 0 (1.279201ms)
+✔ AC7: empty stats produces only HELP/TYPE headers, ends with newline (0.353822ms)
+✔ AC7: null/undefined stats produces only headers (0.240747ms)
+✔ AC1: GET /api/miser/metrics returns 200 with correct content-type (32.266007ms)
+✔ AC8: GET /api/miser/stats still returns JSON (no regression) (5.350467ms)
+✔ routing: classifyRoute GET /api/miser/metrics → metrics kind (3.168938ms)
+✔ reads subscription access_token via injected reader (no real file touched) (2.625962ms)
+✔ NEVER uses OPENAI_API_KEY — bearer is the subscription access_token only (0.745978ms)
+✔ fails closed when auth file is missing (4.024577ms)
+✔ fails closed when JSON is malformed (0.465503ms)
+✔ fails closed when access_token is absent (0.680191ms)
+✔ fails closed when access_token is empty string (0.354393ms)
+✔ OAuthUnavailableError carries a 401 statusCode (treated as transient→Ollama) (0.509192ms)
+✔ translateToOllama handles OpenAI-style messages (system in array) (2.496568ms)
+✔ compress (openai): system stays in messages[], no anthropic normalization (1.278811ms)
+✔ compress (openai): no blind truncation — every unique turn preserved (0.574494ms)
+✔ compress (openai): duplicate role:tool results deduped to newest (paired by tool_call_id) (1.15216ms)
+✔ compress (openai): different fn arguments → NOT deduped even if content matches (0.787113ms)
+✔ compress (openai): legacy role:function results deduped on function_call identity (0.678621ms)
+✔ compress (openai): un-locatable pair → treated as unique (never deduped) (0.478726ms)
+✔ compress (openai): tail results (within MIN_KEEP) are authoritative, never stubbed (0.730497ms)
+✔ AC10: project--panel route parsed correctly (4.772676ms)
+✔ AC11: project-only route has no panel field (backward-compatible) (0.722006ms)
+✔ AC12: invalid panel charset → not_found (0.375978ms)
+✔ AC13: invalid project with valid panel → not_found (0.343039ms)
+✔ AC14: empty project (--panel) → not_found (0.802664ms)
+✔ AC14: empty panel (proj--) → not_found (0.378218ms)
+✔ AC19: a--b always parsed as project=a, panel=b (0.428792ms)
+✔ AC15: recordPanelUsage creates a panel entry with correct fields (1.840282ms)
+✔ AC16: two panel-routed requests accumulate (0.862143ms)
+✔ AC18: non-panel calls do not create entries (2.112028ms)
+✔ AC17: GET /api/miser/stats/panels returns correct structure (2.75243ms)
+[miser/panel-stats] WARN load failed; starting empty: EISDIR: illegal operation on a directory, read
+✔ GET /api/miser/stats/panels reflects degraded persistence (85.593564ms)
+✔ routing: classifyRoute GET /api/miser/stats/panels → stats_panels kind (0.511934ms)
+✔ AC20: budgets with double-dash project name throws (1.06913ms)
+✔ AC20: policy with double-dash project name throws (0.344167ms)
+✔ AC20: contextEditProjects with double-dash project name throws (0.320391ms)
+✔ AC20: toolAllowlists with double-dash project name throws (0.334064ms)
+✔ AC20: budgetGrace list with double-dash name throws (0.32289ms)
+✔ AC20: valid project names in budgets do not throw (0.430649ms)
+✔ AC20: valid project name in budgetGrace does not throw (0.26573ms)
+✔ AC20: null/undefined maps are skipped without error (0.250712ms)
+✔ AC31: wireCacheThrashDeps wires all required keys without importing index.js (0.557493ms)
+✔ AC31: wireCacheThrashDeps is a no-op when minRequests=0 (0.240751ms)
+✔ AC31: index.js is never imported by this test suite (0.329954ms)
+[miser/stats] ERROR flush error: ENOENT: no such file or directory, rename '/tmp/miser-panel-test-1757730-1786334107452.json.tmp.1757730' -> '/tmp/miser-panel-test-1757730-1786334107452.json'
+✔ panel stats persist across a simulated restart (54.403354ms)
+✔ panel stats missing and corrupt files fail soft to empty (13.170613ms)
+[miser/panel-stats] WARN load failed; starting empty: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+[miser/panel-stats] WARN load failed; starting empty: Unexpected end of JSON input
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+[miser/panel-stats] WARN load failed; starting empty: panel stats file root must be an object
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+[miser/panel-stats] WARN load failed; starting empty: panel stats file root must be an object
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+[miser/panel-stats] WARN load failed; starting empty: panel stats file root must be an object
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+[miser/panel-stats] WARN load failed; starting empty: panel stats file contains no project--panel keys
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+✔ panel stats unreadable-shape files degrade and refuse to overwrite the file (45.291483ms)
+[miser/panel-stats] WARN load failed; starting empty: panel stats file root must be an object
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+✔ panel stats refuse-overwrite protects real accounting behind an unreadable file (10.460724ms)
+✔ panel stats sanitize wrong-typed counters on load (8.56387ms)
+✔ stale panel keys are retained and do not accrue traffic for new panel keys (9.953911ms)
+[miser/panel-stats] ERROR flush error: EACCES: permission denied, open '/tmp/miser-panel-unwritable-1757736-zLDKN8/stats.json.tmp.1757736'
+[miser/panel-stats] ERROR flush error: EACCES: permission denied, open '/tmp/miser-panel-unwritable-1757736-zLDKN8/stats.json.tmp.1757736'
+[miser/panel-stats] ERROR flush error: EACCES: permission denied, open '/tmp/miser-panel-unwritable-1757736-zLDKN8/stats.json.tmp.1757736'
+[miser/panel-stats] CRITICAL final panel stats flush failed after 3 attempt(s); dirty accounting data remains pending and may be lost on shutdown
+✔ panel stats report write failure for unwritable path without throwing (4.123465ms)
+[miser/panel-stats] WARN load failed; starting empty: EISDIR: illegal operation on a directory, read
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+[miser/panel-stats] WARN clamping MISER_PANEL_STATS_MAX_AGE_DAYS=10000 to 730
+✔ panel stats report directory target as persistence failure (6.89689ms)
+[miser/panel-stats] WARN retention pruned 1 panel stat key(s) reason=load age=0 maxKeys=1
+[miser/panel-stats] WARN retention pruned 1 panel stat key(s) reason=runtime age=0 maxKeys=1
+[miser/panel-stats] WARN clamping MISER_PANEL_STATS_MAX_AGE_DAYS=10000 to 730
+✔ panel stats evict least-recently-seen keys on load and flush (10.751952ms)
+✔ panel stats expose unflushed dirty data as pending, not durable (7.993322ms)
+[miser/panel-stats] WARN load failed; starting empty: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+[miser/panel-stats] ERROR refusing flush after load failure: panel stats load failed; refusing to overwrite existing persisted data
+✔ panel stats do not overwrite existing file after load failure followed by flush (8.120772ms)
+✔ panel stats bound and count mutations after load-failure refusal (51.161917ms)
+[miser/panel-stats] ERROR flush error: temporary write failure
+✔ panel stats final flush retries a transient non-in-flight write failure before returning (8.262841ms)
+[miser/panel-stats] ERROR flush error: transient in-flight panel rename failure
+✔ panel stats flushNow retries when shutdown observes an in-flight write failure (9.071389ms)
+[miser/panel-stats] ERROR flush error: chmod denied
+[miser/panel-stats] ERROR flush error: chmod denied
+[miser/panel-stats] ERROR flush error: chmod denied
+[miser/panel-stats] CRITICAL final panel stats flush failed after 3 attempt(s); dirty accounting data remains pending and may be lost on shutdown
+✔ panel stats treat chmod failure as flush failure (8.549854ms)
+[miser/panel-stats] WARN retention pruned 1 panel stat key(s) reason=load age=0 maxKeys=1
+[miser/panel-stats] WARN clamping MISER_PANEL_STATS_MAX_KEYS=9007199254740991 to 100000
+[miser/panel-stats] WARN clamping MISER_PANEL_STATS_MAX_AGE_DAYS=9007199254740991 to 730
+[miser/panel-stats] WARN clamping MISER_PANEL_STATS_MAX_BYTES=9007199254740991 to 20971520
+✔ panel stats retention tie-breaker keeps deterministic key order (8.089667ms)
+✔ panel stats clamps abusive retention env vars (6.340658ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-policy-1757742-drift-ledger-1786334107520-0.9604922756978123.json'); starting empty
+✔ parsePolicy unset/empty → null (OFF), no warning (14.929871ms)
+✔ parsePolicy malformed / array / non-object / all-invalid → null + warn (2.677086ms)
+✔ parsePolicy accepts drift-only, bloat-only, and combined project policies (3.41692ms)
+✔ parsePolicy: one invalid field invalidates the whole project entry (1.993736ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-policy-1757742-nomodel-ledger-1786334107623-0.15555171319958572.json'); starting empty
+✔ AC5a/b: mismatched model alerts once, counter keeps incrementing; matching prefix is silent (102.557385ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-policy-1757742-bloatonly-ledger-1786334107635-0.762485351403074.json'); starting empty
+✔ AC5c: absent / non-string body.model → skip, no alert, no throw (11.672927ms)
+✔ AC5d: bloat-only policy project → drift skips silently on ANY model (12.566192ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-policy-1757742-bloat-ledger-1786334107661-0.6278712014296386.json'); starting empty
+✔ drift with missing ledger → skip: no alert, no counter (§2.5) (12.705355ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-policy-1757742-nousage-ledger-1786334107682-0.42524795686566286.json'); starting empty
+✔ AC6a: measured usage over threshold → one alert + counter increments per event (18.493779ms)
+✔ AC6: cache_creation nested and legacy total fields count toward context tokens (2.026617ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-policy-1757742-edge-ledger-1786334107690-0.019720511442280042.json'); starting empty
+✔ AC6b: null / missing usage → returns immediately, no event, no fabricated signal (7.871779ms)
+✔ AC6: at-threshold is NOT bloat (strictly greater-than), drift-only policy skips bloat (9.586783ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-policy-1757742-shared-ledger-1786334107705-0.10808870500489043.json'); starting empty
+✔ bloat with missing ledger → immediate return (B6-OFF for the invocation) (6.17272ms)
+✔ drift + bloat counters share one sparse policy node per project per day (7.623422ms)
+✔ Anthropic pricing table pins sonnet, opus, haiku, opus-5, sonnet-5, and fable-5 all five axes (3.412512ms)
+✔ Sonnet 5 default pricing documents the 2026-09-01 rollover (6.191363ms)
+✔ unknown model uses fallback pricing and returns 6dp number (2.520594ms)
+✔ MISER_PRICING_JSON partial override merges over defaults (0.917188ms)
+✔ malformed MISER_PRICING_JSON falls back to defaults without throwing (1.105261ms)
+[miser] project=default format=anthropic deduped 459→338 tokens (saved 121)
+✔ AC8: hoisted top-level system reaches the Anthropic leg (loopback echo) (145.265032ms)
+✔ AC10: middle duplicate tool_result forwards as a STUB (loopback echo canary) (14.150114ms)
+✔ AC7: upstream 400 passes through verbatim (no miser synthetic error) (10.719112ms)
+[miser] compress: dedup rejected (orphaned or misordered tool_result: tool_use_id orphan has no corresponding tool_use in the immediately preceding assistant turn); reverting dedup, forwarding normalized messages
+✔ AC7: upstream 413 passes through verbatim (no miser synthetic error) (8.458347ms)
+✔ AC5: a client-illegal request (orphan tool_result) is FORWARDED, not miser-rejected (10.27718ms)
+✔ health payload reports process vitals (4.813022ms)
+✔ /api/miser/stats returns 200 with the expected shape (8.441749ms)
+✔ /api/miser/stats reflects degraded persistence after load failure (6.225281ms)
+✔ /api/miser/stats exposes load failure mutation drop counters (13.731636ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ /api/miser/stats exposes top-level weekly authority rollup without lowering ok (17.163544ms)
+✔ /api/miser/stats?days=abc returns 400 (3.904378ms)
+[miser] c1-injected project=pathproj
+✔ /api/miser/stats?days=-1 returns 400 (4.413365ms)
+✔ /api/miser/quota still returns 200 (3.105141ms)
+[miser/pricing] WARN unknown Anthropic model claude; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude; using fallback pricing
+✔ v4 P1/C1: path project beats header project for attribution and injection (25.056396ms)
+✔ v4 C1: default env performs zero mutation (10.307108ms)
+[miser] c1-injected project=alpha
+✔ v4 C1: beta merge avoids duplicates and client context_management is never overridden (15.223476ms)
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser] c1-injected project=alpha
+✔ v4 M1/C1: usage and applied_edits are captured from non-stream Anthropic JSON (18.196397ms)
+[miser] c1-injected non-2xx project=alpha status=400
+[miser] c1-injected project=alpha
+[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)
+✔ v4 C1: injected non-429 non-2xx passes through and writes no usage stats (15.171218ms)
+[miser] c1-injected project=alpha
+✔ v4 C1: injected 429 keeps failover behavior (5.215054ms)
+[miser] c1-injected non-2xx project=alpha status=400
+[miser] c1-injected project=alpha
+[miser] c1-injected non-2xx project=alpha status=400
+[miser] c1-injected project=alpha
+[miser] c1-injected non-2xx project=alpha status=400
+[miser] context-management disabled project=alpha reason=three-consecutive-400
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-proxy-ledger-1757766-1786334107870-0.45297001029756523.json'); starting empty
+✔ v4 C1: breaker trips on 400,400,400 and disables later injection (17.710562ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-proxy-ledger-1757766-1786334107881-0.6832222366304735.json'); starting empty
+✔ Sprint B AC2: capped project → exact 429 block, never forwarded, no usage accrual, counter increments (12.250712ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-proxy-ledger-1757766-1786334107894-0.8671251358850885.json'); starting empty
+✔ Sprint B AC2: grace project at cap is forwarded normally with a GRACE cap alert only (12.283506ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-proxy-ledger-1757766-1786334107902-0.8545534554963158.json'); starting empty
+✔ Sprint B AC4: OpenAI-format request is cross-leg blocked on Anthropic spend, transport never invoked (7.994599ms)
+[miser/alert-ledger] WARN ledger load failed (ENOENT: no such file or directory, open '/tmp/miser-proxy-ledger-1757766-1786334107914-0.16566230129013237.json'); starting empty
+✔ Sprint B AC2/AC5e: budget-capped + drifted model → block only, NO drift alert or counter (11.654146ms)
+✔ Sprint B AC5: drifted model under budget → forwarded UNMUTATED, drift alert fires once (12.421625ms)
+[miser] c1-injected project=alpha
+✔ Sprint B: guardrails-OFF (empty guardDeps) leaves the proxy path byte-identical (8.278703ms)
+[miser] c1-injected non-2xx project=alpha status=400
+[miser] c1-injected project=alpha
+[miser] c1-injected project=alpha
+[miser] c1-injected non-2xx project=alpha status=400
+[miser] c1-injected project=alpha
+[miser] c1-injected project=alpha
+[miser] c1-injected non-2xx project=alpha status=400
+[miser] c1-injected project=alpha
+✔ v4 C1: breaker does not trip when 400s are reset by 2xx (21.740227ms)
+✔ getUsage returns null for unknown project (1.929694ms)
+✔ recordUsage tracks requests and provider (0.988304ms)
+✔ recordUsage increments on repeated calls (0.32384ms)
+✔ recordUsage tracks provider switches (0.341399ms)
+✔ getAllUsage includes all recorded projects (0.798577ms)
+✔ AC1: fn() called exactly 3 times on 2 retryable failures then success (3.228398ms)
+✔ AC1: success on first attempt returns result, fn called once (0.331261ms)
+✔ AC2: 500 with retryable=true: retried (retryable flag is sole predicate) (0.36051ms)
+✔ AC2: 502 with retryable=true: retried (retryable flag is sole predicate) (0.25629ms)
+✔ AC2: 503 with retryable=true: retried (retryable flag is sole predicate) (0.308151ms)
+✔ AC2: 504 with retryable=true: retried (retryable flag is sole predicate) (0.257639ms)
+✔ AC3: 429 (retryable not set) propagates immediately, fn called once (1.065408ms)
+✔ AC3: connect-error (retryable=true, no statusCode) retried up to maxAttempts (0.869456ms)
+✔ AC3: 400 non-retryable propagates immediately, fn called once (1.427197ms)
+✔ AC3: all maxAttempts exhausted throws last error (0.806677ms)
+✔ AC4-A: headersSent set during fn() prevents retry (top-of-loop guard) (0.463529ms)
+✔ AC4-B: headersSent set during sleep prevents second fn() invocation (post-sleep guard) (0.545641ms)
+✔ AC8-A: shouldAlert=true at 80% capFraction, alert sent once with correct text (1.174358ms)
+✔ AC8-B: shouldAlert=true on first 429, alert text contains 429 count (C1) (0.413785ms)
+✔ AC8: _maybeAlertSubCap is fail-safe: throwing tracker does not propagate (0.418867ms)
+✔ AC8: _maybeAlertSubCap no-ops when guardDeps has no subCapTracker (0.174108ms)
+[miser/rollup] WARN daily rollup skipped: MISER_PKACHU_TOKEN or MISER_PKACHU_ENDPOINT not set
+✔ rollup baseline excludes today and fires anomaly above two times trailing average (5.57243ms)
+✔ rollup suppresses anomaly with fewer than three history days (0.721128ms)
+✔ rollup sparse missing days count as zero in the seven-day denominator (0.922424ms)
+✔ Sprint B: guardrail fields append to a usage line only when nonzero (24.291274ms)
+✔ Sprint B: anomaly marker and guardrail fields coexist in order (0.793488ms)
+✔ Sprint B: guardrail-only project emits a $0.00 line with no token fields (0.714315ms)
+✔ Sprint B: zeroed guardrail nodes produce no rollup line for usage-less projects (0.393782ms)
+✔ Fact B: rollup renders a scoped miser-routed cap fraction only when supplied (0.735013ms)
+[miser/rollup] WARN daily rollup skipped: boom
+✔ emitDailyRollup no-env no-ops and HTTP failure does not throw (17.717658ms)
+✔ emitDailyRollup writes dedup marker after successful post and skips same UTC date (4.011732ms)
+✔ Fact B: unpriced-model rollup tick sends fleet-scoped alert (1.941766ms)
+✔ emitDailyRollup default dedup marker is isolated by MISER_ROLLUP_DEDUP_FILE (5.650146ms)
+✔ rollup interval window is the first two UTC minutes after midnight (0.295998ms)
+✔ bloat hook fires with parsed usage after a 2xx response resolves (66.040833ms)
+✔ AC6e: a throwing bloat check is exception-isolated — warn logged, response unaffected (5.512813ms)
+✔ no guardDeps at all (legacy callers) → no hook, no crash (2.533701ms)
+✔ AC6d: G3-only guardDeps (no checkContextBloat key) → guard false, zero bloat calls (5.501853ms)
+✔ AC6b: no usage captured (JSON body without usage) → hook receives null usage (4.300074ms)
+✔ aborted/incomplete SSE stream → hook receives null usage (no fabricated signal) (1.583306ms)
+✔ non-2xx upstream → no usage recording and no bloat hook (1.232961ms)
+✔ routeRequest threads deps.guardDeps to the anthropic transport as the 8th arg (1.635787ms)
+✔ routeRequest without guardDeps stays backward-compatible (8th arg undefined) (0.778464ms)
+✔ v4 P1: /p/<project>/v1/messages attributes project and ignores query (4.299983ms)
+✔ v4 P1: encoded slash project bypass is rejected (0.604324ms)
+✔ v4 P1: malformed percent encoding is rejected (0.384569ms)
+✔ v4 P1: suffixed messages route is rejected (0.456991ms)
+✔ v4 P1: invalid project charset and empty project are rejected (0.749411ms)
+✔ v4 P1: existing /v1/messages and exact /api/miser routes are unchanged (0.61273ms)
+✔ AR17: the preload scrubs every /^MISER_ALERT_ROUTES/ key plus MISER_PKACHU_*, as a rule (78.411081ms)
+✔ AR17: package.json preloads the guard, so the scrub cannot be bypassed by running node --test directly (0.589367ms)
+✔ AR18: the network guard blocks off-host and the pkachu relay port, and allows ordinary loopback (264.564066ms)
+✔ AR18: MISER_TEST_ALLOW_NETWORK=1 overrides the guard (90.33622ms)
+✔ 200 rapid mutations trigger immediate flush at queue-depth threshold (198.955744ms)
+✔ 100 rapid mutations debounce to exactly one flush after five seconds (54.581741ms)
+✔ flushNow writes all pending records before simulated shutdown (17.257535ms)
+✔ load failure followed by flush does not overwrite existing stats file (18.194414ms)
+✔ load failure mutation drops are counted by label and warned once (15.745318ms)
+✔ mutation after initial flushNow quiescence is captured by a second flushNow (13.849075ms)
+✔ concurrent flushNow calls resolve without interleaved writes (10.263566ms)
+[miser/stats] ERROR flush error: rename once
+✔ flushNow retries a transient non-in-flight write failure before returning (11.610885ms)
+✔ six consecutive failures log critical and stop retrying (19.496743ms)
+[miser/stats] ERROR flush error: first fail
+✔ successful retry inside flushNow resets writeFailures to zero (11.64702ms)
+✔ flushNow drains mutation that arrives during in-flight write (17.77476ms)
+[miser/stats] ERROR flush error: transient in-flight rename failure
+✔ flushNow retries when shutdown observes an in-flight write failure (18.929602ms)
+✔ subscription week key straddles the Sunday 06:00 America/Chicago reset (56.451836ms)
+✔ subscription week key handles CST boundary at Sunday 12:00 UTC (3.609158ms)
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/stats] WARN America/Chicago timezone data unavailable (transient missing timezone data); using Sunday 12:00 UTC weekly fallback
+[miser/stats] WARN America/Chicago timezone data unavailable (permanent missing timezone data); using Sunday 12:00 UTC weekly fallback
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ usage before Sunday reset keeps the same subscription week after flush and reload (49.933943ms)
+✔ subscription week key handles DST transition Sundays with hard-coded UTC instants (4.617304ms)
+✔ subscription week key logs and uses explicit fallback when zone data is unavailable (1.685262ms)
+✔ subscription timezone probe recovers after a transient unsupported result (2.126145ms)
+✔ subscription timezone probe backs off after permanent unsupported results (1.618093ms)
+✔ weekly buckets accumulate current week-to-date and prior complete weeks (10.655323ms)
+✔ weekly retention caps prior complete weeks and prunes persisted snapshots (31.077577ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ daily stats with no meta derive recordingStartedAt and backfill weekly buckets from observed keys (27.160865ms)
+✔ legacy daily-only stats are backfilled non-authoritatively when no weekly bucket exists (5.459833ms)
+✔ load reconciliation persists missing-provenance classification without an explicit writer (15.842109ms)
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ load reconciliation persists legacy daily backfill without an explicit writer (17.972855ms)
+✔ legacy UTC daily-only boundary usage is never exposed as authoritative weekly data (11.080601ms)
+✔ weekly reconciliation preserves unprovenanced stored weekly counters but marks them non-authoritative (29.291428ms)
+✔ partial daily coverage does not overwrite an unprovenanced stored weekly bucket (37.802443ms)
+✔ legacy daily-only stats with no stored weekly bucket are non-authoritative (35.950498ms)
+✔ mixed stored-weekly and daily-only legacy data reconciles missing weeks per week (13.293035ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ mixed provenanced weekly and older daily-only legacy data backfills only missing older weeks (28.070557ms)
+✔ missing completed week after recording start is exposed non-authoritative (18.038389ms)
+✔ retained weeks after the recording-start cap are exposed non-authoritative (457.631656ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ legacy-only daily retention watermark is deleted without using it as recording boundary (36.89084ms)
+✔ clean successful load seals today and persists without explicit flushNow (13.209592ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ empty install startup seal writes the pinned simulated day and becomes durable (12.03196ms)
+✔ observation seal writes the simulated day, not the real wall-clock day (4.347895ms)
+✔ observation seal interval is unrefd (1.749839ms)
+✔ fully observed week with degraded persistence is non-authoritative (25.250754ms)
+✔ failed load does not write even after a retained mutation and flush attempt (2.303401ms)
+✔ derived recordingStartedAt is not lowered by a later older-day record (7.726151ms)
+✔ empty daily stats have missing daily observation coverage until a day is observed (5.644642ms)
+✔ getStats marks current week non-authoritative for empty state (5.461155ms)
+✔ getStats marks current week non-authoritative for recordingStartedAt null (5.038131ms)
+✔ getStats marks current week non-authoritative for recordingStartedAt invalid (12.762466ms)
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+✔ fresh install first mid-week write keeps recorded current week authoritative from a single captured clock (14.39921ms)
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+✔ recorded weekly provenance survives flush reload and reconcile (23.471927ms)
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ recordingStartedAt is write-once and older records still accumulate in recorded weekly bucket (20.512053ms)
+✔ sparse quiet-day gaps do not replace an unprovenanced stored weekly value (19.609954ms)
+✔ current unprovenanced stored week stays non-authoritative across a UTC-midnight rollover mid-read (8.887489ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model surplusModel; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/stats] ERROR stats migration/retention failed; preserving parsed daily stats: timezone probe failed unexpectedly
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ real-file-shape migration treats existing 2026-07-14 through 2026-07-28 keys as observed (40.751525ms)
+✔ weekly reconciliation preserves surplus stored projects and models from recorded weeks (42.933419ms)
+✔ valid stored weekly week with no daily backing is preserved but non-authoritative without provenance (9.345662ms)
+✔ loadStats migration failure marks preserved weekly data non-authoritative (16.346165ms)
+✔ clock-skewed record timestamps are rejected, counted, and logged once (5.105777ms)
+✔ budget and policy events are written to weekly buckets (7.638135ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ budget and policy events before Sunday reset keep event-time subscription week after reload (40.090217ms)
+✔ internal weekly buckets do not affect daily getStats windows (12.178509ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+✔ /api/miser/stats/trend ignores internal weekly buckets and keeps daily shape (23.522519ms)
+[miser/pricing] WARN unknown Anthropic model model; using fallback pricing
+[miser/stats] WARN clamping MISER_WEEKLY_STATS_MAX_WEEKS=9007199254740991 to 260
+[miser/stats] WARN clamping MISER_STATS_CLOCK_PAST_DAYS=9007199254740991 to 730
+[miser/stats] WARN clamping MISER_STATS_CLOCK_FUTURE_DAYS=9007199254740991 to 30
+✔ /api/miser/stats/trend intentionally ignores legacy malformed daily keys (9.047139ms)
+✔ stats clamps abusive weekly and clock env vars (1.176593ms)
+[miser/pricing] WARN unknown Anthropic model unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model unknown; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-legacy; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-legacy; using fallback pricing
+✔ recordStats persists across a simulated restart (71.739231ms)
+✔ getStats returns correct per-technique totals for N days (15.630834ms)
+✔ getStats supports project filter (17.229706ms)
+✔ getStats with malformed days throws 400 (6.547474ms)
+✔ getStats with days=0 throws 400 (7.051225ms)
+✔ getStats with days=-1 throws 400 (5.7128ms)
+✔ recordStats dedup-only increments only the dedup bucket (11.443824ms)
+✔ recordStats cacheHint-only increments only the cacheHint bucket (12.838402ms)
+✔ recordStats toolPrune-only increments only the toolPrune bucket (11.631616ms)
+✔ stats keep byte-removed and cache-billing counters separate (11.265648ms)
+✔ v4 M2: recordAnthropicUsage writes sparse provider/model usage and weighted equivalents (12.43222ms)
+✔ v4 M2: usage tree omits absent measurements instead of zero-filling (12.059972ms)
+✔ v4 M2: legacy total cache_creation_input_tokens records as cacheWrite1h when nested TTLs are absent (12.615765ms)
+✔ v4 M2: pure usage writes do not persist legacy technique zero buckets (35.733212ms)
+✔ v4 M2: context_management.applied_edits aggregate per project (12.002775ms)
+✔ Sprint B: recordBudgetBlock uses a single nowFn capture for day bucket AND firstBlockedAt (18.501755ms)
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+[miser/pricing] WARN unknown Anthropic model claude-sonnet-4; using fallback pricing
+✔ Sprint B: recordPolicyEvent increments drift/bloat under a mocked day and returns counts (14.133498ms)
+✔ Sprint B AC9c: guardrail-only project gets budget/policy nodes and NO legacy bucket fields (11.426211ms)
+✔ Sprint B AC9a/b: usage-only and contextManagement-only projects keep legacy buckets (baseline preserved) (12.930033ms)
+✔ Sprint B AC9d: a no-activity (empty) project bucket is absent from perProject (11.366316ms)
+✔ Sprint B §2.3: multi-day aggregation sums counts and keeps the EARLIEST firstBlockedAt (17.095425ms)
+✔ Sprint B: guardrail + usage project carries both node families (11.847803ms)
+✔ v4 M2: real pre-v4 stats fixture preserves daily data and backfills weekly usage-free buckets (55.572666ms)
+✔ zero-state when no events recorded (4.722046ms)
+✔ capFraction and deferBackground at 80% (AC8-A core) (0.393484ms)
+✔ below 80% → deferBackground=false, shouldAlert=false (0.430811ms)
+✔ single 429 triggers deferBackground/shouldAlert regardless of capFraction (AC8-B core) (0.262536ms)
+✔ 5h window pruning: successes older than 5h fall out of requestsIn5h (0.252183ms)
+✔ 5h window: events within window are counted (0.266417ms)
+✔ 7-day retention: events older than 7 days pruned from weeklyRequests (0.231164ms)
+✔ timeToLimitEstMs is null when cap5h is 0 (feature off) (0.290679ms)
+✔ timeToLimitEstMs is null when no successes (burn rate zero) (0.381183ms)
+✔ timeToLimitEstMs computed from formula: (cap5h - req5h) * WINDOW_5H / req5h (0.570498ms)
+✔ burnRatePerHour = requestsIn5h / 5 (0.368044ms)
+✔ feature off (cap5h=0): capFraction=0, deferBackground=false even with successes (0.307835ms)
+✔ weeklyCapFraction computed when weeklyCap > 0 (0.34419ms)
+✔ getStatus can be called multiple times without double-counting (0.317387ms)
+✔ AC1: valid allowlist with zero intersection returns original tools unchanged (2.660605ms)
+✔ AC1: zero allowlist intersection remains NO-OP even when rescues exist (0.425262ms)
+✔ AC2: tool named in history tool_use is rescued (3.64085ms)
+✔ AC3: Anthropic tool_choice name is rescued (0.390787ms)
+✔ AC3b: OpenAI function tool_choice name is rescued (0.406653ms)
+✔ AC4a: null allowlist is NO-OP (0.311892ms)
+✔ AC4b: empty allowlist is NO-OP (0.330294ms)
+✔ normal prune removes non-allowlisted tools (0.347421ms)
+✔ rescue plus prune keeps rescued tools outside the allowlist (0.483472ms)
+✔ top-level Anthropic system becomes a leading OpenAI system message (4.940832ms)
+✔ block-array system is flattened to text (0.449371ms)
+✔ text ordering is preserved across blocks and messages (1.669306ms)
+✔ tool_use / tool_result blocks are degraded to inline text (not structured) (0.763701ms)
+✔ empty / directive-only messages are dropped (never content:[]) (0.447569ms)
+✔ translated request CANNOT trigger the prior messages.0 error (0.681155ms)
+✔ validateOpenAIRequest rejects an array-content (Anthropic block) message (0.346066ms)
+✔ non-string object system.text is dropped, never emitted as content (0.352024ms)
+✔ string object system.text is accepted as the system turn (0.430393ms)
+✔ block-array system with a non-string block.text is skipped, not stringified (0.549164ms)
+✔ validateOpenAIRequest rejects a leaked anthropic-only key (0.243282ms)
+✔ top-level system becomes Responses `instructions` (2.9781ms)
+✔ messages become input items with typed content parts (0.398511ms)
+✔ empty / directive-only messages are dropped (no empty content parts) (0.36498ms)
+✔ tool blocks degrade to inline text (never structured) (0.646166ms)
+✔ store:false; stream forced true; NO max_output_tokens (backend rejects it) (0.382573ms)
+✔ stream is forced true even when client requests stream:false (0.322244ms)
+✔ validateResponsesRequest passes a clean request and rejects leaks (0.710468ms)
+✔ object-form system.text non-string is dropped, request stays valid (0.408256ms)
+✔ translateResponsesStream emits Anthropic events from Responses SSE (1.502814ms)
+✔ translateResponsesStream parses CRLF-framed SSE (0.7392ms)
+✔ translateResponsesStream parses CRLF split across chunk boundary (0.555551ms)
+✔ translateResponsesStream matches the real captured Responses event sequence (2.240845ms)
+✔ translateResponsesStream tolerates split frames across chunks (0.396078ms)
+✔ translateResponsesStream ends cleanly on response.failed (no hang) (0.334542ms)
+✔ translateResponsesStream ignores unknown events and malformed data (0.466082ms)
+✔ adds system message from string system field (3.219605ms)
+✔ adds system message from block array system field (0.297602ms)
+✔ object-form system {text} does not throw and yields a system turn (0.226603ms)
+✔ object-form system with non-string text is dropped, does not throw (0.337596ms)
+✔ non-array object message content does not throw (0.249507ms)
+✔ null block inside content array does not throw (0.300026ms)
+✔ circular tool_use input does not throw (0.320396ms)
+✔ passes string content through unchanged (0.254277ms)
+✔ flattens text content blocks to string (0.306785ms)
+✔ sets correct model, stream, and num_predict (0.354364ms)
+✔ defaults num_predict to 4096 when max_tokens absent (0.203655ms)
+✔ getDailyTrend returns sparse date/project measured traffic entries (42.474625ms)
+✔ trend project filter, days cap, and today-only behavior (5.49055ms)
+✔ /api/miser/stats/trend returns ok envelope and exact project filter (41.453454ms)
+✔ /api/miser/stats/trend mirrors stats authority contract on degraded persistence (3.650001ms)
+✔ v4 M1: SSE parser handles one JSON object split across chunks (3.312678ms)
+✔ v4 M1: SSE parser handles multiple events in one chunk (0.570965ms)
+✔ v4 M1: SSE parser handles multi-line data fields (2.314704ms)
+✔ v4 M1: aborted incomplete SSE stream records no missing axes and does not throw (0.613604ms)
+✔ v4 M1/C1: non-stream JSON usage and applied_edits are parsed (1.935361ms)
+✔ v4 M1: proxyAnthropicResponse keeps piping when the usage parser throws mid-stream (28.624513ms)
+ℹ tests 566
+ℹ suites 0
+ℹ pass 566
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1618.757883
