@@ -149,11 +149,28 @@ test('Fact B: metrics expose unpriced and routed-scope pace gauges without verdi
     },
   });
   assert.match(text, /miser_unpriced_requests_7d\{model="claude-test-unknown"\} 2/);
-  assert.match(text, /# HELP miser_routed_consumed_frac Miser-routed fraction of weekly cap; floor scope only/);
+  assert.match(text, /# HELP miser_routed_consumed_frac Miser-routed fraction of configured weekly cap/);
   assert.match(text, /miser_routed_consumed_frac 0\.25/);
   assert.match(text, /miser_routed_pace_delta -0\.1/);
   assert.match(text, /miser_limit_events_7d 1/);
   assert.doesNotMatch(text, /UNDER-PACE|OVER-PACE|NEAR-CAP|ON-PACE/);
+});
+
+test('Fact B: metrics omit estimated cap percentage gauges because range cannot render', () => {
+  const text = buildMetricsText({
+    usage: {},
+    pace: {
+      capSource: 'estimated',
+      weightedRoutedConsumed: 250,
+      routedConsumedFrac: 0.25,
+      routedPaceDelta: -0.1,
+      capRange: { low: 500, high: 1000 },
+    },
+  });
+  assert.match(text, /estimated denominators are omitted because Prometheus cannot render the required range marker/);
+  assert.doesNotMatch(text, /^miser_routed_consumed_frac /m);
+  assert.doesNotMatch(text, /^miser_routed_pace_delta /m);
+  assert.match(text, /^miser_routed_weighted_tokens_week_to_date 250$/m);
 });
 
 // ---- AC3: Prometheus compliance (comprehensive) -----------------------------

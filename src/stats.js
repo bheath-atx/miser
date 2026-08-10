@@ -1103,7 +1103,9 @@ function recordProviderLimitEvent(project, provider = 'anthropic', model = 'unkn
   if (!canRetainMutationAfterLoadFailure('limit_event')) return null;
   const day = dayKeyFromDate(now);
   const weekKey = subscriptionWeekKeyFromDate(now);
-  const currentWeekly = getSubscriptionWeeks(undefined, DEFAULT_WEIGHTS, now).currentWeekToDate;
+  const weekly = getSubscriptionWeeks(undefined, DEFAULT_WEIGHTS, now);
+  const currentWeekly = weekly.currentWeekToDate;
+  const pace = buildPaceBundle(weekly, now);
   const observed = {
     at: now.toISOString(),
     day,
@@ -1114,6 +1116,10 @@ function recordProviderLimitEvent(project, provider = 'anthropic', model = 'unkn
     status: event.status || event.statusCode || null,
     errorType: event.errorType || event.type || null,
     weightedConsumptionAtObservation: currentWeekly.weightedTokenEquivalents.total,
+    weeklyCapAtObservation: Number.isFinite(pace.weeklyCap) ? pace.weeklyCap : null,
+    capSourceAtObservation: pace.capSource || 'absent',
+    capRangeAtObservation: pace.capRange || null,
+    capUnavailableReasonAtObservation: pace.unavailableReason || null,
     raw: event.raw || null,
   };
   const root = getObservationContainer(_stats, LIMIT_EVENTS_KEY, true);
@@ -1664,6 +1670,14 @@ function estimateRangeFromAnchor(anchorNumerator, observedRange) {
   };
 }
 
+function hasFiniteCapRange(capRange) {
+  return !!(capRange
+    && Number.isFinite(capRange.low)
+    && Number.isFinite(capRange.high)
+    && capRange.low > 0
+    && capRange.high > 0);
+}
+
 function resolveEstimatedCap(cap, weekly) {
   if (!cap || cap.capSource !== 'estimated') return cap;
   const calibration = cap.calibration || {};
@@ -1722,6 +1736,8 @@ function buildPaceBundle(weekly, now, capWeekly = weekly) {
     reason = cap.mismatchReason || 'unit-mismatch';
   } else if (current.authoritative === false) {
     reason = 'numerator-not-authoritative';
+  } else if (cap.capSource === 'estimated' && !hasFiniteCapRange(cap.capRange)) {
+    reason = 'estimate-range-absent';
   } else if (Number.isFinite(cap.weeklyCap) && cap.weeklyCap > 0) {
     routedConsumedFrac = weightedRoutedConsumed / cap.weeklyCap;
     routedPaceDelta = elapsedFrac == null ? null : routedConsumedFrac - elapsedFrac;

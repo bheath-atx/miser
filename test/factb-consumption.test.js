@@ -145,6 +145,33 @@ test('Fact B: estimated cap derives from authoritative anchor week and observed 
   }
 });
 
+test('Fact B: estimated cap with missing range withholds routed percentage', async () => {
+  const statsFile = tmpFile('stats');
+  const capsFile = tmpFile('caps');
+  const prev = { stats: process.env.MISER_STATS_FILE, caps: process.env.MISER_WEEKLY_CAPS_FILE };
+  let stats;
+  try {
+    stats = freshStats(statsFile, capsFile);
+    const anchorInstant = new Date('2026-08-03T12:00:00.000Z');
+    const now = new Date('2026-08-09T12:00:00.000Z');
+    const anchorWeekStart = stats.__test.subscriptionWeekKeyFromDate(anchorInstant);
+    writeCalibration(capsFile, anchorWeekStart, 0.25, null);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-5', { input_tokens: 200 }, null, () => anchorInstant);
+    stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-sonnet-5', { input_tokens: 100 }, null, () => now);
+    stats.__test.setNowFnForTest(() => now);
+    await stats.flushNow();
+    const result = stats.getStats('7');
+    assert.equal(result.pace.capSource, 'estimated');
+    assert.equal(result.pace.weeklyCap, 800);
+    assert.equal(result.pace.capRange, null);
+    assert.equal(result.pace.routedConsumedFrac, null);
+    assert.equal(result.pace.routedPaceDelta, null);
+    assert.equal(result.pace.unavailableReason, 'estimate-range-absent');
+  } finally {
+    cleanup(stats, [statsFile, capsFile], prev);
+  }
+});
+
 test('Fact B: project-filtered stats derive estimated cap from shared unfiltered anchor', async () => {
   const statsFile = tmpFile('stats');
   const capsFile = tmpFile('caps');
@@ -249,13 +276,15 @@ test('Fact B: unknown model counter records once on response path and reads are 
   }
 });
 
-test('Fact B: provider limit event records and alerts without cap', async () => {
+test('Fact B: provider limit event records and alerts with concurrent cap', async () => {
   const statsFile = tmpFile('stats');
   const capsFile = tmpFile('caps');
   const prev = { stats: process.env.MISER_STATS_FILE, caps: process.env.MISER_WEEKLY_CAPS_FILE };
   let stats;
   try {
     stats = freshStats(statsFile, capsFile);
+    const methodId = stats.__test.MISER_METHOD_ID;
+    writeCap(capsFile, methodId, 1000);
     const prevAnthropicUrl = process.env.MISER_ANTHROPIC_URL;
     process.env.MISER_ANTHROPIC_URL = 'http://127.0.0.1:9';
     const routerPath = require.resolve('../src/router.js');
@@ -297,6 +326,7 @@ test('Fact B: provider limit event records and alerts without cap', async () => 
     assert.equal(result.limitEvents.length, 1);
     assert.equal(alerts[0].opts.scope, 'fleet');
     assert.equal(alerts[0].opts.kind, 'limit-event');
+    assert.match(alerts[0].text, /cap=1000 weighted routed tokens source=configured/);
   } finally {
     cleanup(stats, [statsFile, capsFile], prev);
   }

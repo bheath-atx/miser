@@ -186,14 +186,15 @@ function buildMetricsText(statsResult) {
   if (pace && Number.isFinite(pace.weightedRoutedConsumed)) {
     lines.push(`miser_routed_weighted_tokens_week_to_date ${pace.weightedRoutedConsumed}`);
   }
-  lines.push('# HELP miser_routed_consumed_frac Miser-routed fraction of weekly cap; floor scope only, not transcript-visible fleet consumption.');
+  const estimatedCap = pace && pace.capSource === 'estimated';
+  lines.push('# HELP miser_routed_consumed_frac Miser-routed fraction of configured weekly cap; estimated denominators are omitted because Prometheus cannot render the required range marker.');
   lines.push('# TYPE miser_routed_consumed_frac gauge');
-  if (pace && Number.isFinite(pace.routedConsumedFrac)) {
+  if (!estimatedCap && pace && Number.isFinite(pace.routedConsumedFrac)) {
     lines.push(`miser_routed_consumed_frac ${pace.routedConsumedFrac}`);
   }
-  lines.push('# HELP miser_routed_pace_delta Miser-routed consumed fraction minus elapsed week fraction; input only, no pace verdict.');
+  lines.push('# HELP miser_routed_pace_delta Miser-routed configured-cap consumed fraction minus elapsed week fraction; estimated denominators are omitted because Prometheus cannot render the required range marker.');
   lines.push('# TYPE miser_routed_pace_delta gauge');
-  if (pace && Number.isFinite(pace.routedPaceDelta)) {
+  if (!estimatedCap && pace && Number.isFinite(pace.routedPaceDelta)) {
     lines.push(`miser_routed_pace_delta ${pace.routedPaceDelta}`);
   }
   lines.push('# HELP miser_limit_events_7d Provider usage-limit events observed by miser in the last 7 days.');

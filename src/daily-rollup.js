@@ -104,6 +104,19 @@ function formatPercent(n) {
   return `${(n * 100).toFixed(1)}%`;
 }
 
+function formatEstimatedRange(pace) {
+  const range = pace && pace.capRange;
+  if (!range || !Number.isFinite(range.low) || !Number.isFinite(range.high) || range.low <= 0 || range.high <= 0) {
+    return null;
+  }
+  const weighted = pace.weightedRoutedConsumed;
+  if (!Number.isFinite(weighted)) return null;
+  const lowFrac = weighted / Math.max(range.low, range.high);
+  const highFrac = weighted / Math.min(range.low, range.high);
+  if (!Number.isFinite(lowFrac) || !Number.isFinite(highFrac)) return null;
+  return `${formatPercent(lowFrac)}-${formatPercent(highFrac)}`;
+}
+
 const PACE_DEFERRAL_LINE = 'fleet pace: NOT ALERTED (deferred by design — see PROPOSAL-FACTB §4.3.7); run weekly-pace.py for the current transcript-visible-fleet verdict';
 
 function buildPaceLines(pace) {
@@ -112,7 +125,10 @@ function buildPaceLines(pace) {
     ? pace.weightedRoutedConsumed
     : 0;
   let line = `week to date: ${formatWeighted(weighted)} weighted tokens across miser-routed traffic (a floor - unrouted panels not counted); transcript-visible fleet % of cap: see weekly-pace.py`;
-  if (pace && Number.isFinite(pace.routedConsumedFrac)) {
+  if (pace && Number.isFinite(pace.routedConsumedFrac) && pace.capSource === 'estimated') {
+    const range = formatEstimatedRange(pace);
+    if (range) line += `; miser-routed estimated ${formatPercent(pace.routedConsumedFrac)} of cap (range ${range})`;
+  } else if (pace && Number.isFinite(pace.routedConsumedFrac)) {
     line += `; miser-routed ${formatPercent(pace.routedConsumedFrac)} of cap`;
   } else if (pace && pace.unavailableReason) {
     line += `; miser-routed % unavailable: ${pace.unavailableReason}`;

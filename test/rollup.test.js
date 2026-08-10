@@ -163,6 +163,31 @@ test('Fact B: rollup renders a scoped miser-routed cap fraction only when suppli
   assert.doesNotMatch(text, /(^|[^-])% weekly/);
 });
 
+test('Fact B: rollup marks estimated cap fractions and renders the range', () => {
+  const text = buildRollupText({}, new Date('2026-07-23T00:00:30Z'), {
+    pace: {
+      capSource: 'estimated',
+      weightedRoutedConsumed: 100,
+      routedConsumedFrac: 0.125,
+      capRange: { low: 500, high: 1000 },
+    },
+  });
+  assert.match(text, /miser-routed estimated 12\.5% of cap \(range 10\.0%-20\.0%\)/);
+  assert.doesNotMatch(text, /miser-routed 12\.5% of cap(;|$)/);
+});
+
+test('Fact B: rollup withholds estimated cap fraction when range is absent', () => {
+  const text = buildRollupText({}, new Date('2026-07-23T00:00:30Z'), {
+    pace: {
+      capSource: 'estimated',
+      weightedRoutedConsumed: 100,
+      routedConsumedFrac: 0.125,
+      capRange: null,
+    },
+  });
+  assert.doesNotMatch(text, /12\.5% of cap/);
+});
+
 test('emitDailyRollup no-env no-ops and HTTP failure does not throw', async () => {
   const prev = { endpoint: process.env.MISER_PKACHU_ENDPOINT, token: process.env.MISER_PKACHU_TOKEN };
   const dedupFile = tmpFile('dedup');

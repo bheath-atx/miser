@@ -122,6 +122,18 @@ function _maybeAlertSubCap(guardDeps, nowMs) {
     .catch(() => {});
 }
 
+function limitEventCapText(observed) {
+  if (!observed) return 'cap=unknown';
+  if (Number.isFinite(observed.weeklyCapAtObservation)) {
+    const range = observed.capRangeAtObservation;
+    const rangeText = range && Number.isFinite(range.low) && Number.isFinite(range.high)
+      ? ` range=${Math.round(range.low)}-${Math.round(range.high)}`
+      : '';
+    return `cap=${Math.round(observed.weeklyCapAtObservation)} weighted routed tokens source=${observed.capSourceAtObservation || 'unknown'}${rangeText}`;
+  }
+  return `cap=unavailable(${observed.capUnavailableReasonAtObservation || observed.capSourceAtObservation || 'unknown'})`;
+}
+
 // ---------------------------------------------------------------------------
 // Failover chain (anthropic format):
 //
@@ -402,7 +414,7 @@ function forwardToAnthropic(messages, originalBody, incomingHeaders, res, projec
           if (guardDeps && guardDeps.sendAlert) {
             Promise.resolve()
               .then(() => guardDeps.sendAlert(
-                `miser provider limit event: anthropic ${upstream.statusCode} model=${originalBody.model || 'unknown'} project=${project || 'default'} consumed=${observed ? observed.weightedConsumptionAtObservation : 'unknown'} weighted routed tokens`,
+                `miser provider limit event: anthropic ${upstream.statusCode} model=${originalBody.model || 'unknown'} project=${project || 'default'} consumed=${observed ? observed.weightedConsumptionAtObservation : 'unknown'} weighted routed tokens ${limitEventCapText(observed)}`,
                 { scope: 'fleet', kind: 'limit-event' }))
               .catch(() => {});
           }
