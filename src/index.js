@@ -11,6 +11,7 @@ const { startDailyRollupInterval } = require('./daily-rollup.js');
 const { buildGuardDeps } = require('./budgets.js');
 const { wireCacheThrashDeps } = require('./cache-thrash.js');
 const { wireAlertDispatcher, resolveRoute, alertRoutingHealth } = require('./alert-routes.js');
+const { createStopgapWatchdog, startStopgapWatchdogInterval } = require('./stopgap-watchdog.js');
 const config = require('./config.js');
 const { validateStartupConfig } = config;
 
@@ -69,7 +70,26 @@ wireAlertDispatcher(config, guardDeps);
 // B2: wire cache-thrash detector into guardDeps (no-op when MIN_REQUESTS=0).
 wireCacheThrashDeps(config, guardDeps);
 
-const server = http.createServer(createProxy({ guardDeps }));
+let stopgapWatchdog = null;
+if (config.stopgapWatchdog && config.stopgapWatchdog.enabled) {
+  const stopgapOpts = {
+    stallMs: config.stopgapWatchdog.stallMs,
+    retryWaitMs: config.stopgapWatchdog.retryWaitMs,
+    maxAttempts: config.stopgapWatchdog.maxAttempts,
+    termdeck: {
+      baseUrl: config.stopgapWatchdog.termdeckBaseUrl,
+      token: config.stopgapWatchdog.termdeckToken,
+      tokenFile: config.stopgapWatchdog.termdeckTokenFile,
+    },
+  };
+  stopgapOpts['send' + 'Alert'] = guardDeps['send' + 'Alert'];
+  stopgapWatchdog = createStopgapWatchdog(stopgapOpts);
+  startStopgapWatchdogInterval(stopgapWatchdog, {
+    intervalMs: config.stopgapWatchdog.intervalMs,
+  });
+}
+
+const server = http.createServer(createProxy({ guardDeps, stopgapWatchdog }));
 startDailyRollupInterval(getRawStatsSnapshot, {
   getPace: () => getStats(undefined, undefined, config.weightedTokenWeights).pace,
   alertDispatcher: guardDeps['send' + 'Alert'],
@@ -98,6 +118,9 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log(`[miser] thrash-detector: ${config.cacheThrashMinRequests > 0
     ? `ON (warm after ${config.cacheThrashMinRequests} req, spike=${config.cacheThrashSpikeRatio}×, ring=${config.cacheThrashRingSize})`
     : 'OFF (MISER_CACHE_THRASH_MIN_REQUESTS=0)'}`);
+  console.log(`[miser] stopgap-watchdog: ${config.stopgapWatchdog && config.stopgapWatchdog.enabled
+    ? `ON (stall=${config.stopgapWatchdog.stallMs}ms retryWait=${config.stopgapWatchdog.retryWaitMs}ms maxAttempts=${config.stopgapWatchdog.maxAttempts} termdeck=${config.stopgapWatchdog.termdeckBaseUrl})`
+    : 'OFF (MISER_STOPGAP_WATCHDOG unset)'}`);
   const _ar = alertRoutingHealth(config);
   console.log(`[miser] alert routes: ${config.alertRoutes
     ? `${_ar.mapped.length} routed (${_ar.mapped.join(', ') || 'none'}); `

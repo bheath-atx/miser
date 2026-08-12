@@ -522,6 +522,7 @@ const ALERTING_FEATURES = [
   { module: 'cache-thrash.js',    enabled: c => (c.cacheThrashMinRequests || 0) > 0 },
   { module: 'poll-rewrite.js',    enabled: c => !!c.pollRewriteProjects
                                              && Object.keys(c.pollRewriteProjects).length > 0 },
+  { module: 'stopgap-watchdog.js', enabled: c => !!(c.stopgapWatchdog && c.stopgapWatchdog.enabled) },
 ];
 
 // ALLOWLIST of modules PERMITTED to name `sendAlert` without being a registered
