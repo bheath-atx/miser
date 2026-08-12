@@ -358,10 +358,11 @@ function createProxy(deps = {}) {
     }
 
     let project = 'default';
+    let originalBody = null;
     let c1Injected = false;
     try {
       const raw = await readBody(req);
-      const originalBody = JSON.parse(raw);
+      originalBody = JSON.parse(raw);
       project = route.project || headerProject(req.headers);
       const panel = route.panel || null;
       const format = route.format;
@@ -381,6 +382,15 @@ function createProxy(deps = {}) {
           console.warn('[miser] budget check error (fail-open):', e.message);
         }
         if (block) {
+          if (panel && deps.stopgapWatchdog) {
+            deps.stopgapWatchdog.recordProxyOutcome({
+              project,
+              panel,
+              originalBody,
+              statusCode: block.status,
+              headers: block.headers,
+            });
+          }
           res.writeHead(block.status, block.headers);
           res.end(JSON.stringify(block.body));
           return;
@@ -461,6 +471,15 @@ function createProxy(deps = {}) {
       // hoisted top-level `system` and any cache hint reach the wire on all legs.
       await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format,
         { ...deps, panel });
+      if (panel && deps.stopgapWatchdog) {
+        deps.stopgapWatchdog.recordProxyOutcome({
+          project,
+          panel,
+          originalBody,
+          statusCode: res.statusCode,
+          headers: res.headers,
+        });
+      }
       if (c1Injected && (res.statusCode < 200 || res.statusCode >= 300)) {
         console.warn(`[miser] c1-injected non-2xx project=${project} status=${res.statusCode}`);
       }
@@ -470,6 +489,15 @@ function createProxy(deps = {}) {
       updateContextBreaker(project, c1Injected, res.statusCode);
     } catch (err) {
       updateContextBreaker(project, c1Injected, undefined);
+      if (route.panel && deps.stopgapWatchdog) {
+        deps.stopgapWatchdog.recordProxyOutcome({
+          project,
+          panel: route.panel,
+          originalBody,
+          statusCode: err.statusCode,
+          error: err,
+        });
+      }
       console.error('[miser] error:', err.message);
       if (!res.headersSent) {
         json(res, 500, { error: { type: 'proxy_error', message: err.message } });

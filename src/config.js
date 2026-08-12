@@ -4,6 +4,7 @@ const { parseContextEditProjects } = require('./context-management.js');
 const { parseBudgets, parseBudgetGrace } = require('./budgets.js');
 const { parsePolicy } = require('./policy-watchdog.js');
 const { parseAlertRoutes, parseOpsRoute } = require('./alert-routes.js');
+const { parseStopgapWatchdogEnv } = require('./stopgap-watchdog.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
 // (which collides with the panel routing grammar). Exported for unit tests so
@@ -159,6 +160,9 @@ module.exports = {
   cacheThrashInputSpikeRatio: parseFloat(process.env.MISER_CACHE_THRASH_INPUT_SPIKE_RATIO ?? '2.0'),
   cacheThrashMinRequests:     parseInt(process.env.MISER_CACHE_THRASH_MIN_REQUESTS        || '10', 10),
   cacheThrashRingSize:        parseInt(process.env.MISER_CACHE_THRASH_RING_SIZE            || '50', 10),
+  // Stopgap stuck-panel watchdog. OFF unless explicitly enabled because it can
+  // inject into TermDeck panels.
+  stopgapWatchdog: parseStopgapWatchdogEnv(process.env),
   // Alert routing (PROPOSAL §2.2-§2.5). null is the exclusive OFF signal.
   // parseAlertRoutes is PURE: it reads only the env object handed to it, which
   // is what lets defaultConfigured participate in the degraded decision (§2.3
