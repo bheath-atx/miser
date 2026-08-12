@@ -35,9 +35,13 @@ function termdeckProjectName(miserProject, aliases = PROJECT_ALIASES) {
 
 function headerValue(headers, name) {
   if (!headers || typeof headers !== 'object') return undefined;
-  const direct = headers[name] || headers[name.toLowerCase()];
-  if (Array.isArray(direct)) return direct[0];
-  return direct;
+  const wanted = normalizeName(name);
+  for (const [key, value] of Object.entries(headers)) {
+    if (normalizeName(key) !== wanted) continue;
+    if (Array.isArray(value)) return value[0];
+    return value;
+  }
+  return undefined;
 }
 
 function isBudgetExhausted(headers) {
@@ -299,6 +303,11 @@ function createStopgapWatchdog(opts = {}) {
     console.warn(`[miser/stopgap] DETECTED project=${st.project} panel=${st.panel} ts=${nowIso(now)} attempt=${attemptNo} failures=${st.consecutiveRetryableFailures}`);
     try {
       const session = await client.findSession(st.project, st.panel);
+      const sendNow = nowFn();
+      if (!isStuck(st, sendNow)) {
+        console.warn(`[miser/stopgap] ABORT project=${st.project} panel=${st.panel} ts=${nowIso(sendNow)} attempt=${attemptNo} reason=recovered_before_send`);
+        return { attempted: false, reason: 'recovered_before_send', mode };
+      }
       if (!session) {
         console.warn(`[miser/stopgap] WARN no TermDeck session match project=${st.project} termdeckProject=${termdeckProjectName(st.project)} panel=${st.panel} attempt=${attemptNo}`);
         st.resubmitAttempts = attemptNo;

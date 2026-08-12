@@ -55,6 +55,10 @@ test('budget-exhausted 429 is excluded from retryable stuck detection', () => {
     statusCode: 429,
     headers: { 'x-miser-budget': 'exhausted' },
   }), false);
+  assert.equal(isRetryableFailure({
+    statusCode: 429,
+    headers: { 'X-Miser-Budget': 'exhausted' },
+  }), false);
 
   const watchdog = createStopgapWatchdog({ nowFn: () => 0, client: {} });
   watchdog.recordProxyOutcome({
@@ -71,6 +75,61 @@ test('budget-exhausted 429 is excluded from retryable stuck detection', () => {
     originalBody: requestBody(),
   });
   assert.equal(st.consecutiveRetryableFailures, 0);
+});
+
+test('resubmit aborts when panel recovers before TermDeck input send', async () => {
+  let now = 0;
+  const sent = [];
+  let watchdog;
+  const client = {
+    async findSession(project, panel) {
+      watchdog.recordProxyOutcome({
+        project,
+        panel,
+        statusCode: 200,
+        originalBody: requestBody('healthy replacement turn'),
+      });
+      return { id: 'sid-1', meta: { project, label: `${project}-${panel.toUpperCase()}` } };
+    },
+    async sendInput(sessionId, text) {
+      sent.push({ sessionId, text, at: now });
+      return { ok: true };
+    },
+  };
+  watchdog = createStopgapWatchdog({
+    nowFn: () => now,
+    stallMs: 180000,
+    retryWaitMs: 30000,
+    sleepFn: async () => {},
+    client,
+  });
+
+  watchdog.recordProxyOutcome({
+    project: 'pkachu',
+    panel: 'orch',
+    statusCode: 500,
+    originalBody: requestBody('please retry the original task'),
+  });
+  now = 1000;
+  watchdog.recordProxyOutcome({
+    project: 'pkachu',
+    panel: 'orch',
+    statusCode: 529,
+    originalBody: requestBody('please retry the original task'),
+  });
+
+  now = 181000;
+  const result = await watchdog.checkOnce();
+  assert.equal(result.length, 1);
+  assert.equal(result[0].attempted, false);
+  assert.equal(result[0].reason, 'recovered_before_send');
+  assert.equal(sent.length, 0);
+
+  const [st] = watchdog.snapshot();
+  assert.equal(st.consecutiveRetryableFailures, 0);
+  assert.equal(st.resubmitAttempts, 0);
+  assert.equal(st.lastResubmitTs, 0);
+  assert.equal(st.lastSuccessTs, 181000);
 });
 
 test('two retryable failures plus stall triggers bare CR, then original body after retry wait', async () => {
