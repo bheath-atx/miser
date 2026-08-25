@@ -219,7 +219,7 @@ test('AC11: cap-only (budgets=null, policy=null, codex5hCap=40) → ledger + sub
   assert.equal('policyConfig' in deps, false);
 });
 
-test('AC11: all three features OFF (codex5hCap=0) → empty deps, no spies called', () => {
+test('AC11: all guardrail features OFF (codex5hCap=0) → empty deps, no spies called', () => {
   const { budgets } = freshModules(tmpFile('ac11b'));
   let ledgerCalls = 0;
   let trackerCalls = 0;
@@ -234,6 +234,34 @@ test('AC11: all three features OFF (codex5hCap=0) → empty deps, no spies calle
   assert.deepEqual(deps, {});
   assert.equal(ledgerCalls, 0);
   assert.equal(trackerCalls, 0);
+});
+
+test('enforcement-only buildGuardDeps wires enforcement without budgets or policy', () => {
+  const { budgets } = freshModules(tmpFile('enforcement-only'));
+  let ledgerCalls = 0;
+  let stateCalls = 0;
+  const deps = budgets.buildGuardDeps(
+    {
+      budgets: null,
+      policy: null,
+      enforcement: { '*': { mode: 'observe' } },
+      codex5hCap: 0,
+      budgetGrace: [],
+    },
+    {
+      createLedger: () => { ledgerCalls += 1; return { fake: 'ledger' }; },
+      createEnforcementState: () => { stateCalls += 1; return { fake: 'state' }; },
+    },
+  );
+  assert.equal(ledgerCalls, 1);
+  assert.equal(stateCalls, 1);
+  assert.deepEqual(deps.enforcementConfig, { '*': { mode: 'observe' } });
+  assert.deepEqual(deps.enforcementState, { fake: 'state' });
+  assert.equal(typeof deps.checkEnforcement, 'function');
+  assert.equal(typeof deps.recordEnforcementUsage, 'function');
+  assert.equal(typeof deps.recordEnforcementEvent, 'function');
+  assert.equal('budgetsConfig' in deps, false);
+  assert.equal('policyConfig' in deps, false);
 });
 
 test('AC11: cap + budgets both active → both wired alongside each other', () => {

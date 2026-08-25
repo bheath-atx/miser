@@ -111,7 +111,7 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log(`[miser] ollama url: ${config.ollamaUrl}`);
   console.log(`[miser] fallback models: ${config.fallbackModels.join(', ')}`);
   console.log(`[miser] env: MISER_PRICING_JSON=${process.env.MISER_PRICING_JSON ? 'set' : 'unset'} MISER_PKACHU_TOKEN=${process.env.MISER_PKACHU_TOKEN ? 'set' : 'unset'} MISER_PKACHU_ENDPOINT=${process.env.MISER_PKACHU_ENDPOINT ? 'set' : 'unset'}`);
-  console.log(`[miser] guardrails: budgets ${config.budgets ? `ON (${Object.keys(config.budgets).length} project(s))` : 'OFF'}; policy watchdog ${config.policy ? `ON (${Object.keys(config.policy).length} project(s))` : 'OFF'}`);
+  console.log(`[miser] guardrails: budgets ${config.budgets ? `ON (${Object.keys(config.budgets).length} project(s))` : 'OFF'}; policy watchdog ${config.policy ? `ON (${Object.keys(config.policy).length} project(s))` : 'OFF'}; enforcement ${config.enforcement ? `ON (${Object.keys(config.enforcement).length} entr${Object.keys(config.enforcement).length === 1 ? 'y' : 'ies'})` : 'OFF'}`);
   console.log(`[miser] retry: max ${config.retryMaxAttempts} attempts, base ${config.retryBaseMs}ms jittered backoff`);
   console.log(`[miser] breaker: threshold=${config.breakerThreshold} reset=${config.breakerResetMs}ms per-upstream`);
   console.log(`[miser] sub-cap: codex 5h cap ${config.codex5hCap > 0 ? `${config.codex5hCap} req` : 'OFF'} weekly ${config.codexWeeklyCap > 0 ? `${config.codexWeeklyCap} req` : 'OFF'}`);

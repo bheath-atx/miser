@@ -266,6 +266,7 @@ test('Fact B: unknown model counter records once on response path and reads are 
     stats = freshStats(statsFile, capsFile);
     const now = new Date('2026-08-09T12:00:00.000Z');
     stats.recordAnthropicUsage('alpha', 'anthropic', 'claude-test-unknown', { input_tokens: 1 }, null, () => now);
+    stats.__test.setNowFnForTest(() => now);
     const first = stats.getStats('7');
     const second = stats.getStats('7');
     assert.equal(first.unpriced_models['claude-test-unknown']['2026-08-09'], 1);

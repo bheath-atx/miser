@@ -13,6 +13,7 @@ const {
 } = require('./stats.js');
 const { pruneTools } = require('./toolprune.js');
 const { checkBudget } = require('./budgets.js');
+const { checkEnforcement } = require('./enforcement.js');
 const { checkModelDrift } = require('./policy-watchdog.js');
 const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
@@ -246,6 +247,7 @@ function createProxy(deps = {}) {
         pendingWrites: getPendingWriteCount(),
         circuitBreakers: getBreakersState(),
         subscriptionCap: subCapStatus,
+        enforcement: gd && gd.enforcementState ? gd.enforcementState.snapshot() : null,
         alertRouting,
       });
       return;
@@ -443,6 +445,31 @@ function createProxy(deps = {}) {
       const compactHeaders = computeCompactHeaders(originalBody, projectFingerprints, { project, rawTokens, techniques });
       suppressCompactHeadersOnErrors(res);
       for (const [k, v] of Object.entries(compactHeaders)) res.setHeader(k, v);
+
+      if (guardDeps.enforcementConfig) {
+        let block = null;
+        try {
+          const check = guardDeps.checkEnforcement || checkEnforcement;
+          block = check(project, panel, originalBody, compactHeaders, rawTokens, guardDeps, req.headers);
+        } catch (e) {
+          console.warn('[miser] enforcement check error (fail-open):', e.message);
+        }
+        if (block) {
+          if (panel && deps.stopgapWatchdog) {
+            deps.stopgapWatchdog.recordProxyOutcome({
+              project,
+              panel,
+              originalBody,
+              statusCode: block.status,
+              headers: block.headers,
+              enforcement: block.enforcement,
+            });
+          }
+          res.writeHead(block.status, block.headers);
+          res.end(JSON.stringify(block.body));
+          return;
+        }
+      }
 
       const legacyStats = {
         inputTokensRemoved: savedTokens,

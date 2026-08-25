@@ -212,10 +212,11 @@ function buildGuardDeps(config, seams = {}) {
   const guardDeps = {};
   const budgets = config.budgets != null ? config.budgets : null;
   const policy  = config.policy  != null ? config.policy  : null;
+  const enforcement = config.enforcement != null ? config.enforcement : null;
   const cap5h   = config.codex5hCap || 0;
 
-  // Early return only when ALL three features are off.
-  if (budgets === null && policy === null && cap5h <= 0) return guardDeps;
+  // Early return only when all guardrail features are off.
+  if (budgets === null && policy === null && enforcement === null && cap5h <= 0) return guardDeps;
 
   // Ledger is required by any active guardrail (dedup + alert dispatch).
   const mkLedger = seams.createLedger || require('./alert-ledger.js').createLedger;
@@ -229,6 +230,14 @@ function buildGuardDeps(config, seams = {}) {
   if (policy !== null) {
     guardDeps.checkContextBloat = require('./policy-watchdog.js').checkContextBloat;
     guardDeps.policyConfig      = policy;
+  }
+  if (enforcement !== null) {
+    const enforcementMod = require('./enforcement.js');
+    guardDeps.enforcementConfig = enforcement;
+    guardDeps.enforcementState = (seams.createEnforcementState || enforcementMod.createEnforcementState)();
+    guardDeps.checkEnforcement = enforcementMod.checkEnforcement;
+    guardDeps.recordEnforcementUsage = enforcementMod.recordEnforcementUsage;
+    guardDeps.recordEnforcementEvent = require('./stats.js').recordEnforcementEvent;
   }
   if (cap5h > 0) {
     const mkTracker = seams.createSubCapTracker

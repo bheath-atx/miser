@@ -5,6 +5,7 @@ const { parseBudgets, parseBudgetGrace } = require('./budgets.js');
 const { parsePolicy } = require('./policy-watchdog.js');
 const { parseAlertRoutes, parseOpsRoute } = require('./alert-routes.js');
 const { parseStopgapWatchdogEnv } = require('./stopgap-watchdog.js');
+const { parseEnforcement } = require('./enforcement.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
 // (which collides with the panel routing grammar). Exported for unit tests so
@@ -15,6 +16,7 @@ function validateStartupConfig(cfg) {
     ['policy',              cfg.policy],
     ['contextEditProjects', cfg.contextEditProjects],
     ['toolAllowlists',      cfg.toolAllowlists],
+    ['enforcement',         cfg.enforcement],
     // MISER_ALERT_ROUTES inherits the '--' collision fatal from the shared
     // contract (§1.5) via this row — not re-implemented in alert-routes.js.
     ['alertRoutes',         cfg.alertRoutes && cfg.alertRoutes.entries],
@@ -22,6 +24,7 @@ function validateStartupConfig(cfg) {
   for (const [label, map] of maps) {
     if (!map || typeof map !== 'object') continue;
     for (const name of Object.keys(map)) {
+      if (label === 'enforcement' && name === '*') continue;
       if (name.includes('--')) {
         throw new Error(
           `[miser] fatal: ${label} config contains project name "${name}" ` +
@@ -83,6 +86,7 @@ module.exports = {
   budgets: parseBudgets(process.env.MISER_BUDGETS || ''),
   budgetGrace: parseBudgetGrace(process.env.MISER_BUDGET_GRACE || ''),
   policy: parsePolicy(process.env.MISER_POLICY || ''),
+  enforcement: parseEnforcement(process.env.MISER_ENFORCEMENT || ''),
   weightedTokenWeights: {
     input: parseFloat(process.env.MISER_WEIGHT_INPUT ?? '1.0'),
     cacheRead: parseFloat(process.env.MISER_WEIGHT_CACHE_READ ?? '0.1'),
