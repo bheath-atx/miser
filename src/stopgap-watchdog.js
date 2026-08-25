@@ -48,8 +48,14 @@ function isBudgetExhausted(headers) {
   return normalizeName(headerValue(headers, 'x-miser-budget')) === 'exhausted';
 }
 
+function hasMiserEnforcement(headers) {
+  return !!headerValue(headers, 'x-miser-enforcement');
+}
+
 function isRetryableFailure(outcome = {}) {
   if (isBudgetExhausted(outcome.headers)) return false;
+  if (hasMiserEnforcement(outcome.headers)) return false;
+  if (outcome.enforcement && outcome.enforcement.reason) return false;
   const statusCode = Number(outcome.statusCode || (outcome.error && outcome.error.statusCode));
   if (statusCode === 429) return true;
   if (statusCode >= 500 && statusCode <= 599) return true;
@@ -390,6 +396,7 @@ module.exports = {
   PROJECT_ALIASES,
   createStopgapWatchdog,
   createTermdeckClient,
+  hasMiserEnforcement,
   isRetryableFailure,
   lastUserText,
   parseStopgapWatchdogEnv,

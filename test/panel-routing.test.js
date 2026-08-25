@@ -214,6 +214,16 @@ test('AC20: budgetGrace list with double-dash name throws', () => {
   );
 });
 
+test('AC20: enforcement wildcard is allowed but double-dash project override throws', () => {
+  assert.doesNotThrow(() =>
+    validateStartupConfig({ enforcement: { '*': { mode: 'observe' }, pkachu: { mode: 'alert' } } }),
+  );
+  assert.throws(
+    () => validateStartupConfig({ enforcement: { 'a--b': { mode: 'block' } } }),
+    (err) => err.message.includes('--') && err.message.includes('panel routing'),
+  );
+});
+
 test('AC20: valid project names in budgets do not throw', () => {
   assert.doesNotThrow(() =>
     validateStartupConfig({ budgets: { pkachu: { dailyUSD: 5 } } }),

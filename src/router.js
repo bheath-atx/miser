@@ -358,6 +358,13 @@ function proxyAnthropicResponse(upstream, res, originalBody, project, panel, sav
       if (panel) {
         recordPanelUsage(project, panel, (parsed && parsed.usage) || {});
       }
+      if (panel && guardDeps && guardDeps.enforcementConfig && guardDeps.recordEnforcementUsage && parsed && parsed.usage) {
+        try {
+          guardDeps.recordEnforcementUsage(project, panel, parsed.usage, config.weightedTokenWeights, guardDeps);
+        } catch (e) {
+          console.warn('[miser] enforcement usage record error:', e.message);
+        }
+      }
       if (guardDeps && guardDeps.checkContextBloat) {
         Promise.resolve()
           .then(() => guardDeps.checkContextBloat(project, model, parsed && parsed.usage, guardDeps))

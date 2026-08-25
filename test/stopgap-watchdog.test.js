@@ -4,6 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   createStopgapWatchdog,
+  hasMiserEnforcement,
   isRetryableFailure,
   sessionMatchesPanel,
   termdeckProjectName,
@@ -72,6 +73,36 @@ test('budget-exhausted 429 is excluded from retryable stuck detection', () => {
     panel: 'orch',
     statusCode: 429,
     headers: { 'x-miser-budget': 'exhausted' },
+    originalBody: requestBody(),
+  });
+  assert.equal(st.consecutiveRetryableFailures, 0);
+});
+
+test('miser enforcement responses are excluded from retryable stuck detection', () => {
+  assert.equal(hasMiserEnforcement({ 'x-miser-enforcement': 'poll-budget' }), true);
+  assert.equal(hasMiserEnforcement({ 'X-Miser-Enforcement': 'orch-control-budget' }), true);
+  assert.equal(isRetryableFailure({
+    statusCode: 429,
+    headers: { 'x-miser-enforcement': 'poll-budget' },
+  }), false);
+  assert.equal(isRetryableFailure({
+    statusCode: 403,
+    enforcement: { reason: 'orch-control-budget' },
+  }), false);
+
+  const watchdog = createStopgapWatchdog({ nowFn: () => 0, client: {} });
+  watchdog.recordProxyOutcome({
+    project: 'nacho-orch',
+    panel: 'sprints',
+    statusCode: 529,
+    originalBody: requestBody(),
+  });
+  const st = watchdog.recordProxyOutcome({
+    project: 'nacho-orch',
+    panel: 'sprints',
+    statusCode: 429,
+    headers: { 'x-miser-enforcement': 'poll-budget' },
+    enforcement: { reason: 'poll-budget' },
     originalBody: requestBody(),
   });
   assert.equal(st.consecutiveRetryableFailures, 0);

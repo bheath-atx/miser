@@ -45,7 +45,7 @@ function startEcho(handler) {
 // their pricing dep) must be re-required in the same sweep as stats.
 function freshProxy(anthropicUrl, extraEnv = {}) {
   for (const k of Object.keys(require.cache)) {
-    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage|budgets|policy-watchdog|pricing|daily-rollup|alert-ledger)\.js$/.test(k.replace(/\\/g, '/'))) {
+    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage|budgets|policy-watchdog|pricing|daily-rollup|alert-ledger|enforcement)\.js$/.test(k.replace(/\\/g, '/'))) {
       delete require.cache[k];
     }
   }
@@ -438,6 +438,49 @@ test('v4 C1: default env performs zero mutation', async () => {
     assert.equal(res.statusCode, 200);
     assert.ok(!('context_management' in echo.captured[0].body));
     assert.ok(!echo.captured[0].headers['anthropic-beta']);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('enforcement canary blocks repeated NACHO ORCH-control poll before upstream', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok', usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_ENFORCEMENT: JSON.stringify({
+      '*': { mode: 'observe' },
+      'nacho-orch': {
+        mode: 'throttle',
+        poll: { maxLikelyPollsPer10Min: 1, maxLikelyPollsPerHour: 6, minIdlePollSpacingSec: 600 },
+      },
+    }),
+  });
+  try {
+    const config = require('../src/config.js');
+    const { buildGuardDeps } = require('../src/budgets.js');
+    const guardDeps = buildGuardDeps(config, { createLedger: () => ({ shouldSend: () => false, markSent: () => {} }) });
+    const handler = createProxy({ guardDeps });
+    const run = (req, res) => {
+      const done = res.whenDone();
+      handler(req, res);
+      return done;
+    };
+    const body = {
+      model: 'claude',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: 'curl http://127.0.0.1:20128/api/miser/stats' }],
+    };
+    const first = fakeRes();
+    await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', body, {}), first);
+    assert.equal(first.statusCode, 200);
+    assert.equal(echo.captured.length, 1);
+
+    const second = fakeRes();
+    await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', body, {}), second);
+    assert.equal(second.statusCode, 429);
+    assert.equal(second.headers['x-miser-enforcement'], 'poll-budget');
+    assert.equal(second.headers['x-miser-enforcement-mode'], 'throttle');
+    assert.match(second.body(), /poll budget exceeded/);
+    assert.equal(echo.captured.length, 1);
   } finally {
     echo.server.close(); restoreEnv();
   }

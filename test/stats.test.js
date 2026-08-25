@@ -359,6 +359,26 @@ test('Sprint B: recordPolicyEvent increments drift/bloat under a mocked day and 
   }
 });
 
+test('Miser enforcement events aggregate sparsely by decision and reason', () => {
+  const file = tmpStatsFile('enforcement');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    const now = new Date(`${dayKey()}T12:00:00.000Z`);
+    stats.recordEnforcementEvent('nacho-orch', { decision: 'would_block', reason: 'poll-budget' }, () => now);
+    stats.recordEnforcementEvent('nacho-orch', { decision: 'block', reason: 'poll-budget' }, () => now);
+    stats.recordEnforcementEvent('nacho-orch', { decision: 'block', reason: 'orch-control-budget' }, () => now);
+    const node = stats.getStats('1').perProject['nacho-orch'].enforcement;
+    assert.equal(node.wouldBlockCount, 1);
+    assert.equal(node.blockedCount, 2);
+    assert.equal(node.alertCount, 0);
+    assert.deepEqual(node.byReason, { 'poll-budget': 2, 'orch-control-budget': 1 });
+    assert.ok(!('dedup' in stats.getStats('1').perProject['nacho-orch']));
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
 test('Sprint B AC9c: guardrail-only project gets budget/policy nodes and NO legacy bucket fields', () => {
   const file = tmpStatsFile('ac9c');
   const prevEnv = process.env.MISER_STATS_FILE;

@@ -836,6 +836,25 @@ function addGuardrailFields(target, source) {
       target.policy.contextBloatCount += bloat;
     }
   }
+  if (source.enforcement && typeof source.enforcement === 'object') {
+    const blocked = source.enforcement.blockedCount || 0;
+    const would = source.enforcement.wouldBlockCount || 0;
+    const alerts = source.enforcement.alertCount || 0;
+    if (blocked > 0 || would > 0 || alerts > 0) {
+      if (!target.enforcement) target.enforcement = { blockedCount: 0, wouldBlockCount: 0, alertCount: 0, byReason: {} };
+      target.enforcement.blockedCount += blocked;
+      target.enforcement.wouldBlockCount += would;
+      target.enforcement.alertCount += alerts;
+      const first = source.enforcement.firstEventAt;
+      if (typeof first === 'string' && (!target.enforcement.firstEventAt || first < target.enforcement.firstEventAt)) {
+        target.enforcement.firstEventAt = first;
+      }
+      for (const [reason, count] of Object.entries(source.enforcement.byReason || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.enforcement.byReason[reason] = (target.enforcement.byReason[reason] || 0) + count;
+      }
+    }
+  }
 }
 
 function buildWeeklyFromDaily(statsObj) {
@@ -1200,6 +1219,31 @@ function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn
   return { modelDriftCount: bucket.policy.modelDriftCount, contextBloatCount: bucket.policy.contextBloatCount };
 }
 
+function recordEnforcementEvent(project, event = {}, nowFn = defaultNow) {
+  const decision = event.decision;
+  if (!['block', 'would_block', 'alert'].includes(decision)) return { blockedCount: 0, wouldBlockCount: 0, alertCount: 0 };
+  const now = nowFn();
+  if (!isAllowedRecordTime(now, 'enforcement')) return { blockedCount: 0, wouldBlockCount: 0, alertCount: 0 };
+  if (!canRetainMutationAfterLoadFailure('enforcement')) return { blockedCount: 0, wouldBlockCount: 0, alertCount: 0 };
+  const dayKey = dayKeyFromDate(now);
+  const weekKey = subscriptionWeekKeyFromDate(now);
+  const bucket = ensureGuardrailBucket(project, dayKey);
+  const weekBucket = ensureWeeklyGuardrailBucket(project, weekKey);
+  function apply(target) {
+    if (!target.enforcement) target.enforcement = { blockedCount: 0, wouldBlockCount: 0, alertCount: 0, byReason: {} };
+    if (decision === 'block') target.enforcement.blockedCount += 1;
+    if (decision === 'would_block') target.enforcement.wouldBlockCount += 1;
+    if (decision === 'alert') target.enforcement.alertCount += 1;
+    const reason = event.reason || 'unknown';
+    target.enforcement.byReason[reason] = (target.enforcement.byReason[reason] || 0) + 1;
+    if (!target.enforcement.firstEventAt) target.enforcement.firstEventAt = now.toISOString();
+  }
+  apply(bucket);
+  apply(weekBucket);
+  scheduleFlush();
+  return bucket.enforcement;
+}
+
 function applyOptimizerStats(bucket, opts = {}) {
   const {
     inputTokensRemoved = 0,
@@ -1399,7 +1443,10 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
     || projData.dedup || projData.cacheHint || projData.toolPrune);
   // Guardrail activity only counts when counts are positive (sparse contract §2.3).
   const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
-    || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0));
+    || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0))
+    || (projData.enforcement && ((projData.enforcement.blockedCount || 0) > 0
+      || (projData.enforcement.wouldBlockCount || 0) > 0
+      || (projData.enforcement.alertCount || 0) > 0));
   if (!hasLegacy && !hasGuardrail) return;
   if (!perProject[proj]) perProject[proj] = {};
   const target = perProject[proj];
@@ -1446,6 +1493,25 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
       if (!target.policy) target.policy = { modelDriftCount: 0, contextBloatCount: 0 };
       target.policy.modelDriftCount += dc;
       target.policy.contextBloatCount += bc;
+    }
+  }
+  if (projData.enforcement && typeof projData.enforcement === 'object') {
+    const blocked = projData.enforcement.blockedCount || 0;
+    const would = projData.enforcement.wouldBlockCount || 0;
+    const alerts = projData.enforcement.alertCount || 0;
+    if (blocked > 0 || would > 0 || alerts > 0) {
+      if (!target.enforcement) target.enforcement = { blockedCount: 0, wouldBlockCount: 0, alertCount: 0, byReason: {} };
+      target.enforcement.blockedCount += blocked;
+      target.enforcement.wouldBlockCount += would;
+      target.enforcement.alertCount += alerts;
+      const first = projData.enforcement.firstEventAt;
+      if (typeof first === 'string' && (!target.enforcement.firstEventAt || first < target.enforcement.firstEventAt)) {
+        target.enforcement.firstEventAt = first;
+      }
+      for (const [reason, count] of Object.entries(projData.enforcement.byReason || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.enforcement.byReason[reason] = (target.enforcement.byReason[reason] || 0) + count;
+      }
     }
   }
 }
@@ -1939,6 +2005,7 @@ module.exports = {
   recordStats,
   recordAnthropicUsage,
   recordBudgetBlock,
+  recordEnforcementEvent,
   recordPolicyEvent,
   recordProviderLimitEvent,
   getStats,
