@@ -45,66 +45,129 @@ function translateToOllama(messages, originalBody, model) {
 
 // Translate Ollama NDJSON stream → Anthropic SSE format.
 // Claude Code expects the Anthropic event shape; this bridges the gap.
-function translateOllamaStream(ollamaStream, res, model) {
+function translateOllamaStream(ollamaStream, res, model, opts = {}) {
   const messageId = `msg_miser_${Date.now().toString(36)}`;
   let buffer = '';
   let started = false;
+  let stopped = false;
+  let sawValidLine = false;
+  let sawText = false;
+  let sawError = false;
+  let outputTokens = 0;
+  const headers = opts.headers || {};
+  const emptyText = opts.emptyText || 'miser: local fallback returned an empty response; stand down and retry after provider recovery.';
 
   function sse(event, data) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
+  function ensureStarted() {
+    if (started) return;
+    started = true;
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        ...headers,
+      });
+    }
+    sse('message_start', {
+      type: 'message_start',
+      message: {
+        id: messageId, type: 'message', role: 'assistant',
+        model, content: [], stop_reason: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+    sse('content_block_start', {
+      type: 'content_block_start', index: 0,
+      content_block: { type: 'text', text: '' },
+    });
+  }
+
+  function finish(textIfEmpty = '') {
+    if (stopped) return;
+    stopped = true;
+    ensureStarted();
+    if (!sawText && textIfEmpty) {
+      sawText = true;
+      sse('content_block_delta', {
+        type: 'content_block_delta', index: 0,
+        delta: { type: 'text_delta', text: textIfEmpty },
+      });
+    }
+    sse('content_block_stop', { type: 'content_block_stop', index: 0 });
+    sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: outputTokens },
+    });
+    sse('message_stop', { type: 'message_stop' });
+    if (!res.writableEnded) res.end();
+  }
+
   ollamaStream.setEncoding('utf8');
 
-  ollamaStream.on('data', chunk => {
-    buffer += chunk;
-    const lines = buffer.split('\n');
-    buffer = lines.pop();
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let parsed;
-      try { parsed = JSON.parse(line); } catch { continue; }
-
-      if (!started) {
-        started = true;
-        sse('message_start', {
-          type: 'message_start',
-          message: {
-            id: messageId, type: 'message', role: 'assistant',
-            model, content: [], stop_reason: null,
-            usage: { input_tokens: parsed.prompt_eval_count || 0, output_tokens: 0 },
-          },
-        });
-        sse('content_block_start', {
-          type: 'content_block_start', index: 0,
-          content_block: { type: 'text', text: '' },
-        });
+  return new Promise((resolve, reject) => {
+    function handleParsed(parsed) {
+      sawValidLine = true;
+      if (parsed && parsed.error) {
+        sawError = true;
+        finish(`miser: local fallback error: ${String(parsed.error)}`);
+        resolve({ ok: false, sawValidLine, sawText, sawError, outputTokens });
+        return;
       }
+      ensureStarted();
 
-      const text = parsed.message?.content || '';
+      const text = parsed && parsed.message && parsed.message.content ? parsed.message.content : '';
       if (text) {
+        sawText = true;
         sse('content_block_delta', {
           type: 'content_block_delta', index: 0,
           delta: { type: 'text_delta', text },
         });
       }
 
-      if (parsed.done) {
-        sse('content_block_stop', { type: 'content_block_stop', index: 0 });
-        sse('message_delta', {
-          type: 'message_delta',
-          delta: { stop_reason: 'end_turn', stop_sequence: null },
-          usage: { output_tokens: parsed.eval_count || 0 },
-        });
-        sse('message_stop', { type: 'message_stop' });
-        if (!res.writableEnded) res.end();
+      if (parsed && parsed.done) {
+        outputTokens = parsed.eval_count || 0;
+        const hadText = sawText;
+        finish(hadText ? '' : emptyText);
+        resolve({ ok: !sawError && sawValidLine && hadText, sawValidLine, sawText: hadText, sawError, outputTokens });
       }
     }
-  });
 
-  ollamaStream.on('end', () => {
-    if (!res.writableEnded) res.end();
+    ollamaStream.on('data', chunk => {
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (stopped || !line.trim()) continue;
+        let parsed;
+        try { parsed = JSON.parse(line); } catch { continue; }
+        handleParsed(parsed);
+      }
+    });
+
+    ollamaStream.on('end', () => {
+      if (!stopped) {
+        if (buffer.trim()) {
+          try { handleParsed(JSON.parse(buffer)); } catch (_) {}
+        }
+      }
+      if (!stopped) {
+        finish(sawValidLine ? 'miser: local fallback stream ended before completion; stand down and retry after provider recovery.' : emptyText);
+        resolve({ ok: false, sawValidLine, sawText, sawError, outputTokens });
+      }
+    });
+
+    ollamaStream.on('error', (err) => {
+      if (started) {
+        finish(`miser: local fallback stream error: ${err.message}`);
+        resolve({ ok: false, sawValidLine, sawText, sawError: true, outputTokens });
+        return;
+      }
+      reject(err);
+    });
   });
 }
 
