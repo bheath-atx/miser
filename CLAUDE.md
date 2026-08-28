@@ -20,6 +20,14 @@ Detailed mechanics live in `~/.claude/runbooks/codex-gate.md`; read that runbook
 
 Miser-ORCH is not a lane watcher. Use Claude for policy judgment, architecture, routing, risk calls, and compact Brad-facing synthesis. Do not use Claude as the repeated poller for Codex lanes, GitHub/CI state, TermDeck panels, Miser health/stats, service logs, or its own context/turn count.
 
+Sprint boundary: Miser-ORCH is the dispatcher/coordinator, not the sprint architect or builder. When
+Brad asks to create, scope, start, or run a sprint, read only the minimum authority files needed to
+route it, create/assemble a compact dispatch artifact, spawn fresh `:3200` Claude architect lanes for
+ambiguous proposal/architecture work when needed, spawn fresh `:3200` Codex lanes for mechanical
+build/test/sweep/audit work, then read compact results per global R16 (80 lines / 4KB; no raw task output) and coordinate. Do not author `PROPOSAL.md`,
+architecture docs, implementation plans, code, tests, audit reports, PRs, or repo-wide investigations
+in-place unless Brad explicitly says "ORCH may do this in-place."
+
 For external verification, use scripts/Codex/artifacts:
 - Run probes outside Claude where practical.
 - Write raw output to a file under the active sprint directory or `/tmp`.
