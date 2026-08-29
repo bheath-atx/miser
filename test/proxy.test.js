@@ -443,7 +443,7 @@ test('v4 C1: default env performs zero mutation', async () => {
   }
 });
 
-test('enforcement canary blocks repeated NACHO ORCH-control poll before upstream', async () => {
+test('enforcement canary warns before blocking repeated NACHO ORCH-control poll upstream', async () => {
   const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok', usage: { input_tokens: 1 } } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {
     MISER_ENFORCEMENT: JSON.stringify({
@@ -472,7 +472,9 @@ test('enforcement canary blocks repeated NACHO ORCH-control poll before upstream
     const first = fakeRes();
     await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', body, {}), first);
     assert.equal(first.statusCode, 200);
-    assert.equal(echo.captured.length, 1);
+    assert.equal(first.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
+    assert.match(first.body(), /poll budget edge/);
+    assert.equal(echo.captured.length, 0);
 
     const second = fakeRes();
     await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', body, {}), second);
@@ -480,7 +482,46 @@ test('enforcement canary blocks repeated NACHO ORCH-control poll before upstream
     assert.equal(second.headers['x-miser-enforcement'], 'poll-budget');
     assert.equal(second.headers['x-miser-enforcement-mode'], 'throttle');
     assert.match(second.body(), /poll budget exceeded/);
-    assert.equal(echo.captured.length, 1);
+    assert.equal(echo.captured.length, 0);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('enforcement warning honors Anthropic streaming requests with SSE', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok', usage: { input_tokens: 1 } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_ENFORCEMENT: JSON.stringify({
+      '*': { mode: 'observe' },
+      'nacho-orch': {
+        mode: 'throttle',
+        poll: { maxLikelyPollsPer10Min: 1, maxLikelyPollsPerHour: 6, minIdlePollSpacingSec: 600 },
+      },
+    }),
+  });
+  try {
+    const config = require('../src/config.js');
+    const { buildGuardDeps } = require('../src/budgets.js');
+    const guardDeps = buildGuardDeps(config, { createLedger: () => ({ shouldSend: () => false, markSent: () => {} }) });
+    const handler = createProxy({ guardDeps });
+    const res = fakeRes();
+    const done = res.whenDone();
+    handler(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', {
+      model: 'claude',
+      max_tokens: 50,
+      stream: true,
+      messages: [{ role: 'user', content: 'curl http://127.0.0.1:20128/api/miser/stats' }],
+    }, {}), res);
+    await done;
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
+    assert.equal(res.headers['content-type'], 'text/event-stream');
+    assert.match(res.body(), /event: message_start/);
+    assert.match(res.body(), /event: content_block_delta/);
+    assert.match(res.body(), /poll budget edge/);
+    assert.match(res.body(), /event: message_stop/);
+    assert.equal(echo.captured.length, 0);
   } finally {
     echo.server.close(); restoreEnv();
   }

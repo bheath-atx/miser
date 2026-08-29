@@ -64,6 +64,17 @@ test('real forwardToCodex rejects on 500 without writing headers', async () => {
   });
 });
 
+test('real forwardToCodex rejects 200 non-SSE before writing headers', async () => {
+  await withCodexUpstream(200, '{"error":"not an event stream"}', async () => {
+    const res = makeRes();
+    await assert.rejects(
+      () => forwardToCodex(RESPONSES_REQ, BEARER, res, 'proj', 0),
+      (e) => e.statusCode === 502 && e.retryable === true && /non-SSE/.test(e.message),
+    );
+    assert.equal(res.headersSent, false);
+  });
+});
+
 test('real forwardToCodex sends subscription Bearer + codex headers, never OPENAI_API_KEY', async () => {
   const seen = {};
   const { srv, port } = await new Promise((resolve) => {

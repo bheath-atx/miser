@@ -2,7 +2,9 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { translateToOllama } = require('../src/translate.js');
+const { Readable } = require('node:stream');
+const { translateToOllama, translateOllamaStream } = require('../src/translate.js');
+const { makeRes } = require('./_harness.js');
 
 test('adds system message from string system field', () => {
   const result = translateToOllama([], { system: 'Be helpful.', max_tokens: 256 }, 'qwen2.5-coder:14b');
@@ -71,4 +73,54 @@ test('sets correct model, stream, and num_predict', () => {
 test('defaults num_predict to 4096 when max_tokens absent', () => {
   const result = translateToOllama([], {}, 'qwen2.5:3b');
   assert.equal(result.options.num_predict, 4096);
+});
+
+test('empty Ollama stream produces a complete Anthropic SSE message, not empty 200', async () => {
+  const res = makeRes();
+  const result = await translateOllamaStream(Readable.from([]), res, 'qwen', {
+    headers: { 'x-miser-provider': 'ollama' },
+    emptyText: 'miser: local fallback returned an empty response',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['content-type'], 'text/event-stream');
+  assert.equal(res.headers['x-miser-provider'], 'ollama');
+  assert.match(res.body(), /event: message_start/);
+  assert.match(res.body(), /miser: local fallback returned an empty response/);
+  assert.match(res.body(), /event: message_stop/);
+});
+
+test('Ollama stream that starts but never sends done is completed cleanly', async () => {
+  const res = makeRes();
+  const line = `${JSON.stringify({ message: { content: 'partial text' } })}\n`;
+  const result = await translateOllamaStream(Readable.from([line]), res, 'qwen', {
+    headers: { 'x-miser-provider': 'ollama' },
+  });
+  assert.equal(result.ok, false);
+  assert.match(res.body(), /partial text/);
+  assert.match(res.body(), /event: content_block_stop/);
+  assert.match(res.body(), /event: message_stop/);
+});
+
+test('Ollama error JSON produces a complete Anthropic SSE message', async () => {
+  const res = makeRes();
+  const line = `${JSON.stringify({ error: 'model exploded' })}\n`;
+  const result = await translateOllamaStream(Readable.from([line]), res, 'qwen', {
+    headers: { 'x-miser-provider': 'ollama' },
+  });
+  assert.equal(result.ok, false);
+  assert.match(res.body(), /miser: local fallback error: model exploded/);
+  assert.match(res.body(), /event: message_stop/);
+});
+
+test('Ollama done with no text emits controlled empty-response message', async () => {
+  const res = makeRes();
+  const line = `${JSON.stringify({ done: true, eval_count: 0 })}\n`;
+  const result = await translateOllamaStream(Readable.from([line]), res, 'qwen', {
+    headers: { 'x-miser-provider': 'ollama' },
+    emptyText: 'miser: empty done',
+  });
+  assert.equal(result.ok, false);
+  assert.match(res.body(), /miser: empty done/);
+  assert.match(res.body(), /event: message_stop/);
 });

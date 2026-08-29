@@ -134,6 +134,152 @@ function limitEventCapText(observed) {
   return `cap=unavailable(${observed.capUnavailableReasonAtObservation || observed.capSourceAtObservation || 'unknown'})`;
 }
 
+function wantsAnthropicStream(body) {
+  return !!(body && body.stream === true);
+}
+
+function anthropicSseFrame(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function localAnthropicMessage(model, text) {
+  return {
+    id: `miser_local_${Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    model: model || 'miser-local',
+    content: [{ type: 'text', text }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: 0,
+    },
+  };
+}
+
+function writeLocalAnthropicMessage(res, originalBody, text, extraHeaders = {}) {
+  const body = localAnthropicMessage((originalBody && originalBody.model) || 'miser-local', text);
+  const headers = {
+    'x-miser-provider': 'local',
+    'x-miser-enforcement': 'tool-sensitive-fallback-veto',
+    ...extraHeaders,
+  };
+
+  if (!wantsAnthropicStream(originalBody)) {
+    res.writeHead(200, { ...headers, 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+    return;
+  }
+
+  res.writeHead(200, { ...headers, 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+  res.write(anthropicSseFrame('message_start', {
+    type: 'message_start',
+    message: {
+      id: body.id,
+      type: 'message',
+      role: 'assistant',
+      model: body.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: body.usage,
+    },
+  }));
+  res.write(anthropicSseFrame('content_block_start', {
+    type: 'content_block_start',
+    index: 0,
+    content_block: { type: 'text', text: '' },
+  }));
+  if (text) {
+    res.write(anthropicSseFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text },
+    }));
+  }
+  res.write(anthropicSseFrame('content_block_stop', { type: 'content_block_stop', index: 0 }));
+  res.write(anthropicSseFrame('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn', stop_sequence: null },
+    usage: { output_tokens: 0 },
+  }));
+  res.write(anthropicSseFrame('message_stop', { type: 'message_stop' }));
+  res.end();
+}
+
+function textOnlyContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map(block => {
+      if (!block || typeof block !== 'object') return '';
+      if (block.type === 'text' && typeof block.text === 'string') return block.text;
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function latestRealUserText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || msg.role !== 'user') continue;
+    const text = textOnlyContent(msg.content);
+    if (text.trim()) return text;
+  }
+  return '';
+}
+
+function contentHasToolBlock(content) {
+  return Array.isArray(content) && content.some(block =>
+    block && (block.type === 'tool_use' || block.type === 'tool_result'));
+}
+
+function forcedToolChoice(body) {
+  const choice = body && body.tool_choice;
+  if (choice == null) return false;
+  if (typeof choice === 'string') return !['auto', 'none'].includes(choice.toLowerCase());
+  if (typeof choice === 'object') {
+    const type = String(choice.type || '').toLowerCase();
+    if (!type) return true;
+    return !['auto', 'none'].includes(type);
+  }
+  return true;
+}
+
+function isDeliveryRepairText(text) {
+  const s = String(text || '').toLowerCase();
+  if (!s) return false;
+  return /stop[-_ ]?hook/.test(s)
+    || s.includes('stop_hook_active')
+    || s.includes('use the bash tool')
+    || s.includes('do not print curl')
+    || s.includes('send it now')
+    || s.includes('ok:true')
+    || s.includes('"ok":true')
+    || /\/v1\/orch(?:-[^\s"'`]+|\/[^\s"'`]+)\/reply/.test(s);
+}
+
+function isToolSensitiveFallback(messages, originalBody) {
+  const last = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
+  return !!(
+    (last && contentHasToolBlock(last.content))
+    || forcedToolChoice(originalBody)
+    || isDeliveryRepairText(latestRealUserText(messages || []))
+  );
+}
+
+function writeToolSensitiveFallbackVeto(res, originalBody, project, panel) {
+  const where = panel ? `${project || 'default'}--${panel}` : (project || 'default');
+  const text = `miser: upstream unavailable; local fallback disabled for tool-sensitive Claude Code turn in ${where} because fallback cannot preserve tool_use. Stand down and retry after provider recovery or restart a fresh panel.`;
+  writeLocalAnthropicMessage(res, originalBody, text, {
+    'x-miser-enforcement-reason': 'upstream-unavailable-tool-sensitive',
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Failover chain (anthropic format):
 //
@@ -222,6 +368,12 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     console.log('[miser] Anthropic breaker OPEN — skipping to Codex');
   }
 
+  if (isToolSensitiveFallback(messages, originalBody)) {
+    console.log(`[miser] tool-sensitive fallback veto project=${project || 'default'} panel=${panel || ''}`);
+    writeToolSensitiveFallbackVeto(res, originalBody, project, panel);
+    return;
+  }
+
   // --- Leg 2: Codex via subscription OAuth ---------------------------------
   if (safeAcquire(breakers.codex)) {
     try {
@@ -283,19 +435,29 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   // --- Leg 3: hard-capped Ollama ------------------------------------------
   if (safeAcquire(breakers.ollama)) {
     try {
-      await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
-      safeRecord(breakers.ollama, 'recordSuccess');
+      const result = await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
+      if (result && result.ok === false) {
+        safeRecord(breakers.ollama, 'recordFailure');
+      } else {
+        safeRecord(breakers.ollama, 'recordSuccess');
+      }
     } catch (err) {
       incrementLegError('ollama');
       // Only retryable errors (connect-errors, transport failures) count against the breaker.
       if (err.retryable) safeRecord(breakers.ollama, 'recordFailure');
+      if (!res.headersSent) {
+        writeLocalAnthropicMessage(res, originalBody,
+          `miser: local fallback unavailable (${err.statusCode || err.message}); stand down and retry after provider recovery.`,
+          { 'x-miser-enforcement-reason': 'ollama-unavailable' });
+        return;
+      }
       throw err;
     }
   } else {
     incrementLegError('ollama');
-    const err = new Error('miser: all upstreams unavailable (ollama breaker OPEN)');
-    err.statusCode = 503;
-    throw err;
+    writeLocalAnthropicMessage(res, originalBody,
+      'miser: all upstreams unavailable and local fallback breaker is open; stand down and retry after provider recovery.',
+      { 'x-miser-enforcement-reason': 'ollama-breaker-open' });
   }
 }
 
@@ -535,6 +697,15 @@ function forwardToCodex(codexReq, bearer, res, project, savedTokens) {
         reject(err);
         return;
       }
+      const contentType = upstream.headers['content-type'] || '';
+      if (isResponses && !/^text\/event-stream\b/i.test(contentType)) {
+        const err = new Error(`codex 2xx non-SSE response (${contentType || 'missing content-type'})`);
+        err.statusCode = 502;
+        err.retryable = true;
+        upstream.resume();
+        reject(err);
+        return;
+      }
       res.writeHead(200, {
         'content-type': 'text/event-stream',
         'x-miser-provider': 'codex',
@@ -578,15 +749,27 @@ function forwardToOllama(messages, originalBody, res, project, savedTokens, opts
     };
 
     const req = transport.request(options, (upstream) => {
-      res.writeHead(200, {
+      if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
+        upstream.resume();
+        writeLocalAnthropicMessage(res, originalBody,
+          `miser: local fallback unavailable (ollama ${upstream.statusCode}); stand down and retry after provider recovery.`,
+          { 'x-miser-enforcement-reason': 'ollama-non-2xx' });
+        resolve({ ok: false, statusCode: upstream.statusCode });
+        return;
+      }
+      const headers = {
         'content-type': 'text/event-stream',
         'x-miser-provider': 'ollama',
         'x-miser-model': model,
         'x-miser-saved-tokens': String(savedTokens),
-      });
-      translateOllamaStream(upstream, res, model);
-      upstream.on('end', () => { recordUsage(project, 'ollama', model); resolve(); });
-      upstream.on('error', (e) => { teardownResponse(res, e); reject(e); });
+      };
+      translateOllamaStream(upstream, res, model, {
+        headers,
+        emptyText: 'miser: local fallback returned an empty response; stand down and retry after provider recovery.',
+      }).then((result) => {
+        if (result && result.ok) recordUsage(project, 'ollama', model);
+        resolve(result);
+      }).catch(reject);
     });
 
     req.on('error', (err) => { err.retryable = true; reject(err); });
@@ -612,6 +795,8 @@ module.exports = {
     safeRecord,
     retryWithBackoff,
     _maybeAlertSubCap,
+    isToolSensitiveFallback,
+    writeLocalAnthropicMessage,
   },
   _buildCappedOllamaBody: (messages, originalBody, cap) =>
     hardCapOllamaBody(translateToOllama(messages, originalBody, config.fallbackModels[0]), cap),

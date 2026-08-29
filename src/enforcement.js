@@ -328,13 +328,28 @@ function createEnforcementState(opts = {}) {
     return sessions.get(key);
   }
 
+  function resetControlLoop(project, panel) {
+    const st = get(project, panel);
+    st.likelyPollAt = [];
+    st.controlAt = [];
+    st.totalRequests = 0;
+    st.likelyPollRequests = 0;
+    st.controlTurns = 0;
+    st.postCapHandoffTurns = 0;
+    st.inboundBradReplyTurns = 0;
+    return st;
+  }
+
   function recordRequest(project, panel, classification) {
     const now = nowMs();
     const st = get(project, panel);
     pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
     pruneTimes(st.controlAt, now - 60 * 60 * 1000);
+    if (!classification.isControl) {
+      resetControlLoop(project, panel);
+    }
     st.totalRequests += 1;
-    if (classification.pollClass === 'likely') {
+    if (classification.pollClass === 'likely' && classification.isControl) {
       st.likelyPollRequests += 1;
       st.likelyPollAt.push(now);
     }
@@ -371,7 +386,7 @@ function createEnforcementState(opts = {}) {
     };
   }
 
-  return { get, recordRequest, recordUsage, recordDecision, snapshot };
+  return { get, resetControlLoop, recordRequest, recordUsage, recordDecision, snapshot };
 }
 
 const defaultState = createEnforcementState();
@@ -453,6 +468,33 @@ function buildEnforcementResponse(reason, mode, message, retryAfter = null) {
   };
 }
 
+function buildWarningResponse(reason, mode, message, model = 'miser-enforcement-warning') {
+  return {
+    status: 200,
+    headers: {
+      'content-type': 'application/json',
+      'x-miser-enforcement-warning': reason,
+      'x-miser-enforcement-mode': mode,
+    },
+    body: {
+      id: `miser_warning_${Date.now()}`,
+      type: 'message',
+      role: 'assistant',
+      model: model || 'miser-enforcement-warning',
+      content: [{ type: 'text', text: message }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: {
+        input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 0,
+      },
+    },
+    enforcement: { reason, mode, status: 200, warning: true },
+  };
+}
+
 function modeDecision(mode) {
   if (mode === 'observe') return 'would_block';
   if (mode === 'alert') return 'alert';
@@ -475,6 +517,23 @@ function maybeBlock(project, panel, policy, classification, state, guardDeps, re
   }
   if (decision !== 'block') return null;
   return buildEnforcementResponse(reason, mode, message, retryAfter);
+}
+
+function maybeWarn(project, panel, policy, classification, state, guardDeps, reason, message, model) {
+  const mode = policy.mode || 'observe';
+  if (!['throttle', 'block'].includes(mode)) return null;
+  const event = state.recordDecision(project, panel, {
+    decision: 'alert',
+    reason,
+    mode,
+    controlClasses: classification.controlClasses,
+    pollClass: classification.pollClass,
+    assistantTurns: classification.assistantTurns,
+  });
+  if (guardDeps.recordEnforcementEvent) {
+    guardDeps.recordEnforcementEvent(project, event, guardDeps.nowFn || (() => new Date()));
+  }
+  return buildWarningResponse(reason, mode, message, model);
 }
 
 function pollCounts(st, now) {
@@ -510,12 +569,20 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
 
   if (classification.pollClass === 'likely' && canaryPollThrottleApplies(project, classification)) {
     const counts = pollCounts(st, now);
+    const tenMinLimit = policy.poll.maxLikelyPollsPer10Min || DEFAULT_POLICY.poll.maxLikelyPollsPer10Min;
+    const hourLimit = policy.poll.maxLikelyPollsPerHour || DEFAULT_POLICY.poll.maxLikelyPollsPerHour;
     if (counts.tenMin > (policy.poll.maxLikelyPollsPer10Min || DEFAULT_POLICY.poll.maxLikelyPollsPer10Min)
         || counts.hour > (policy.poll.maxLikelyPollsPerHour || DEFAULT_POLICY.poll.maxLikelyPollsPerHour)) {
       return maybeBlock(project, panel, policy, classification, state, guardDeps,
         'poll-budget',
         'miser: poll budget exceeded; use a zero-LLM watcher artifact before polling again',
         policy.poll.minIdlePollSpacingSec || 600);
+    }
+    if (counts.tenMin >= tenMinLimit || counts.hour >= hourLimit) {
+      return maybeWarn(project, panel, policy, classification, state, guardDeps,
+        'poll-budget-edge',
+        'miser warning: this session is at the poll budget edge; the next similar nonzero-LLM poll/control turn will be blocked. Stop now and use a zero-LLM watcher artifact, or send a real non-poll work command to reset the poll counter.',
+        body && body.model);
     }
   }
 

@@ -154,6 +154,88 @@ test('Anthropic 429 → Codex 502 (retryable 5xx) → fails over to Ollama after
   assert.equal(res.headers['x-miser-provider'], 'ollama');
 });
 
+test('tool-sensitive fallback veto: last tool_result skips Codex and Ollama with local non-retry response', async () => {
+  const calls = [];
+  const toolMsgs = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'date' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] },
+  ];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(toolMsgs, { model: 'claude', max_tokens: 100, messages: toolMsgs }, {}, res, 'pkachu', 0, 'anthropic', deps);
+  assert.deepEqual(calls.map(c => c.name), ['anthropic']);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.equal(res.headers['x-miser-enforcement'], 'tool-sensitive-fallback-veto');
+  assert.match(res.body(), /^{"id":"miser_local_.*"content":\[\{"type":"text","text":"miser:/);
+});
+
+test('tool-sensitive fallback veto: Stop-hook repair text skips Codex and Ollama', async () => {
+  const calls = [];
+  const msgs = [{ role: 'user', content: 'Stop hook blocked: Use the Bash tool now. Do not print curl in markdown. Confirm ok:true for /v1/orch-pkachu/reply.' }];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs, stream: true }, {}, res, 'pkachu', 0, 'anthropic', deps);
+  assert.deepEqual(calls.map(c => c.name), ['anthropic']);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['content-type'], 'text/event-stream');
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.match(res.body(), /event: message_stop/);
+  assert.match(res.body(), /miser: upstream unavailable/);
+});
+
+test('tool-sensitive fallback veto: forced tool_choice skips Codex and Ollama', async () => {
+  const calls = [];
+  const msgs = [{ role: 'user', content: 'run the selected tool' }];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs, tool_choice: { type: 'tool', name: 'Bash' } }, {}, res, 'proj', 0, 'anthropic', deps);
+  assert.deepEqual(calls.map(c => c.name), ['anthropic']);
+  assert.equal(res.headers['x-miser-provider'], 'local');
+});
+
+test('bare tools array alone is not tool-sensitive: ordinary chat still reaches Ollama fallback', async () => {
+  const calls = [];
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: failTransport('codex', calls, 429),
+      ollama: successTransport('ollama', calls),
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs, tools: [{ name: 'Bash' }], tool_choice: { type: 'auto' } }, {}, res, 'proj', 0, 'anthropic', deps);
+  assert.deepEqual(calls.map(c => c.name), ['anthropic', 'codex', 'ollama']);
+  assert.equal(res.headers['x-miser-provider'], 'ollama');
+});
+
 test('Codex leg receives a validated Responses request + the subscription bearer', async () => {
   const captured = {};
   const calls = [];
@@ -525,7 +607,7 @@ test('AC5-B: Codex breaker OPEN skips Codex transport (B1), routes to Ollama (M1
 });
 
 // AC5-C: Ollama breaker OPEN → surfaces 503 to client; Ollama transport never called
-test('AC5-C: Ollama breaker OPEN surfaces 503 error; Ollama transport never called', async () => {
+test('AC5-C: Ollama breaker OPEN surfaces local non-retry response; Ollama transport never called', async () => {
   const ollamaBreaker = createBreaker('ac5-ollama', { threshold: 3 });
   ollamaBreaker.recordFailure(); ollamaBreaker.recordFailure(); ollamaBreaker.recordFailure();
   assert.equal(ollamaBreaker.getState().state, 'OPEN');
@@ -543,12 +625,10 @@ test('AC5-C: Ollama breaker OPEN surfaces 503 error; Ollama transport never call
     retryOpts: fastRetry,
   };
   const res = makeRes();
-  await assert.rejects(
-    () => routeRequest(ANTH_MSGS, ANTH_BODY, {}, res, 'proj', 0, 'anthropic', deps),
-    (err) => {
-      assert.equal(err.statusCode, 503);
-      return true;
-    },
-  );
+  await routeRequest(ANTH_MSGS, ANTH_BODY, {}, res, 'proj', 0, 'anthropic', deps);
   assert.ok(!calls.some(c => c.name === 'ollama'), 'Ollama transport must NOT be called when breaker OPEN');
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.equal(res.headers['x-miser-enforcement-reason'], 'ollama-breaker-open');
+  assert.match(res.body(), /miser: all upstreams unavailable/);
 });

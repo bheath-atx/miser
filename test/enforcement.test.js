@@ -72,7 +72,7 @@ test('controlClass catches measured NACHO control-loop patterns', () => {
   }
 });
 
-test('nacho-orch canary blocks repeated likely ORCH-control poll in throttle mode', () => {
+test('nacho-orch canary warns at poll edge before blocking in throttle mode', () => {
   let nowMs = Date.parse('2026-08-25T12:00:00.000Z');
   const state = createEnforcementState({ nowMs: () => nowMs });
   const config = parseEnforcement(JSON.stringify({
@@ -81,12 +81,57 @@ test('nacho-orch canary blocks repeated likely ORCH-control poll in throttle mod
   }));
   const deps = guard(config, state, () => new Date(nowMs));
   const body = bodyFor('curl http://127.0.0.1:20128/api/miser/stats');
-  assert.equal(checkEnforcement('nacho-orch', 'sprints', body, { 'x-miser-poll-class': 'likely' }, 100, deps), null);
+  const warn = checkEnforcement('nacho-orch', 'sprints', body, { 'x-miser-poll-class': 'likely' }, 100, deps);
+  assert.equal(warn.status, 200);
+  assert.equal(warn.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
+  assert.match(warn.body.content[0].text, /poll budget edge/);
   nowMs += 1000;
   const block = checkEnforcement('nacho-orch', 'sprints', body, { 'x-miser-poll-class': 'likely' }, 100, deps);
   assert.equal(block.status, 429);
   assert.equal(block.headers['x-miser-enforcement'], 'poll-budget');
   assert.equal(block.headers['retry-after'], '600');
+});
+
+test('non-control work turn resets the likely-poll strike window', () => {
+  let nowMs = Date.parse('2026-08-25T12:00:00.000Z');
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = parseEnforcement(JSON.stringify({
+    '*': { mode: 'observe' },
+    'nacho-orch': { mode: 'throttle', poll: { maxLikelyPollsPer10Min: 1, minIdlePollSpacingSec: 600 } },
+  }));
+  const deps = guard(config, state, () => new Date(nowMs));
+  const poll = bodyFor('curl http://127.0.0.1:20128/api/miser/stats');
+  const work = bodyFor('please make the requested boot prompt wording change');
+
+  assert.equal(checkEnforcement('nacho-orch', 'sprints', poll, { 'x-miser-poll-class': 'likely' }, 100, deps).status, 200);
+  nowMs += 1000;
+  assert.equal(checkEnforcement('nacho-orch', 'sprints', work, { 'x-miser-poll-class': 'likely' }, 100, deps), null);
+  nowMs += 1000;
+  const warnAgain = checkEnforcement('nacho-orch', 'sprints', poll, { 'x-miser-poll-class': 'likely' }, 100, deps);
+  assert.equal(warnAgain.status, 200);
+  assert.equal(warnAgain.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
+});
+
+test('non-control work turn resets even after a hard poll-budget block', () => {
+  let nowMs = Date.parse('2026-08-25T12:00:00.000Z');
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = parseEnforcement(JSON.stringify({
+    '*': { mode: 'observe' },
+    'nacho-orch': { mode: 'throttle', poll: { maxLikelyPollsPer10Min: 1, minIdlePollSpacingSec: 600 } },
+  }));
+  const deps = guard(config, state, () => new Date(nowMs));
+  const poll = bodyFor('curl http://127.0.0.1:20128/api/miser/stats');
+  const work = bodyFor('please answer Brad and stop polling');
+
+  assert.equal(checkEnforcement('nacho-orch', 'sprints', poll, { 'x-miser-poll-class': 'likely' }, 100, deps).status, 200);
+  nowMs += 1000;
+  assert.equal(checkEnforcement('nacho-orch', 'sprints', poll, { 'x-miser-poll-class': 'likely' }, 100, deps).status, 429);
+  nowMs += 1000;
+  assert.equal(checkEnforcement('nacho-orch', 'sprints', work, { 'x-miser-poll-class': 'likely' }, 100, deps), null);
+  nowMs += 1000;
+  const warnAgain = checkEnforcement('nacho-orch', 'sprints', poll, { 'x-miser-poll-class': 'likely' }, 100, deps);
+  assert.equal(warnAgain.status, 200);
+  assert.equal(warnAgain.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
 });
 
 test('non-NACHO projects do not live-block pollClass during canary even in throttle', () => {
