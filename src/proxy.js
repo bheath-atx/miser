@@ -439,6 +439,15 @@ function createProxy(deps = {}) {
 
     if (route.kind === 'watch_refresh') {
       try {
+        if (config.watch && config.watch.enabled === false) {
+          json(res, 503, {
+            ok: false,
+            status: 'disabled',
+            disabled: true,
+            error: { type: 'watch_disabled', message: 'miser watcher disabled by MISER_WATCH_ENABLED' },
+          });
+          return;
+        }
         const raw = await readBody(req);
         let parsed = {};
         if (raw.trim()) parsed = JSON.parse(raw);

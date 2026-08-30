@@ -14,6 +14,10 @@ function usage() {
 
 async function main(argv) {
   const watcher = createWatcher(config.watch || {});
+  if (watcher.enabled === false) {
+    console.error('[miser-watchd] watcher disabled by MISER_WATCH_ENABLED');
+    return;
+  }
   const probes = watcher.listProbes();
   if (probes.length === 0) {
     console.error('[miser-watchd] no probes configured; set MISER_WATCH_PROBES');

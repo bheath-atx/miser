@@ -62,6 +62,33 @@ test('watch config env registry overrides configured file registry', () => {
   assert.deepEqual(cfg.probes.map(p => p.id), ['fresh']);
 });
 
+test('MISER_WATCH_ENABLED=off parses as disabled', () => {
+  const cfg = parseWatchConfig({
+    MISER_WATCH_ENABLED: 'off',
+    MISER_WATCH_PROBES: JSON.stringify({ ci: { command: 'echo should-not-run' } }),
+  });
+  assert.equal(cfg.enabled, false);
+  assert.deepEqual(cfg.probes.map(p => p.id), ['ci']);
+});
+
+test('disabled watcher lists no runnable probes and refresh does not execute commands', async () => {
+  let runs = 0;
+  const watcher = createWatcher({
+    enabled: false,
+    probes: [{ id: 'ci', command: 'echo should-not-run' }],
+    runCommand: async () => {
+      runs += 1;
+      return { status: 'ok', exit_code: 0, signal: null, error: null, output: 'bad', duration_ms: 1 };
+    },
+  });
+  assert.equal(watcher.enabled, false);
+  assert.deepEqual(watcher.listProbes(), []);
+  const result = await watcher.refreshProbe('ci');
+  assert.equal(result.status, 'disabled');
+  assert.equal(result.disabled, true);
+  assert.equal(runs, 0);
+});
+
 test('artifact freshness reports missing, fresh, and stale states', async () => {
   let now = Date.parse('2026-08-30T12:00:00.000Z');
   const dir = tmpWatchDir('freshness');
@@ -85,6 +112,22 @@ test('artifact freshness reports missing, fresh, and stale states', async () => 
   assert.equal(watcher.freshness('probe').state, 'fresh');
   now += 11_000;
   assert.equal(watcher.freshness('probe').state, 'stale');
+});
+
+test('enabled watcher lists and refreshes configured probes normally', async () => {
+  let runs = 0;
+  const watcher = createWatcher({
+    probes: [{ id: 'ci', command: 'echo ok', ttl_s: 90, timeout_s: 5 }],
+    runCommand: async () => {
+      runs += 1;
+      return { status: 'ok', exit_code: 0, signal: null, error: null, output: 'ok', duration_ms: 1 };
+    },
+  });
+  assert.equal(watcher.enabled, true);
+  assert.deepEqual(watcher.listProbes().map(p => p.id), ['ci']);
+  const result = await watcher.refreshProbe('ci');
+  assert.equal(result.status, 'ok');
+  assert.equal(runs, 1);
 });
 
 test('refresh writes JSON, raw, and compact artifacts with verdict-first compact output', async () => {

@@ -391,6 +391,38 @@ test('/api/miser/watch/refresh runs a configured watcher probe on demand', async
   }
 });
 
+test('/api/miser/watch/refresh returns disabled without calling injected watcher when disabled', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_WATCH_ENABLED: 'off',
+    MISER_WATCH_PROBES: JSON.stringify({ ci: { command: 'echo should-not-run', ttl_s: 90, timeout_s: 5 } }),
+  });
+  try {
+    let calls = 0;
+    const watcher = {
+      async refreshProbe() {
+        calls += 1;
+        throw new Error('disabled endpoint must not call watcher');
+      },
+    };
+    const handler = createProxy({ watcher });
+    const res = fakeRes();
+    const done = res.whenDone();
+    handler(fakeReq('POST', '/api/miser/watch/refresh?id=ci', null, {}), res);
+    await done;
+
+    const payload = JSON.parse(res.body());
+    assert.equal(calls, 0);
+    assert.equal(res.statusCode, 503);
+    assert.equal(payload.status, 'disabled');
+    assert.equal(payload.disabled, true);
+    assert.equal(payload.error.type, 'watch_disabled');
+    assert.equal(echo.captured.length, 0);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
 test('/api/miser/stats?days=abc returns 400', async () => {
   const echo = await startEcho(() => ({ status: 200, body: {} }));
   const { createProxy, restoreEnv } = freshProxy(echo.url);

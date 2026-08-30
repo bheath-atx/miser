@@ -15,6 +15,18 @@ This change adds a zero-LLM watcher module and sidecar entrypoint that:
 
 The proxy does not start autonomous watcher loops. Periodic execution is isolated to the `miser-watchd` sidecar when invoked directly.
 
+## Revision: MISER_WATCH_ENABLED=off
+
+Revised PR #23 so `config.watch.enabled` is honored by watcher construction, the watcher sidecar, and the explicit refresh endpoint.
+
+- `MISER_WATCH_ENABLED=off` parses to `config.watch.enabled === false`.
+- Disabled watchers list no runnable probes and `refreshProbe()` returns a clear disabled result without executing probe commands.
+- `bin/miser-watchd.js` reports the disabled state and exits cleanly before listing or refreshing probes.
+- `POST /api/miser/watch/refresh` returns a disabled response without calling the injected watcher when watch is disabled.
+- Enabled watcher behavior is unchanged.
+
+Final pushed commit SHA is reported in the PR handoff; Git cannot embed a commit's own final SHA in the committed file content.
+
 ## Files Changed
 
 - `bin/miser-watchd.js`
@@ -42,10 +54,10 @@ The proxy does not start autonomous watcher loops. Periodic execution is isolate
 - `npm test`
 
 Results:
-- Watcher tests: 10 passed
-- Proxy tests: 31 passed
+- Watcher tests: 13 passed
+- Proxy tests: 32 passed
 - Routing/health tests: 16 passed
-- Full suite: 636 passed
+- Full suite: 640 passed
 
 ## Intentionally Deferred
 

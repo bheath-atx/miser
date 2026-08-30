@@ -306,6 +306,7 @@ function artifactFreshness(artifact, nowMs = Date.now()) {
 }
 
 function createWatcher(opts = {}) {
+  const enabled = opts.enabled !== false;
   const watchDir = expandHome(opts.watchDir || DEFAULT_WATCH_DIR);
   const lockLeaseMs = finiteInt(opts.lockLeaseMs, DEFAULT_LOCK_LEASE_MS, 1000, 24 * 60 * 60 * 1000);
   const probeList = Array.isArray(opts.probes) ? opts.probes.map(p => normalizeProbe(p)).filter(Boolean) : [];
@@ -318,6 +319,7 @@ function createWatcher(opts = {}) {
   }
 
   function listProbes() {
+    if (!enabled) return [];
     return Array.from(probes.values()).map(probe => ({ ...probe }));
   }
 
@@ -341,6 +343,16 @@ function createWatcher(opts = {}) {
   }
 
   async function refreshProbe(id) {
+    if (!enabled) {
+      return {
+        ok: false,
+        status: 'disabled',
+        probe_id: id || null,
+        disabled: true,
+        in_flight: false,
+        paths: id ? pathsFor(id) : null,
+      };
+    }
     const probe = getProbe(id);
     if (!probe) {
       const err = new Error(`unknown watcher probe ${id}`);
@@ -396,7 +408,7 @@ function createWatcher(opts = {}) {
     return out;
   }
 
-  return { watchDir, getProbe, listProbes, pathsFor, readArtifact, freshness, refreshProbe, refreshAll };
+  return { enabled, watchDir, getProbe, listProbes, pathsFor, readArtifact, freshness, refreshProbe, refreshAll };
 }
 
 module.exports = {
