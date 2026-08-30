@@ -529,6 +529,58 @@ test('enforcement warning honors Anthropic streaming requests with SSE', async (
   }
 });
 
+test('redirect shadow classifies ORCH gh run view but passes upstream response through', async () => {
+  const upstreamBody = {
+    id: 'msg_upstream_shadow',
+    type: 'message',
+    role: 'assistant',
+    model: 'claude-sonnet-5-test',
+    content: [{ type: 'text', text: 'upstream ok' }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: 7, output_tokens: 3 },
+  };
+  const echo = await startEcho(() => ({ status: 200, body: upstreamBody }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_ENFORCEMENT: JSON.stringify({
+      '*': {
+        mode: 'observe',
+        redirect: { mode: 'shadow' },
+        override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' },
+      },
+    }),
+  });
+  try {
+    const config = require('../src/config.js');
+    const { buildGuardDeps } = require('../src/budgets.js');
+    const guardDeps = buildGuardDeps(config, { createLedger: () => ({ shouldSend: () => false, markSent: () => {} }) });
+    const handler = createProxy({ guardDeps });
+    const res = fakeRes();
+    const done = res.whenDone();
+    handler(fakeReq('POST', '/p/aetheria--orch/v1/messages', {
+      model: 'claude-sonnet-5-test',
+      max_tokens: 50,
+      system: 'You are the ORCH controller.',
+      messages: [
+        { role: 'user', content: 'MISER_ASSIGNMENT=A check CI once' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'gh run view 123 --log' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'CI output' }] },
+      ],
+    }, {}), res);
+    await done;
+
+    assert.equal(echo.captured.length, 1);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(JSON.parse(res.body()), upstreamBody);
+    const snapshot = guardDeps.enforcementState.snapshot();
+    assert.equal(snapshot.redirect.wouldSynthesize, 1);
+    assert.equal(snapshot.recentEvents[0].commandClass, 'POLL_CI');
+    assert.equal(snapshot.recentEvents[0].would_synthesize, true);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
 test('v4 C1: beta merge avoids duplicates and client context_management is never overridden', async () => {
   const echo = await startEcho(() => ({ status: 200, body: { usage: { input_tokens: 1 } } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {

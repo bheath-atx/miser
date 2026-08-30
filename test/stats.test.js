@@ -379,6 +379,31 @@ test('Miser enforcement events aggregate sparsely by decision and reason', () =>
   }
 });
 
+test('Miser redirect shadow events aggregate sparsely by command class and role', () => {
+  const file = tmpStatsFile('redirect-shadow');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    const now = new Date(`${dayKey()}T12:00:00.000Z`);
+    stats.recordEnforcementEvent('aetheria', {
+      decision: 'would_synthesize',
+      reason: 'zero-llm-redirect-shadow',
+      would_synthesize: true,
+      commandClass: 'POLL_CI',
+      role: 'ORCH',
+      mode: 'shadow',
+      fingerprint: 'fp-a',
+    }, () => now);
+    const node = stats.getStats('1').perProject.aetheria.redirect;
+    assert.equal(node.wouldSynthesizeCount, 1);
+    assert.deepEqual(node.byCommandClass, { POLL_CI: 1 });
+    assert.deepEqual(node.byRole, { ORCH: 1 });
+    assert.deepEqual(node.byMode, { shadow: 1 });
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
 test('Sprint B AC9c: guardrail-only project gets budget/policy nodes and NO legacy bucket fields', () => {
   const file = tmpStatsFile('ac9c');
   const prevEnv = process.env.MISER_STATS_FILE;

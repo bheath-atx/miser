@@ -7,6 +7,9 @@ const {
   parseEnforcement,
   resolvePolicy,
   classifyRequest,
+  conversationFingerprint,
+  buildSyntheticMessageResponse,
+  buildSyntheticSseResponse,
   createEnforcementState,
   checkEnforcement,
   recordEnforcementUsage,
@@ -32,6 +35,28 @@ function toolResultBody(content) {
       { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/tmp/out' } }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content }] },
     ],
+  };
+}
+
+function bashToolResultBody(command, system = 'You are the ORCH controller for this sprint.') {
+  return {
+    model: 'claude-sonnet-5-test',
+    max_tokens: 50,
+    system,
+    messages: [
+      { role: 'user', content: 'MISER_ASSIGNMENT=A coordinate this lane' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'command output' }] },
+    ],
+  };
+}
+
+function promptBody(text, system = 'You are the ORCH controller for this sprint.') {
+  return {
+    model: 'claude-sonnet-5-test',
+    max_tokens: 50,
+    system,
+    messages: [{ role: 'user', content: text }],
   };
 }
 
@@ -95,17 +120,20 @@ test('parseEnforcement accepts wildcard default and project overrides, including
     inboundBradReplyMaxTurns: 2,
   };
   const parsed = parseEnforcement(JSON.stringify({
-    '*': { mode: 'observe', poll: { maxLikelyPollsPer10Min: 2 }, orchControl },
-    'nacho-orch': { mode: 'throttle', orchControl: { enabled: false, panels: ['sprints'] } },
+    '*': { mode: 'observe', redirect: { mode: 'shadow' }, poll: { maxLikelyPollsPer10Min: 2 }, orchControl },
+    'nacho-orch': { mode: 'throttle', redirect: { mode: 'off' }, orchControl: { enabled: false, panels: ['sprints'] } },
     'bad name!': { mode: 'block' },
   }));
   assert.equal(parsed['*'].mode, 'observe');
+  assert.equal(parsed['*'].redirect.mode, 'shadow');
   assert.equal(parsed['*'].poll.maxLikelyPollsPer10Min, 2);
   assert.equal(parsed['nacho-orch'].mode, 'throttle');
+  assert.equal(parsed['nacho-orch'].redirect.mode, 'off');
   assert.equal(parsed['bad name!'], undefined);
 
   const policy = resolvePolicy(parsed, 'nacho-orch');
   assert.equal(policy.mode, 'throttle');
+  assert.equal(policy.redirect.mode, 'off');
   assert.equal(policy.poll.maxLikelyPollsPer10Min, 2);
   for (const key of Object.keys(DEFAULT_POLICY.orchControl)) {
     assert.deepEqual(policy.orchControl[key], key === 'enabled'
@@ -468,4 +496,107 @@ test('historical oversized tool_result is not blocked unless strict latest-turn 
   }));
   const deps = guard(config, state);
   assert.equal(checkEnforcement('nacho-orch', 'sprints', toolResultBody('x'.repeat(100)), { 'x-miser-poll-class': 'unlikely' }, 100, deps), null);
+});
+
+test('redirect classifier marks ORCH gh run view as POLL_CI and shadow records without blocking', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = parseEnforcement(JSON.stringify({
+    '*': { mode: 'observe', redirect: { mode: 'shadow' }, override: { overrideFile: TEST_OVERRIDE_FILE } },
+  }));
+  const deps = guard(config, state);
+  const body = bashToolResultBody('gh run view 123 --log');
+  const c = classifyRequest('aetheria', 'orch', body, { 'x-miser-poll-class': 'unlikely' }, 100);
+  assert.equal(c.role, 'ORCH');
+  assert.equal(c.commandClass, 'POLL_CI');
+  assert.equal(c.redirectable, true);
+
+  assert.equal(checkEnforcement('aetheria', 'orch', body, { 'x-miser-poll-class': 'unlikely' }, 100, deps), null);
+  assert.equal(deps.events.length, 1);
+  assert.equal(deps.events[0].decision, 'would_synthesize');
+  assert.equal(deps.events[0].would_synthesize, true);
+  assert.equal(deps.events[0].commandClass, 'POLL_CI');
+  assert.equal(deps.events[0].role, 'ORCH');
+  assert.equal(typeof deps.events[0].fingerprint, 'string');
+  assert.equal(state.snapshot().redirect.wouldSynthesize, 1);
+});
+
+test('non-streaming synthetic helper emits Claude text-only response with zero usage', () => {
+  const response = buildSyntheticMessageResponse({ model: 'claude-fable-5', tools: [{ name: 'Bash' }] }, 'use watcher artifact');
+  assert.equal(response.type, 'message');
+  assert.equal(response.role, 'assistant');
+  assert.equal(response.model, 'claude-fable-5');
+  assert.deepEqual(response.usage, {
+    input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 0,
+  });
+  assert.equal(response.content.length, 1);
+  assert.equal(response.content[0].type, 'text');
+  assert.match(response.content[0].text, /^\[MISER-SYNTHETIC\]/);
+  assert.equal(response.content.some(block => block.type === 'tool_use'), false);
+});
+
+test('streaming synthetic helper emits valid Claude SSE text flow', () => {
+  const sse = buildSyntheticSseResponse({ model: 'claude-fable-5', stream: true }, 'shadow text', { id: 'msg_miser_test' });
+  const events = [...sse.matchAll(/^event: ([^\n]+)\ndata: (.+)$/gm)].map(match => ({
+    event: match[1],
+    data: JSON.parse(match[2]),
+  }));
+  assert.deepEqual(events.map(e => e.event), [
+    'message_start',
+    'content_block_start',
+    'content_block_delta',
+    'content_block_stop',
+    'message_delta',
+    'message_stop',
+  ]);
+  assert.equal(events[0].data.message.id, 'msg_miser_test');
+  assert.equal(events[0].data.message.model, 'claude-fable-5');
+  assert.match(events[2].data.delta.text, /^\[MISER-SYNTHETIC\]/);
+  assert.equal(events[4].data.delta.stop_reason, 'end_turn');
+  assert.equal(sse.includes('tool_use'), false);
+});
+
+test('request with tools still receives synthetic text-only response with no tool_use', () => {
+  const response = buildSyntheticMessageResponse({
+    model: 'claude-fable-5',
+    tools: [{ name: 'Bash', input_schema: { type: 'object' } }],
+  }, 'no tools emitted');
+  assert.deepEqual(response.content.map(block => block.type), ['text']);
+  assert.equal(JSON.stringify(response).includes('tool_use'), false);
+});
+
+test('valid dispatch-only commands classify as DISPATCH_OK and are not redirectable', () => {
+  for (const command of [
+    '~/bin/spawn-lane.sh --project aetheria --role builder',
+    'safe-reap.sh --panel old',
+    'td-inject s1 payload',
+    'curl -sS -X POST http://127.0.0.1:8001/v1/orch/aetheria/reply',
+    'git fetch',
+    'date',
+  ]) {
+    const c = classifyRequest('aetheria', 'orch', bashToolResultBody(command), {}, 100);
+    assert.equal(c.commandClass, 'DISPATCH_OK', command);
+    assert.equal(c.redirectable, false, command);
+  }
+});
+
+test('negated poll instructions in user text do not classify as redirectable', () => {
+  for (const text of [
+    'do not poll',
+    'do not run gh run view 123',
+    "don't poll or run gh pr checks",
+  ]) {
+    const c = classifyRequest('aetheria', 'orch', promptBody(text), {}, 100);
+    assert.equal(c.commandClass, 'NEUTRAL', text);
+    assert.equal(c.redirectable, false, text);
+  }
+});
+
+test('conversation fingerprint changes when first user message changes', () => {
+  const a = promptBody('first task A');
+  const b = promptBody('first task B');
+  assert.notEqual(conversationFingerprint(a), conversationFingerprint(b));
+  assert.equal(conversationFingerprint(a), classifyRequest('aetheria', 'orch', a, {}, 100).conversationFingerprint);
 });
