@@ -21,6 +21,7 @@ const { injectContextManagement } = require('./context-management.js');
 const { buildMetricsText } = require('./metrics.js');
 const { getPanelStats, getPersistenceStatus, getRecordRejectionStatus: getPanelRecordRejectionStatus } = require('./panel-stats.js');
 const { alertRoutingHealth } = require('./alert-routes.js');
+const { createWatcher } = require('./watchd.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -239,6 +240,14 @@ function headerProject(headers) {
   return raw || 'default';
 }
 
+function queryParam(reqUrl, name) {
+  try {
+    return new URL(reqUrl, 'http://localhost').searchParams.get(name) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
 function contextProjectConfig() {
   const projects = {};
   for (const [project, knobs] of Object.entries(config.contextEditProjects || {})) {
@@ -291,6 +300,7 @@ function createProxy(deps = {}) {
     for (const [name, b] of Object.entries(bs)) out[name] = b.getState();
     return out;
   });
+  const watcher = deps.watcher || createWatcher(config.watch || {});
 
   return async function handler(req, res) {
     trackRequest();
@@ -424,6 +434,33 @@ function createProxy(deps = {}) {
         recordRejections: getPanelRecordRejectionStatus(),
         panels,
       });
+      return;
+    }
+
+    if (route.kind === 'watch_refresh') {
+      try {
+        if (config.watch && config.watch.enabled === false) {
+          json(res, 503, {
+            ok: false,
+            status: 'disabled',
+            disabled: true,
+            error: { type: 'watch_disabled', message: 'miser watcher disabled by MISER_WATCH_ENABLED' },
+          });
+          return;
+        }
+        const raw = await readBody(req);
+        let parsed = {};
+        if (raw.trim()) parsed = JSON.parse(raw);
+        const id = queryParam(req.url, 'id') || (parsed && parsed.id);
+        if (!id) {
+          json(res, 400, { error: { type: 'invalid_request_error', message: 'miser watch refresh requires probe id' } });
+          return;
+        }
+        const result = await watcher.refreshProbe(id);
+        json(res, result.in_flight ? 202 : 200, result);
+      } catch (err) {
+        json(res, err.statusCode || 500, { error: { type: 'watch_refresh_error', message: err.message } });
+      }
       return;
     }
 

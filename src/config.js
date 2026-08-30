@@ -6,6 +6,7 @@ const { parsePolicy } = require('./policy-watchdog.js');
 const { parseAlertRoutes, parseOpsRoute } = require('./alert-routes.js');
 const { parseStopgapWatchdogEnv } = require('./stopgap-watchdog.js');
 const { parseEnforcement } = require('./enforcement.js');
+const { parseWatchConfig } = require('./watchd.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
 // (which collides with the panel routing grammar). Exported for unit tests so
@@ -167,6 +168,10 @@ module.exports = {
   // Stopgap stuck-panel watchdog. OFF unless explicitly enabled because it can
   // inject into TermDeck panels.
   stopgapWatchdog: parseStopgapWatchdogEnv(process.env),
+  // Zero-LLM watcher artifact writer. The proxy never schedules probes; the
+  // sidecar CLI owns periodic execution, while the proxy exposes explicit
+  // refresh for future redirect integration.
+  watch: parseWatchConfig(process.env),
   // Alert routing (PROPOSAL §2.2-§2.5). null is the exclusive OFF signal.
   // parseAlertRoutes is PURE: it reads only the env object handed to it, which
   // is what lets defaultConfigured participate in the degraded decision (§2.3
