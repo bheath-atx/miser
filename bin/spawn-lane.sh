@@ -18,6 +18,7 @@ BASE="${TERMDECK_BASE:-http://127.0.0.1:3200}"
 BASE_EXPLICIT=0
 [[ -n "${TERMDECK_BASE:-}" ]] && BASE_EXPLICIT=1
 ARTIFACT_DIR="${MISER_SPAWN_FAILURE_DIR:-$HOME/.miser/spawn-failures}"
+STARTED_AT_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -158,11 +159,14 @@ write_spawn_failure_artifact() {
     echo
     echo "verdict: FAILED"
     echo "failure_type: spawn_post"
+    echo "timestamp_utc: $STARTED_AT_UTC"
     echo "child_session_id: unknown"
     echo "label: ${LABEL:-unknown}"
     echo "project: ${PROJECT:-unknown}"
     echo "cwd: ${CWD:-unknown}"
     echo "parent_session_id: ${PARENT:-unknown}"
+    echo "base_url: $BASE"
+    echo "command: ${COMMAND_ARG:-unknown}"
     echo "boot_file: ${BOOT_FILE:-none}"
     echo "attempts: 1"
     echo "last_status: ${last_status:-unknown}"
@@ -259,7 +263,7 @@ if [[ -n "$BOOT_FILE" && "$NO_INJECT" != "1" ]]; then
   BOOT_ERR=$(mktemp "${TMPDIR:-/tmp}/miser-boot-inject.XXXXXX")
   if ! "$BIN_DIR/boot-inject.sh" \
     --child "$CHILD_ID" --boot "$BOOT_FILE" --parent "$PARENT" --base "$BASE" \
-    --project "$PROJECT" --role "$ROLE" --label "$LABEL" --cwd "$CWD" \
+    --project "$PROJECT" --role "$ROLE" --label "$LABEL" --cwd "$CWD" --command "$COMMAND_ARG" \
     >/dev/null 2> >(tee "$BOOT_ERR" >&2); then
     BOOT_ARTIFACT=$(awk -F': ' '/failure artifact:/ {print $2}' "$BOOT_ERR" | tail -1)
     rm -f "$BOOT_ERR"

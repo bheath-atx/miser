@@ -71,6 +71,17 @@ if [[ "$url" == */api/sessions ]]; then
   printf '{"id":"%s"}\\n' "\${FAKE_CHILD_ID:-child-1}"
   exit 0
 fi
+if [[ "$url" == */api/sessions/*/buffer ]]; then
+  echo "buffer $url" >> "$FAKE_CURL_LOG"
+  printf '{"ok":true,"status":"%s","statusDetail":"%s","lastActivity":"%s","replyCount":%s,"inputBufferLength":%s,"inputBufferPreview":"%s"}\\n' \
+    "\${FAKE_BUFFER_STATUS:-\${FAKE_SESSION_STATUS:-thinking}}" \
+    "\${FAKE_BUFFER_STATUS_DETAIL:-}" \
+    "\${FAKE_LAST_ACTIVITY:-2026-08-30T00:00:00Z}" \
+    "\${FAKE_REPLY_COUNT:-2}" \
+    "\${FAKE_INPUT_BUFFER_LENGTH:-0}" \
+    "\${FAKE_INPUT_BUFFER_PREVIEW:-}"
+  exit 0
+fi
 if [[ "$url" == */api/sessions/* ]]; then
   echo "status $url" >> "$FAKE_CURL_LOG"
   count=0
@@ -83,7 +94,20 @@ if [[ "$url" == */api/sessions/* ]]; then
   if [[ -n "\${FAKE_THINKING_AFTER_STATUS:-}" && "$count" -ge "\${FAKE_THINKING_AFTER_STATUS}" ]]; then
     status="thinking"
   fi
-  printf '{"meta":{"status":"%s"}}\\n' "$status"
+  if [[ -n "\${FAKE_CODEX_TRANSCRIPT_CWD:-}" && "$count" -ge "\${FAKE_CODEX_TRANSCRIPT_AFTER_STATUS:-1}" ]]; then
+    day_dir="$HOME/.codex/sessions/$(date -u +%Y/%m/%d)"
+    mkdir -p "$day_dir"
+    printf '{"type":"session_meta","payload":{"cwd":"%s"}}\\n' "$FAKE_CODEX_TRANSCRIPT_CWD" > "$day_dir/rollout-test-$count.jsonl"
+  fi
+  if [[ -n "\${FAKE_TOUCH_CODEX_TRANSCRIPT_PATH:-}" ]]; then
+    touch "$FAKE_TOUCH_CODEX_TRANSCRIPT_PATH"
+  fi
+  printf '{"meta":{"status":"%s","statusDetail":"%s","lastActivity":"%s","requestCount":%s,"replyCount":%s}}\\n' \
+    "$status" \
+    "\${FAKE_STATUS_DETAIL:-}" \
+    "\${FAKE_LAST_ACTIVITY:-2026-08-30T00:00:00Z}" \
+    "\${FAKE_REQUEST_COUNT:-0}" \
+    "\${FAKE_REPLY_COUNT:-2}"
   exit 0
 fi
 echo "unexpected $url" >> "$FAKE_CURL_LOG"
@@ -110,6 +134,13 @@ exit 2
   }
   if (opts.pollCount !== null) env.MISER_BOOT_INJECT_POLL_COUNT = String(opts.pollCount || 1);
   if (opts.thinkingAfterStatus) env.FAKE_THINKING_AFTER_STATUS = String(opts.thinkingAfterStatus);
+  if (opts.codexTranscript) {
+    env.FAKE_CODEX_TRANSCRIPT_CWD = cwd;
+    env.FAKE_CODEX_TRANSCRIPT_AFTER_STATUS = String(opts.codexTranscriptAfterStatus || 1);
+  }
+  if (opts.touchCodexTranscriptPath) {
+    env.FAKE_TOUCH_CODEX_TRANSCRIPT_PATH = opts.touchCodexTranscriptPath;
+  }
   delete env.TERMDECK_BASE;
 
   return { root, home, cwd, bootFile, badBootFile, noSummaryBootFile, curlLog, sleepLog, artifacts, env };
@@ -138,6 +169,19 @@ function artifactPath(fixture, kind = 'boot-unconfirmed', child = 'child-1') {
 
 function transcriptDir(home, cwd) {
   return path.join(home, '.claude', 'projects', cwd.replace(/[/.]/g, '-'));
+}
+
+function codexRolloutDir(home) {
+  const now = new Date();
+  const year = String(now.getUTCFullYear());
+  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(now.getUTCDate()).padStart(2, '0');
+  return path.join(home, '.codex', 'sessions', year, month, day);
+}
+
+function writeCodexRollout(file, cwd) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { cwd } }) + '\n', 'utf8');
 }
 
 test('boot-inject succeeds on first-attempt injection', (t) => {
@@ -217,12 +261,107 @@ test('spawn-lane child-created but boot-unconfirmed writes artifact without dupl
 
   const artifact = fs.readFileSync(artifactPath(f), 'utf8');
   assert.match(artifact, /attempts: 1/);
+  assert.match(artifact, /timestamp_utc: /);
+  assert.match(artifact, /base_url: http:\/\/127\.0\.0\.1:3200/);
+  assert.match(artifact, /command: claude/);
   assert.match(artifact, /last_status: idle/);
   assert.match(artifact, /cwd: .+work/);
   assert.match(artifact, /boot_file: .+boot\.md/);
+  assert.match(artifact, /observed_confirmation_signals:/);
+  assert.match(artifact, /confirmation_rule: termdeck_status_thinking/);
+  assert.match(artifact, /termdeck_reply_count: 2/);
+  assert.match(artifact, /input_buffer_length: 0/);
+  assert.match(artifact, /panel_lookup:/);
+  assert.match(artifact, /Open http:\/\/127\.0\.0\.1:3200 in a browser/);
+  assert.match(artifact, /buffer_inspection_command:/);
+  assert.match(artifact, /sessions_list_command:/);
   assert.match(artifact, /Inspect the panel manually first/);
   assert.match(artifact, /Only re-inject if the boot input is visibly absent or truncated/);
   assert.doesNotMatch(artifact, /manual_recovery_command:\ntd-inject/);
+});
+
+test('spawn-lane codex boot confirms from fresh Codex transcript without thinking status', (t) => {
+  const f = setupFixture(t, { status: 'active', pollCount: 4, codexTranscript: true });
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'termdeck-updates',
+    '--label', 'MISER-BOOT-CANARY',
+    '--cwd', f.cwd,
+    '--boot', f.bootFile,
+    '--base', 'http://127.0.0.1:3200',
+    '--command', 'codex',
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), 'child-1');
+  assert.match(res.stderr, /confirmed_by=codex_transcript_created/);
+  assert.equal(countLog(f.curlLog, 'spawn '), 1);
+  assert.equal(countLog(f.curlLog, 'input '), 2);
+  assert.equal(countLog(f.curlLog, 'status '), 1);
+  assert.equal(fs.existsSync(artifactPath(f)), false);
+});
+
+test('spawn-lane codex ignores pre-existing same-cwd rollout even when mtime becomes fresh', (t) => {
+  const f = setupFixture(t, { status: 'active', pollCount: 3 });
+  const existingRollout = path.join(codexRolloutDir(f.home), 'rollout-existing.jsonl');
+  writeCodexRollout(existingRollout, f.cwd);
+  f.env.FAKE_TOUCH_CODEX_TRANSCRIPT_PATH = existingRollout;
+
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'termdeck-updates',
+    '--label', 'MISER-BOOT-CANARY',
+    '--cwd', f.cwd,
+    '--boot', f.bootFile,
+    '--base', 'http://127.0.0.1:3200',
+    '--command', 'codex',
+  ], f.env);
+
+  assert.notEqual(res.status, 0);
+  assert.equal(res.stdout.trim(), 'child-1');
+  assert.match(res.stderr, /refusing duplicate boot injection/);
+  assert.equal(countLog(f.curlLog, 'input '), 2);
+  assert.equal(countLog(f.curlLog, 'status '), 3);
+
+  const artifact = fs.readFileSync(artifactPath(f), 'utf8');
+  assert.match(artifact, /confirmation_rule: codex_transcript_created/);
+  assert.match(artifact, /confirmed_by: none/);
+  assert.match(artifact, /codex_transcript_path: none/);
+});
+
+test('spawn-lane codex unconfirmed boot fails closed and gives conditional reinject command', (t) => {
+  const f = setupFixture(t, { status: 'active', pollCount: 3 });
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'none',
+    '--project', 'termdeck-updates',
+    '--label', 'MISER-BOOT-CANARY',
+    '--cwd', f.cwd,
+    '--boot', f.bootFile,
+    '--base', 'http://127.0.0.1:3200',
+    '--command', 'codex',
+  ], f.env);
+
+  assert.notEqual(res.status, 0);
+  assert.equal(res.stdout.trim(), 'child-1');
+  assert.match(res.stderr, /refusing duplicate boot injection/);
+  assert.equal(countLog(f.curlLog, 'input '), 2);
+  assert.equal(countLog(f.curlLog, 'status '), 3);
+
+  const artifact = fs.readFileSync(artifactPath(f), 'utf8');
+  assert.match(artifact, /child_session_id: child-1/);
+  assert.match(artifact, /parent_session_id: none/);
+  assert.match(artifact, /project: termdeck-updates/);
+  assert.match(artifact, /label: MISER-BOOT-CANARY/);
+  assert.match(artifact, /base_url: http:\/\/127\.0\.0\.1:3200/);
+  assert.match(artifact, /command: codex/);
+  assert.match(artifact, /last_status: active/);
+  assert.match(artifact, /confirmation_rule: codex_transcript_created/);
+  assert.match(artifact, /confirmed_by: none/);
+  assert.match(artifact, /codex_transcript_path: none/);
+  assert.match(artifact, /conditional_reinject_command:/);
+  assert.match(artifact, /td-inject\.sh child-1 .+Read .+boot\.md and execute it\./);
+  assert.doesNotMatch(artifact, /<session/);
+  assert.doesNotMatch(artifact, /<child/);
 });
 
 test('spawn-lane --no-inject skips boot injection while preserving spawn ledger', (t) => {
