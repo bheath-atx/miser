@@ -15,10 +15,32 @@ const DEFAULT_POLICY = Object.freeze({
     minIdlePollSpacingSec: 600,
   }),
   orchControl: Object.freeze({
-    maxControlTurnsPerHour: 12,
-    maxControlTurnsPerSession: 60,
+    enabled: false,
+    panels: Object.freeze([]),
+    controlClasses: Object.freeze([
+      'panel_lifecycle',
+      'audit_monitor',
+      'usage_monitor',
+      'repo_status',
+    ]),
+    countUnclassifiedManagement: true,
+    warnManagementTurnsPerAssignment: 2,
+    maxManagementTurnsPerAssignment: 3,
+    maxControlTurnsPerHour: 6,
+    maxControlTurnsPerSession: 12,
+    maxRevisionCycles: 2,
+    assignmentIdHeader: 'x-miser-assignment-id',
+    assignmentIdMarker: 'MISER_ASSIGNMENT=',
+    approvalHeader: 'x-miser-brad-approval',
+    approvalMarkers: Object.freeze(['BRAD_APPROVED_CONTINUE']),
+    completionMarkers: Object.freeze(['ORCH-RESULT', 'TASK-COMPLETE', 'VERDICT=APPROVE']),
+    handoffMarkers: Object.freeze(['COMPACT-STATE', 'HANDOFF-WRITTEN']),
+    revisionMarkers: Object.freeze(['PROPOSAL_REVISION', 'REVISION_BRIEFING', 'REVISION_CYCLE', 'REVISE_PROPOSAL']),
+    dispatchFinalizeMarker: 'DISPATCH_FINALIZE',
+    dispatchSessionHeader: 'x-miser-dispatch-session',
+    dispatchSessionMarkers: Object.freeze(['CHILD_SESSION=', 'SESSION_ID=', 'TERMDECK_SESSION=']),
     terminalHandoffAllowed: true,
-    terminalHandoffMaxTurns: 6,
+    terminalHandoffMaxTurns: 2,
     inboundBradReplyMaxTurns: 1,
   }),
   session: Object.freeze({
@@ -216,6 +238,101 @@ function includesAny(haystack, needles) {
   return needles.some(needle => haystack.includes(needle));
 }
 
+function getHeader(headers = {}, name = '') {
+  const needle = String(name || '').toLowerCase();
+  if (!needle) return '';
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (String(k).toLowerCase() === needle) {
+      const value = Array.isArray(v) ? v[0] : v;
+      return String(value == null ? '' : value).trim();
+    }
+  }
+  return '';
+}
+
+function latestUserText(body) {
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const latest = latestUserMessage(messages);
+  return latest ? textFromContent(latest.content) : '';
+}
+
+function promptTextFromContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) {
+    return typeof content.text === 'string' ? content.text : '';
+  }
+  return content.map(block => {
+    if (block == null) return '';
+    if (typeof block === 'string') return block;
+    if (block.type === 'text' && typeof block.text === 'string') return block.text;
+    if (!block.type && typeof block.text === 'string') return block.text;
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+function latestUserPromptText(body) {
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const latest = latestUserMessage(messages);
+  return latest ? promptTextFromContent(latest.content) : '';
+}
+
+function hasTextMarker(text, markers) {
+  if (!Array.isArray(markers) || !text) return false;
+  return markers.some(marker => typeof marker === 'string' && marker.trim() && text.includes(marker));
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+}
+
+function hasControlLineMarker(text, markers) {
+  if (!Array.isArray(markers) || !text) return false;
+  const lines = String(text).split(/\r?\n/);
+  return markers.some(marker => {
+    if (typeof marker !== 'string' || !marker.trim()) return false;
+    const re = new RegExp(`^\\s*${escapeRegExp(marker.trim())}(?:\\s+[^\\r\\n]*)?\\s*$`);
+    return lines.some(line => re.test(line));
+  });
+}
+
+function valueAfterMarker(text, marker) {
+  if (!text || typeof marker !== 'string' || !marker) return '';
+  const idx = text.indexOf(marker);
+  if (idx < 0) return '';
+  const rest = text.slice(idx + marker.length).trimStart();
+  const match = rest.match(/^([A-Za-z0-9._:@/-]+)/);
+  return match ? match[1] : '';
+}
+
+function extractAssignmentId(policy, text, headers) {
+  const orch = policy.orchControl || {};
+  const fromHeader = getHeader(headers, orch.assignmentIdHeader);
+  if (fromHeader) return fromHeader;
+  const fromMarker = valueAfterMarker(text, orch.assignmentIdMarker);
+  if (fromMarker) return fromMarker;
+  return '';
+}
+
+function textLooksManagementLike(text) {
+  const lower = String(text || '').toLowerCase();
+  return includesAny(lower, [
+    'proposal', 'revision briefing', 'revision cycle', 'revise proposal', 'architect review',
+    'builder audit', 'review verdict', 'approval gate', 'brad approval', 'handoff',
+    'assignment budget', 'orchestrator', 'orch management', 'panel handoff', 'lane owner',
+    'status artifact', 'result artifact', 'compact result', 'cross-orch', 'route this',
+  ]);
+}
+
+function textLooksRevisionLike(text, markers = []) {
+  if (hasTextMarker(text, markers)) return true;
+  const lower = String(text || '').toLowerCase();
+  return includesAny(lower, [
+    'proposal revision', 'revision briefing', 'revision cycle', 'revise the proposal',
+    'revise proposal', 'automatic proposal', 'architect revision',
+  ]);
+}
+
 function classifyControl(body, project, panel) {
   const text = collectClassifierText(body, project, panel);
   const classes = [];
@@ -264,13 +381,19 @@ function latestToolResultStats(body) {
 
 function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 0) {
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const latestText = latestUserText(body);
+  const latestPromptText = latestUserPromptText(body);
   const controlClasses = classifyControl(body, project, panel);
   return {
     project: project || 'default',
     panel: panel || null,
+    latestUserText: latestText,
+    latestUserPromptText: latestPromptText,
     pollClass: compactHeaders['x-miser-poll-class'] || compactHeaders['X-Miser-Poll-Class'] || 'unknown',
     controlClasses,
     isControl: controlClasses.length > 0,
+    managementLike: textLooksManagementLike(latestText),
+    revisionLike: textLooksRevisionLike(latestText, DEFAULT_POLICY.orchControl.revisionMarkers),
     assistantTurns: assistantTurns(messages),
     messageCount: messages.length,
     rawTokens: Number.isFinite(rawTokens) ? rawTokens : 0,
@@ -318,6 +441,13 @@ function createEnforcementState(opts = {}) {
         controlTurns: 0,
         postCapHandoffTurns: 0,
         inboundBradReplyTurns: 0,
+        currentAssignmentId: null,
+        assignmentStartedAt: null,
+        assignmentManagementTurns: 0,
+        assignmentWarningSent: false,
+        assignmentBlocked: false,
+        assignmentRevisionCycles: 0,
+        dispatchFinalizeUsed: false,
         freshInput: 0,
         weighted: 0,
         blocks: 0,
@@ -326,6 +456,21 @@ function createEnforcementState(opts = {}) {
       });
     }
     return sessions.get(key);
+  }
+
+  function resetAssignment(st, assignmentId, now, resetAllowances = false) {
+    st.currentAssignmentId = assignmentId || st.currentAssignmentId || null;
+    st.assignmentStartedAt = now;
+    st.assignmentManagementTurns = 0;
+    st.assignmentWarningSent = false;
+    st.assignmentBlocked = false;
+    st.assignmentRevisionCycles = 0;
+    st.dispatchFinalizeUsed = false;
+    if (resetAllowances) {
+      st.postCapHandoffTurns = 0;
+      st.inboundBradReplyTurns = 0;
+    }
+    return st;
   }
 
   function resetControlLoop(project, panel) {
@@ -340,22 +485,36 @@ function createEnforcementState(opts = {}) {
     return st;
   }
 
-  function recordRequest(project, panel, classification) {
+  function recordRequest(project, panel, classification, opts = {}) {
     const now = nowMs();
     const st = get(project, panel);
     pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
     pruneTimes(st.controlAt, now - 60 * 60 * 1000);
-    if (!classification.isControl) {
+    if (opts.protectedPanel) {
+      if (!st.currentAssignmentId && opts.assignmentId) {
+        resetAssignment(st, opts.assignmentId, now, true);
+      } else if (opts.assignmentId && st.currentAssignmentId !== opts.assignmentId) {
+        resetAssignment(st, opts.assignmentId, now, true);
+      } else if (opts.resetAssignment) {
+        resetAssignment(st, opts.assignmentId || st.currentAssignmentId, now, opts.resetAllowances);
+      }
+    } else if (!classification.isControl) {
       resetControlLoop(project, panel);
     }
     st.totalRequests += 1;
-    if (classification.pollClass === 'likely' && classification.isControl) {
+    const countsForPoll = opts.protectedPanel ? opts.countedManagement : classification.isControl;
+    const countsForControl = opts.protectedPanel ? opts.countedManagement && classification.isControl : classification.isControl;
+    if (classification.pollClass === 'likely' && countsForPoll) {
       st.likelyPollRequests += 1;
       st.likelyPollAt.push(now);
     }
-    if (classification.isControl) {
+    if (countsForControl) {
       st.controlTurns += 1;
       st.controlAt.push(now);
+    }
+    if (opts.protectedPanel && opts.countedManagement) {
+      st.assignmentManagementTurns += 1;
+      if (classification.revisionLike) st.assignmentRevisionCycles += 1;
     }
     return st;
   }
@@ -427,13 +586,59 @@ function hasOverride(project, policy, headers = {}) {
   return false;
 }
 
-function canaryPollThrottleApplies(project, classification) {
-  return project === 'nacho-orch' && classification.isControl;
+function orchControlApplies(panel, policy) {
+  const orch = policy && policy.orchControl;
+  if (!orch || !orch.enabled) return false;
+  const panels = Array.isArray(orch.panels) ? orch.panels : [];
+  if (panels.length > 0 && !panels.includes(panel || '')) return false;
+  return true;
+}
+
+function isCountedOrchManagementTurn(policy, classification) {
+  const orch = policy.orchControl || {};
+  if (classification.isControl) {
+    const classes = Array.isArray(orch.controlClasses) ? orch.controlClasses : [];
+    if (classes.length === 0) return true;
+    return (classification.controlClasses || []).some(c => classes.includes(c));
+  }
+  return orch.countUnclassifiedManagement === true && classification.managementLike === true;
+}
+
+function isApprovalTurn(policy, text, headers) {
+  const orch = policy.orchControl || {};
+  return !!getHeader(headers, orch.approvalHeader)
+    || (!!extractAssignmentId(policy, text, headers) && hasControlLineMarker(text, orch.approvalMarkers));
+}
+
+function isCompletionTurn(policy, text, headers) {
+  return !!extractAssignmentId(policy, text, headers)
+    && hasControlLineMarker(text, (policy.orchControl || {}).completionMarkers);
+}
+
+function isHandoffMarkedTurn(policy, text, headers) {
+  return !!extractAssignmentId(policy, text, headers)
+    && hasControlLineMarker(text, (policy.orchControl || {}).handoffMarkers);
+}
+
+function hasDispatchSessionMarker(policy, text, headers) {
+  const orch = policy.orchControl || {};
+  if (getHeader(headers, orch.dispatchSessionHeader)) return true;
+  return hasTextMarker(text, orch.dispatchSessionMarkers);
+}
+
+function isDispatchFinalizeTurn(policy, classification, headers) {
+  const orch = policy.orchControl || {};
+  const text = classification.latestUserPromptText || '';
+  return typeof orch.dispatchFinalizeMarker === 'string'
+    && orch.dispatchFinalizeMarker
+    && hasControlLineMarker(text, [orch.dispatchFinalizeMarker])
+    && !!extractAssignmentId(policy, text, headers)
+    && hasDispatchSessionMarker(policy, text, headers);
 }
 
 function isTerminalHandoffTurn(classification) {
   const classes = new Set(classification.controlClasses || []);
-  return classes.has('handoff') || classes.has('panel_lifecycle');
+  return classes.has('handoff') && classification.handoffMarked === true;
 }
 
 function isInboundBradTurn(classification) {
@@ -549,14 +754,38 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   if (!config) return null;
   const policy = resolvePolicy(config, project);
   if (!policy) return null;
-  if (hasOverride(project, policy, requestHeaders)) return null;
+  const overrideActive = hasOverride(project, policy, requestHeaders);
 
   const state = guardDeps.enforcementState || defaultState;
   const classification = classifyRequest(project, panel, body, compactHeaders, rawTokens);
-  const st = state.recordRequest(project, panel, classification);
+  const promptText = classification.latestUserPromptText || '';
+  classification.revisionLike = textLooksRevisionLike(promptText, policy.orchControl && policy.orchControl.revisionMarkers);
+  classification.handoffMarked = isHandoffMarkedTurn(policy, promptText, requestHeaders);
+  const protectedPanel = orchControlApplies(panel, policy);
+  const countedManagement = protectedPanel && isCountedOrchManagementTurn(policy, classification);
+  const assignmentId = protectedPanel ? extractAssignmentId(policy, promptText, requestHeaders) : '';
+  const resetAssignment = protectedPanel && (
+    overrideActive
+    || isApprovalTurn(policy, promptText, requestHeaders)
+    || isCompletionTurn(policy, promptText, requestHeaders)
+    || classification.handoffMarked
+  );
+  const resetAllowances = protectedPanel && (
+    overrideActive
+    || isApprovalTurn(policy, promptText, requestHeaders)
+    || isCompletionTurn(policy, promptText, requestHeaders)
+  );
+  const st = state.recordRequest(project, panel, classification, {
+    protectedPanel,
+    countedManagement,
+    assignmentId,
+    resetAssignment,
+    resetAllowances,
+  });
   const now = guardDeps.nowFn ? guardDeps.nowFn().getTime() : Date.now();
   pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
   pruneTimes(st.controlAt, now - 60 * 60 * 1000);
+  if (overrideActive) return null;
 
   const toolMode = policy.toolResults && policy.toolResults.mode;
   if (classification.maxLatestToolResultBytes > (policy.toolResults.maxToolResultBytes || Infinity)
@@ -567,7 +796,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
       null);
   }
 
-  if (classification.pollClass === 'likely' && canaryPollThrottleApplies(project, classification)) {
+  if (classification.pollClass === 'likely' && protectedPanel && countedManagement) {
     const counts = pollCounts(st, now);
     const tenMinLimit = policy.poll.maxLikelyPollsPer10Min || DEFAULT_POLICY.poll.maxLikelyPollsPer10Min;
     const hourLimit = policy.poll.maxLikelyPollsPerHour || DEFAULT_POLICY.poll.maxLikelyPollsPerHour;
@@ -581,26 +810,67 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
     if (counts.tenMin >= tenMinLimit || counts.hour >= hourLimit) {
       return maybeWarn(project, panel, policy, classification, state, guardDeps,
         'poll-budget-edge',
-        'miser warning: this session is at the poll budget edge; the next similar nonzero-LLM poll/control turn will be blocked. Stop now and use a zero-LLM watcher artifact, or send a real non-poll work command to reset the poll counter.',
+        'miser warning: this session is at the poll budget edge; the next similar nonzero-LLM poll/control turn will be blocked. Stop now and use a zero-LLM watcher artifact or explicit approved boundary marker.',
         body && body.model);
     }
   }
 
-  if (classification.isControl && project === 'nacho-orch') {
-    const overHour = st.controlAt.length > (policy.orchControl.maxControlTurnsPerHour || DEFAULT_POLICY.orchControl.maxControlTurnsPerHour);
-    const overSession = st.controlTurns > (policy.orchControl.maxControlTurnsPerSession || DEFAULT_POLICY.orchControl.maxControlTurnsPerSession);
+  if (protectedPanel && countedManagement) {
+    const overRevisions = st.assignmentRevisionCycles > (policy.orchControl.maxRevisionCycles ?? DEFAULT_POLICY.orchControl.maxRevisionCycles);
+    if (overRevisions) {
+      return maybeBlock(project, panel, policy, classification, state, guardDeps,
+        'architect-revision-budget',
+        'miser: architect/proposal revision budget exceeded; Brad approval is required before another automatic revision cycle',
+        600);
+    }
+
+    const warnAt = policy.orchControl.warnManagementTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.warnManagementTurnsPerAssignment;
+    const maxTurns = policy.orchControl.maxManagementTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.maxManagementTurnsPerAssignment;
+    if (st.assignmentManagementTurns > maxTurns) {
+      if (isDispatchFinalizeTurn(policy, classification, requestHeaders) && !st.dispatchFinalizeUsed) {
+        st.dispatchFinalizeUsed = true;
+        return null;
+      }
+      if (policy.orchControl.terminalHandoffAllowed && isTerminalHandoffTurn(classification)
+          && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns ?? DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
+        st.postCapHandoffTurns += 1;
+        return null;
+      }
+      if (isInboundBradTurn(classification)
+          && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns ?? DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
+        st.inboundBradReplyTurns += 1;
+        return null;
+      }
+      st.assignmentBlocked = true;
+      return maybeBlock(project, panel, policy, classification, state, guardDeps,
+        'orch-assignment-budget',
+        'miser: ORCH assignment management budget exceeded; Brad approval, durable completion, handoff, or a one-shot final dispatch marker is required before continuing',
+        600);
+    }
+    if (st.assignmentManagementTurns === warnAt && !st.assignmentWarningSent) {
+      st.assignmentWarningSent = true;
+      return maybeWarn(project, panel, policy, classification, state, guardDeps,
+        'orch-assignment-budget-edge',
+        'miser warning: this assignment is at the ORCH management budget edge; finish with a durable result, approved continuation, handoff, or one-shot final dispatch instead of spending more management turns.',
+        body && body.model);
+    }
+  }
+
+  if (classification.isControl && protectedPanel && countedManagement) {
+    const overHour = st.controlAt.length > (policy.orchControl.maxControlTurnsPerHour ?? DEFAULT_POLICY.orchControl.maxControlTurnsPerHour);
+    const overSession = st.controlTurns > (policy.orchControl.maxControlTurnsPerSession ?? DEFAULT_POLICY.orchControl.maxControlTurnsPerSession);
     const freshOver = st.freshInput > (policy.session.maxFreshInputM || DEFAULT_POLICY.session.maxFreshInputM) * 1_000_000;
     const weightedOver = st.weighted > (policy.session.maxSummedContextWeightedM || DEFAULT_POLICY.session.maxSummedContextWeightedM) * 1_000_000;
     const assistantFreshOver = classification.assistantTurns > (policy.session.maxAssistantTurnsObserve || DEFAULT_POLICY.session.maxAssistantTurnsObserve)
       && (freshOver || weightedOver);
     if (overHour || overSession || assistantFreshOver) {
       if (policy.orchControl.terminalHandoffAllowed && isTerminalHandoffTurn(classification)
-          && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns || DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
+          && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns ?? DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
         st.postCapHandoffTurns += 1;
         return null;
       }
       if (isInboundBradTurn(classification)
-          && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns || DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
+          && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns ?? DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
         st.inboundBradReplyTurns += 1;
         return null;
       }
@@ -615,7 +885,8 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   if (classification.assistantTurns >= (policy.session.minTurnsForRatioGate || DEFAULT_POLICY.session.minTurnsForRatioGate)
       && recentPollRatio > (policy.session.maxPollTurnRatio || DEFAULT_POLICY.session.maxPollTurnRatio)
       && classification.pollClass === 'likely'
-      && canaryPollThrottleApplies(project, classification)) {
+      && protectedPanel
+      && countedManagement) {
     return maybeBlock(project, panel, policy, classification, state, guardDeps,
       'poll-ratio-budget',
       'miser: poll-heavy session exceeded allowed ratio; move monitoring to an artifact',
@@ -642,6 +913,8 @@ module.exports = {
     textFromContent,
     latestToolResultStats,
     weightedFromUsage,
-    canaryPollThrottleApplies,
+    orchControlApplies,
+    isCountedOrchManagementTurn,
+    extractAssignmentId,
   },
 };
