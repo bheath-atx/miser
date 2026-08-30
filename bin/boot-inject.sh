@@ -94,6 +94,8 @@ LAST_BUFFER_DETAIL=""
 LAST_INPUT_BUFFER_LENGTH=""
 LAST_INPUT_BUFFER_PREVIEW=""
 LAST_CODEX_TRANSCRIPT=""
+CODEX_SNAPSHOT_FILE=""
+CODEX_SNAPSHOT_EPOCH=""
 
 is_codex_command() {
   local lower="${COMMAND,,}"
@@ -103,6 +105,11 @@ is_codex_command() {
 if is_codex_command; then
   BOOT_BODY="Read $BOOT_FILE and execute it. Do not wait to be polled; follow its notify-back and compact artifact instructions."
 fi
+
+cleanup() {
+  [[ -n "$CODEX_SNAPSHOT_FILE" ]] && rm -f "$CODEX_SNAPSHOT_FILE"
+}
+trap cleanup EXIT
 
 td_inject_command() {
   local td_q child_q boot_q port_q body_q
@@ -182,8 +189,8 @@ PY
 }
 
 find_codex_transcript() {
-  [[ -n "$CWD" && -n "$INJECTED_AT_EPOCH" ]] || return 0
-  CWD="$CWD" INJECTED_AT_EPOCH="$INJECTED_AT_EPOCH" python3 - <<'PY'
+  [[ -n "$CWD" && -n "$CODEX_SNAPSHOT_FILE" && -n "$CODEX_SNAPSHOT_EPOCH" ]] || return 0
+  CWD="$CWD" CODEX_SNAPSHOT_FILE="$CODEX_SNAPSHOT_FILE" CODEX_SNAPSHOT_EPOCH="$CODEX_SNAPSHOT_EPOCH" python3 - <<'PY'
 import datetime as dt
 import json
 import os
@@ -191,9 +198,14 @@ from pathlib import Path
 
 cwd = os.environ["CWD"]
 try:
-    since = float(os.environ["INJECTED_AT_EPOCH"]) - 5.0
+    since = float(os.environ["CODEX_SNAPSHOT_EPOCH"])
 except Exception:
     since = 0.0
+snapshot_file = Path(os.environ["CODEX_SNAPSHOT_FILE"])
+try:
+    existing = set(snapshot_file.read_text(encoding="utf-8").splitlines())
+except Exception:
+    existing = set()
 
 home = Path.home()
 now = dt.datetime.now(dt.timezone.utc)
@@ -207,6 +219,9 @@ for day in days:
         try:
             stat = path.stat()
         except OSError:
+            continue
+        key = f"{stat.st_dev}:{stat.st_ino}:{path}"
+        if key in existing:
             continue
         birth = getattr(stat, "st_birthtime", 0) or 0
         created_or_modified = min(t for t in [birth, stat.st_mtime] if t > 0)
@@ -224,6 +239,44 @@ for day in days:
 if candidates:
     candidates.sort(reverse=True)
     print(candidates[0][1])
+PY
+}
+
+snapshot_codex_rollouts() {
+  [[ -n "$CWD" ]] || return 0
+  CODEX_SNAPSHOT_FILE=$(mktemp "${TMPDIR:-/tmp}/miser-codex-rollouts.XXXXXX")
+  CODEX_SNAPSHOT_EPOCH=$(date +%s)
+  CWD="$CWD" CODEX_SNAPSHOT_FILE="$CODEX_SNAPSHOT_FILE" python3 - <<'PY'
+import datetime as dt
+import json
+import os
+from pathlib import Path
+
+cwd = os.environ["CWD"]
+snapshot_file = Path(os.environ["CODEX_SNAPSHOT_FILE"])
+home = Path.home()
+now = dt.datetime.now(dt.timezone.utc)
+days = [now, now - dt.timedelta(days=1)]
+rows = []
+for day in days:
+    root = home / ".codex" / "sessions" / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+    if not root.is_dir():
+        continue
+    for path in root.glob("rollout-*.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        try:
+            first = path.open("r", encoding="utf-8", errors="replace").readline()
+            obj = json.loads(first)
+        except Exception:
+            continue
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        if payload.get("cwd") == cwd or obj.get("cwd") == cwd:
+            rows.append(f"{stat.st_dev}:{stat.st_ino}:{path}")
+
+snapshot_file.write_text("\n".join(rows) + ("\n" if rows else ""), encoding="utf-8")
 PY
 }
 
@@ -342,6 +395,9 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
     echo "[boot-inject] attempt $attempt/$MAX_ATTEMPTS: waiting ${WAIT_S}s then injecting..." >&2
     sleep "$WAIT_S"
     INJECTED_AT_EPOCH=$(date +%s)
+    if is_codex_command; then
+      snapshot_codex_rollouts
+    fi
     if "$BIN_DIR/td-inject.sh" "$CHILD" "$BOOT_BODY" "$PORT" >&2; then
       INJECT_SENT=1
       LAST_ERROR="boot text posted; waiting for activity confirmation"

@@ -15,11 +15,22 @@ Changes:
 - Failure artifacts now include timestamp, base URL, project, label, cwd, command, boot file, child id, observed TermDeck `/sessions` and `/buffer` signals, Codex transcript path when found, panel lookup instructions, and an exact conditional `td-inject.sh` command with the real child id.
 - Spawn POST failure artifacts now include timestamp, base URL, and command.
 
+## Revision After Grok Audit
+
+Grok found that the initial Codex transcript predicate could false-pass when an already-existing same-`cwd` rollout file was appended after injection. The revision removes that false-pass by snapshotting matching Codex rollout identities before injection and accepting only rollout files whose path/inode identity was absent from that snapshot.
+
+Revision details:
+
+- Before a Codex boot post, `boot-inject.sh` records existing matching `~/.codex/sessions/**/rollout-*.jsonl` files by `st_dev:st_ino:path`.
+- Post-inject confirmation ignores every snapshotted identity, even if its mtime changes.
+- A new matching rollout file created after the snapshot still confirms Codex boot.
+- Fail-closed behavior, the one-successful-POST default, artifact diagnostics, and the conditional manual reinject command are preserved.
+
 ## Tests Run
 
 - `bash -n bin/spawn-lane.sh bin/boot-inject.sh bin/td-inject.sh` - passed
-- `node --test test/spawn-boot-inject.test.js` - 16 passed
-- `npm test` - 656 passed
+- `node --test test/spawn-boot-inject.test.js` - 17 passed
+- `npm test` - 657 passed
 - `git diff --check` - passed
 
 ## Failure Mode Addressed

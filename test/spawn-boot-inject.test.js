@@ -99,6 +99,9 @@ if [[ "$url" == */api/sessions/* ]]; then
     mkdir -p "$day_dir"
     printf '{"type":"session_meta","payload":{"cwd":"%s"}}\\n' "$FAKE_CODEX_TRANSCRIPT_CWD" > "$day_dir/rollout-test-$count.jsonl"
   fi
+  if [[ -n "\${FAKE_TOUCH_CODEX_TRANSCRIPT_PATH:-}" ]]; then
+    touch "$FAKE_TOUCH_CODEX_TRANSCRIPT_PATH"
+  fi
   printf '{"meta":{"status":"%s","statusDetail":"%s","lastActivity":"%s","requestCount":%s,"replyCount":%s}}\\n' \
     "$status" \
     "\${FAKE_STATUS_DETAIL:-}" \
@@ -135,6 +138,9 @@ exit 2
     env.FAKE_CODEX_TRANSCRIPT_CWD = cwd;
     env.FAKE_CODEX_TRANSCRIPT_AFTER_STATUS = String(opts.codexTranscriptAfterStatus || 1);
   }
+  if (opts.touchCodexTranscriptPath) {
+    env.FAKE_TOUCH_CODEX_TRANSCRIPT_PATH = opts.touchCodexTranscriptPath;
+  }
   delete env.TERMDECK_BASE;
 
   return { root, home, cwd, bootFile, badBootFile, noSummaryBootFile, curlLog, sleepLog, artifacts, env };
@@ -163,6 +169,19 @@ function artifactPath(fixture, kind = 'boot-unconfirmed', child = 'child-1') {
 
 function transcriptDir(home, cwd) {
   return path.join(home, '.claude', 'projects', cwd.replace(/[/.]/g, '-'));
+}
+
+function codexRolloutDir(home) {
+  const now = new Date();
+  const year = String(now.getUTCFullYear());
+  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(now.getUTCDate()).padStart(2, '0');
+  return path.join(home, '.codex', 'sessions', year, month, day);
+}
+
+function writeCodexRollout(file, cwd) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { cwd } }) + '\n', 'utf8');
 }
 
 test('boot-inject succeeds on first-attempt injection', (t) => {
@@ -280,6 +299,34 @@ test('spawn-lane codex boot confirms from fresh Codex transcript without thinkin
   assert.equal(countLog(f.curlLog, 'input '), 2);
   assert.equal(countLog(f.curlLog, 'status '), 1);
   assert.equal(fs.existsSync(artifactPath(f)), false);
+});
+
+test('spawn-lane codex ignores pre-existing same-cwd rollout even when mtime becomes fresh', (t) => {
+  const f = setupFixture(t, { status: 'active', pollCount: 3 });
+  const existingRollout = path.join(codexRolloutDir(f.home), 'rollout-existing.jsonl');
+  writeCodexRollout(existingRollout, f.cwd);
+  f.env.FAKE_TOUCH_CODEX_TRANSCRIPT_PATH = existingRollout;
+
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'termdeck-updates',
+    '--label', 'MISER-BOOT-CANARY',
+    '--cwd', f.cwd,
+    '--boot', f.bootFile,
+    '--base', 'http://127.0.0.1:3200',
+    '--command', 'codex',
+  ], f.env);
+
+  assert.notEqual(res.status, 0);
+  assert.equal(res.stdout.trim(), 'child-1');
+  assert.match(res.stderr, /refusing duplicate boot injection/);
+  assert.equal(countLog(f.curlLog, 'input '), 2);
+  assert.equal(countLog(f.curlLog, 'status '), 3);
+
+  const artifact = fs.readFileSync(artifactPath(f), 'utf8');
+  assert.match(artifact, /confirmation_rule: codex_transcript_created/);
+  assert.match(artifact, /confirmed_by: none/);
+  assert.match(artifact, /codex_transcript_path: none/);
 });
 
 test('spawn-lane codex unconfirmed boot fails closed and gives conditional reinject command', (t) => {
