@@ -67,8 +67,8 @@ finite_int "$MAX_ATTEMPTS" || MAX_ATTEMPTS=2
 (( MAX_ATTEMPTS > 2 )) && MAX_ATTEMPTS=2
 
 WAIT_S="${MISER_BOOT_INJECT_WAIT_S:-20}"
-POLL_COUNT="${MISER_BOOT_INJECT_POLL_COUNT:-10}"
-finite_int "$POLL_COUNT" || POLL_COUNT=10
+POLL_COUNT="${MISER_BOOT_INJECT_POLL_COUNT:-67}"
+finite_int "$POLL_COUNT" || POLL_COUNT=67
 (( POLL_COUNT < 1 )) && POLL_COUNT=1
 POLL_SLEEP_S="${MISER_BOOT_INJECT_POLL_SLEEP_S:-1.5}"
 
@@ -78,9 +78,10 @@ PORT="${PORT%%/*}"
 BOOT_BODY=$(cat "$BOOT_FILE")
 ARTIFACT_DIR="${MISER_SPAWN_FAILURE_DIR:-$HOME/.miser/spawn-failures}"
 SAFE_CHILD="${CHILD//[^A-Za-z0-9_.-]/_}"
-FAILURE_ARTIFACT="$ARTIFACT_DIR/boot-inject-${SAFE_CHILD}.md"
+BOOT_FAILURE_ARTIFACT="$ARTIFACT_DIR/boot-unconfirmed-${SAFE_CHILD}.md"
+MODEL_BRICK_ARTIFACT="$ARTIFACT_DIR/model-brick-${SAFE_CHILD}.md"
 
-manual_recovery_command() {
+td_inject_command() {
   local td_q child_q boot_q port_q
   printf -v td_q '%q' "$BIN_DIR/td-inject.sh"
   printf -v child_q '%q' "$CHILD"
@@ -89,17 +90,31 @@ manual_recovery_command() {
   printf '%s %s "$(cat %s)" %s' "$td_q" "$child_q" "$boot_q" "$port_q"
 }
 
-write_failure_artifact() {
+inspect_command() {
+  local base_q child_q
+  printf -v base_q '%q' "$BASE"
+  printf -v child_q '%q' "$CHILD"
+  printf 'curl -sS -H "Authorization: Bearer $TOKEN" %s/api/sessions/%s' "$base_q" "$child_q"
+}
+
+write_boot_failure_artifact() {
   local attempts="$1"
   local last_error="$2"
   local last_status="$3"
-  local manual
-  manual="$(manual_recovery_command)"
+  local inspect reinject note
+  inspect="$(inspect_command)"
+  reinject="$(td_inject_command)"
+  if [[ "$INJECT_SENT" == "1" ]]; then
+    note="Inspect the panel manually first. Only re-inject if the boot input is visibly absent or truncated."
+  else
+    note="No successful boot post was observed. It is safe to retry injection after checking the panel exists."
+  fi
   mkdir -p "$ARTIFACT_DIR"
   {
-    echo "# boot-inject failure"
+    echo "# boot confirmation failure"
     echo
     echo "verdict: FAILED"
+    echo "failure_type: boot_unconfirmed"
     echo "child_session_id: $CHILD"
     echo "label: ${LABEL:-unknown}"
     echo "project: ${PROJECT:-unknown}"
@@ -110,10 +125,42 @@ write_failure_artifact() {
     echo "last_status: ${last_status:-unknown}"
     echo "last_error: ${last_error:-unknown}"
     echo
+    echo "manual_recovery_note:"
+    echo "$note"
+    echo
+    echo "manual_inspection_command:"
+    echo "$inspect"
+    echo
+    echo "conditional_reinject_command:"
+    echo "$reinject"
+  } > "$BOOT_FAILURE_ARTIFACT"
+  echo "[boot-inject] failure artifact: $BOOT_FAILURE_ARTIFACT" >&2
+}
+
+write_model_brick_artifact() {
+  local model_error="$1"
+  local reap
+  printf -v reap 'curl -X DELETE -H "Authorization: Bearer $TOKEN" %q/api/sessions/%q' "$BASE" "$CHILD"
+  mkdir -p "$ARTIFACT_DIR"
+  {
+    echo "# model brick failure"
+    echo
+    echo "verdict: FAILED"
+    echo "failure_type: model_brick"
+    echo "child_session_id: $CHILD"
+    echo "label: ${LABEL:-unknown}"
+    echo "project: ${PROJECT:-unknown}"
+    echo "cwd: ${CWD:-unknown}"
+    echo "parent_session_id: $PARENT"
+    echo "boot_file: $BOOT_FILE"
+    echo "attempts: $ATTEMPTS_USED"
+    echo "last_status: ${LAST_STATUS:-thinking}"
+    echo "last_error: $model_error"
+    echo
     echo "manual_recovery_command:"
-    echo "$manual"
-  } > "$FAILURE_ARTIFACT"
-  echo "[boot-inject] failure artifact: $FAILURE_ARTIFACT" >&2
+    echo "$reap"
+  } > "$MODEL_BRICK_ARTIFACT"
+  echo "[boot-inject] failure artifact: $MODEL_BRICK_ARTIFACT" >&2
 }
 
 get_status() {
@@ -164,13 +211,13 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
 
   if [[ "$INJECT_SENT" == "1" ]]; then
     LAST_ERROR="boot posted but activity was not confirmed"
-    echo "[boot-inject] $LAST_ERROR; refusing duplicate boot injection" >&2
+    echo "[boot-inject] $LAST_ERROR after extended confirmation wait; refusing duplicate boot injection" >&2
     break
   fi
 done
 
 if [[ "$LANDED" != "1" ]]; then
-  write_failure_artifact "$ATTEMPTS_USED" "$LAST_ERROR" "$LAST_STATUS"
+  write_boot_failure_artifact "$ATTEMPTS_USED" "$LAST_ERROR" "$LAST_STATUS"
   echo "[boot-inject] ERROR: boot prompt for $CHILD not confirmed after $ATTEMPTS_USED attempt(s)" >&2
   exit 1
 fi
@@ -193,6 +240,7 @@ if [[ -n "$CWD" ]]; then
     fi
   done
   if [[ -n "$MODEL_ERR" ]]; then
+    write_model_brick_artifact "$MODEL_ERR"
     echo "[boot-inject] ERROR: panel $CHILD is BRICKED - $MODEL_ERR" >&2
     echo "[boot-inject]   Reap: curl -X DELETE -H \"Authorization: Bearer \$TOKEN\" $BASE/api/sessions/$CHILD" >&2
     exit 1
