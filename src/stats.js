@@ -855,6 +855,29 @@ function addGuardrailFields(target, source) {
       }
     }
   }
+  if (source.redirect && typeof source.redirect === 'object') {
+    const would = source.redirect.wouldSynthesizeCount || 0;
+    if (would > 0) {
+      if (!target.redirect) target.redirect = { wouldSynthesizeCount: 0, byCommandClass: {}, byRole: {}, byMode: {} };
+      target.redirect.wouldSynthesizeCount += would;
+      for (const [klass, count] of Object.entries(source.redirect.byCommandClass || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.redirect.byCommandClass[klass] = (target.redirect.byCommandClass[klass] || 0) + count;
+      }
+      for (const [role, count] of Object.entries(source.redirect.byRole || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.redirect.byRole[role] = (target.redirect.byRole[role] || 0) + count;
+      }
+      for (const [mode, count] of Object.entries(source.redirect.byMode || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.redirect.byMode[mode] = (target.redirect.byMode[mode] || 0) + count;
+      }
+      const first = source.redirect.firstEventAt;
+      if (typeof first === 'string' && (!target.redirect.firstEventAt || first < target.redirect.firstEventAt)) {
+        target.redirect.firstEventAt = first;
+      }
+    }
+  }
 }
 
 function buildWeeklyFromDaily(statsObj) {
@@ -1221,6 +1244,30 @@ function recordPolicyEvent(project, { drift = false, bloat = false } = {}, nowFn
 
 function recordEnforcementEvent(project, event = {}, nowFn = defaultNow) {
   const decision = event.decision;
+  if (decision === 'would_synthesize') {
+    const now = nowFn();
+    if (!isAllowedRecordTime(now, 'enforcement')) return { wouldSynthesizeCount: 0 };
+    if (!canRetainMutationAfterLoadFailure('enforcement')) return { wouldSynthesizeCount: 0 };
+    const dayKey = dayKeyFromDate(now);
+    const weekKey = subscriptionWeekKeyFromDate(now);
+    const bucket = ensureGuardrailBucket(project, dayKey);
+    const weekBucket = ensureWeeklyGuardrailBucket(project, weekKey);
+    function apply(target) {
+      if (!target.redirect) target.redirect = { wouldSynthesizeCount: 0, byCommandClass: {}, byRole: {}, byMode: {} };
+      if (event.would_synthesize === true) target.redirect.wouldSynthesizeCount += 1;
+      const commandClass = event.commandClass || 'NEUTRAL';
+      const role = event.role || 'unknown';
+      const mode = event.mode || 'shadow';
+      target.redirect.byCommandClass[commandClass] = (target.redirect.byCommandClass[commandClass] || 0) + 1;
+      target.redirect.byRole[role] = (target.redirect.byRole[role] || 0) + 1;
+      target.redirect.byMode[mode] = (target.redirect.byMode[mode] || 0) + 1;
+      if (!target.redirect.firstEventAt) target.redirect.firstEventAt = now.toISOString();
+    }
+    apply(bucket);
+    apply(weekBucket);
+    scheduleFlush();
+    return bucket.redirect;
+  }
   if (!['block', 'would_block', 'alert'].includes(decision)) return { blockedCount: 0, wouldBlockCount: 0, alertCount: 0 };
   const now = nowFn();
   if (!isAllowedRecordTime(now, 'enforcement')) return { blockedCount: 0, wouldBlockCount: 0, alertCount: 0 };
@@ -1446,7 +1493,8 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
     || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0))
     || (projData.enforcement && ((projData.enforcement.blockedCount || 0) > 0
       || (projData.enforcement.wouldBlockCount || 0) > 0
-      || (projData.enforcement.alertCount || 0) > 0));
+      || (projData.enforcement.alertCount || 0) > 0))
+    || (projData.redirect && (projData.redirect.wouldSynthesizeCount || 0) > 0);
   if (!hasLegacy && !hasGuardrail) return;
   if (!perProject[proj]) perProject[proj] = {};
   const target = perProject[proj];
@@ -1511,6 +1559,29 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
       for (const [reason, count] of Object.entries(projData.enforcement.byReason || {})) {
         if (!Number.isFinite(count) || count <= 0) continue;
         target.enforcement.byReason[reason] = (target.enforcement.byReason[reason] || 0) + count;
+      }
+    }
+  }
+  if (projData.redirect && typeof projData.redirect === 'object') {
+    const would = projData.redirect.wouldSynthesizeCount || 0;
+    if (would > 0) {
+      if (!target.redirect) target.redirect = { wouldSynthesizeCount: 0, byCommandClass: {}, byRole: {}, byMode: {} };
+      target.redirect.wouldSynthesizeCount += would;
+      const first = projData.redirect.firstEventAt;
+      if (typeof first === 'string' && (!target.redirect.firstEventAt || first < target.redirect.firstEventAt)) {
+        target.redirect.firstEventAt = first;
+      }
+      for (const [klass, count] of Object.entries(projData.redirect.byCommandClass || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.redirect.byCommandClass[klass] = (target.redirect.byCommandClass[klass] || 0) + count;
+      }
+      for (const [role, count] of Object.entries(projData.redirect.byRole || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.redirect.byRole[role] = (target.redirect.byRole[role] || 0) + count;
+      }
+      for (const [mode, count] of Object.entries(projData.redirect.byMode || {})) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        target.redirect.byMode[mode] = (target.redirect.byMode[mode] || 0) + count;
       }
     }
   }

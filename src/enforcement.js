@@ -1,14 +1,19 @@
 'use strict';
 
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { isValidProjectName } = require('./routing.js');
 
 const VALID_MODES = new Set(['observe', 'alert', 'throttle', 'block']);
+const VALID_REDIRECT_MODES = new Set(['off', 'shadow', 'warn', 'enforce']);
 const DEFAULT_POLICY = Object.freeze({
   mode: 'observe',
   scarceModeUsedWeeklyPct: 80,
+  redirect: Object.freeze({
+    mode: 'off',
+  }),
   poll: Object.freeze({
     maxLikelyPollsPer10Min: 1,
     maxLikelyPollsPerHour: 6,
@@ -120,6 +125,11 @@ function cleanPolicy(raw, project, partial = false) {
   if (raw.scarceModeUsedWeeklyPct !== undefined || !partial) {
     out.scarceModeUsedWeeklyPct = finiteNumber(raw.scarceModeUsedWeeklyPct, DEFAULT_POLICY.scarceModeUsedWeeklyPct, 0, 1000);
   }
+  out.redirect = cleanSubobject(raw.redirect, DEFAULT_POLICY.redirect, {}, partial);
+  if (out.redirect.mode && !VALID_REDIRECT_MODES.has(out.redirect.mode)) {
+    console.warn(`[miser/enforcement] WARN ${project}: invalid redirect.mode ${JSON.stringify(out.redirect.mode)}; using off`);
+    out.redirect.mode = DEFAULT_POLICY.redirect.mode;
+  }
   out.poll = cleanSubobject(raw.poll, DEFAULT_POLICY.poll, {}, partial);
   out.orchControl = cleanSubobject(raw.orchControl, DEFAULT_POLICY.orchControl, {}, partial);
   out.session = cleanSubobject(raw.session, DEFAULT_POLICY.session, {
@@ -171,6 +181,7 @@ function mergePolicy(base, override) {
   return {
     ...src,
     ...over,
+    redirect: { ...(src.redirect || {}), ...(over.redirect || {}) },
     poll: { ...(src.poll || {}), ...(over.poll || {}) },
     orchControl: { ...(src.orchControl || {}), ...(over.orchControl || {}) },
     session: { ...(src.session || {}), ...(over.session || {}) },
@@ -215,6 +226,13 @@ function blockBytes(block) {
 function latestUserMessage(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i] && messages[i].role === 'user') return messages[i];
+  }
+  return null;
+}
+
+function firstUserMessage(messages) {
+  for (const msg of messages) {
+    if (msg && msg.role === 'user') return msg;
   }
   return null;
 }
@@ -292,6 +310,229 @@ function latestUserPromptText(body) {
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
   const latest = latestUserMessage(messages);
   return latest ? promptTextFromContent(latest.content) : '';
+}
+
+function systemPromptHead(body, maxBytes = 2048) {
+  const parts = [];
+  const top = body && body.system;
+  if (typeof top === 'string') parts.push(top);
+  else if (Array.isArray(top)) parts.push(promptTextFromContent(top));
+
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  for (const msg of messages) {
+    if (msg && msg.role === 'system') parts.push(promptTextFromContent(msg.content));
+  }
+  return parts.filter(Boolean).join('\n').slice(0, maxBytes);
+}
+
+function firstUserPromptText(body, maxBytes = 4096) {
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const first = firstUserMessage(messages);
+  if (!first) return '';
+  const prompt = promptTextFromContent(first.content) || textFromContent(first.content);
+  return prompt.slice(0, maxBytes);
+}
+
+function conversationFingerprint(body) {
+  const features = {
+    system_head: systemPromptHead(body),
+    first_user: firstUserPromptText(body),
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(features)).digest('hex');
+}
+
+function normalizedText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function terminalMessageShape(body) {
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const latestIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i] && messages[i].role === 'user') return i;
+    }
+    return -1;
+  })();
+  if (latestIndex < 0) return { kind: 'none', text: '', toolUse: null };
+  const latest = messages[latestIndex];
+  const blocks = Array.isArray(latest.content) ? latest.content : [];
+  const toolResult = blocks.find(block => block && block.type === 'tool_result');
+  if (!toolResult) {
+    const text = promptTextFromContent(latest.content) || textFromContent(latest.content);
+    const lower = text.toLowerCase();
+    if (lower.includes('<task-notification>')
+        || lower.includes('stop-hook')
+        || lower.includes('stop_hook')
+        || lower.includes('monitor callback')) {
+      return { kind: 'notification', text, toolUse: null };
+    }
+    return { kind: 'real_user_text', text, toolUse: null };
+  }
+
+  const id = toolResult.tool_use_id || toolResult.id || '';
+  for (let i = latestIndex - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+    const match = msg.content.find(block => block && block.type === 'tool_use' && (!id || block.id === id));
+    if (match) return { kind: 'tool_result', text: textFromContent(toolResult.content), toolUse: match };
+  }
+  return { kind: 'tool_result', text: textFromContent(toolResult.content), toolUse: null };
+}
+
+function extractToolCommand(toolUse) {
+  if (!toolUse || typeof toolUse !== 'object') return { name: '', command: '', filePath: '' };
+  const name = String(toolUse.name || '');
+  const input = toolUse.input && typeof toolUse.input === 'object' ? toolUse.input : {};
+  const command = typeof input.command === 'string'
+    ? input.command
+    : typeof input.cmd === 'string'
+      ? input.cmd
+      : '';
+  const filePath = typeof input.file_path === 'string'
+    ? input.file_path
+    : typeof input.path === 'string'
+      ? input.path
+      : '';
+  return { name, command, filePath };
+}
+
+function promptCommandCandidate(shape) {
+  if (!shape || (shape.kind !== 'real_user_text' && shape.kind !== 'notification')) return '';
+  const text = normalizedText(shape.text);
+  const lower = text.toLowerCase();
+  if (!text) return '';
+  if (/\bdo\s+not\s+(?:poll|run|execute|check)\b/.test(lower)) return '';
+  if (/\bdon't\s+(?:poll|run|execute|check)\b/.test(lower)) return '';
+  return text;
+}
+
+function deriveRole(body, project, panel) {
+  const haystack = [
+    project || '',
+    panel || '',
+    systemPromptHead(body, 4096),
+    latestUserPromptText(body),
+  ].join('\n').toLowerCase();
+  if (/\borch\b/.test(haystack)
+      || haystack.includes('orchestrator')
+      || haystack.includes('miser_assignment=')
+      || haystack.includes('orch-control')
+      || haystack.includes('architect lane')) {
+    return 'ORCH';
+  }
+  if (haystack.includes('builder') || haystack.includes('codex builder') || haystack.includes('implementation lane')) {
+    return 'builder';
+  }
+  return 'unknown';
+}
+
+function commandMatches(command, patterns) {
+  return patterns.some(pattern => pattern.test(command));
+}
+
+const DISPATCH_OK_PATTERNS = [
+  /\bspawn-lane\.sh\b/,
+  /\bsafe-reap\.sh\b/,
+  /\btd-inject\b/,
+  /\bpost\b.*:(?:8001)\/v1\/orch\/[^/\s]+\/reply\b/i,
+  /\bcurl\b.*(?:-x\s+)?post\b.*\/v1\/orch\/[^/\s]+\/reply\b/i,
+  /^\s*git\s+fetch(?:\s+--[^\s]+|\s+\S+){0,2}\s*$/i,
+  /^\s*date(?:\s+[^\n;&|]+)?\s*$/i,
+];
+
+const POLL_CI_PATTERNS = [
+  /\bgh\s+run\s+(?:view|watch|list)\b/i,
+  /\bgh\s+pr\s+checks\b/i,
+  /\bgh\s+pr\s+view\b.*--json\b.*(?:state|statusCheckRollup)/i,
+  /\bgh\s+api\b.*check-runs\b/i,
+];
+
+const POLL_TERMDECK_PATTERNS = [
+  /\bcurl\b.*:(?:3100|3200)\/api\/sessions\b/i,
+  /\b(?:replyCount|lastActivity)\b/i,
+  /\/api\/sessions\/[A-Za-z0-9._:-]+/i,
+];
+
+const POLL_MISER_PATTERNS = [
+  /\bcurl\b.*:20128\/(?:health|stats|events)\b/i,
+  /\/api\/miser\b/i,
+  /\bmiser\b.*\b(?:logs?|tail)\b/i,
+];
+
+const POLL_HEALTH_PATTERNS = [
+  /\bsystemctl\s+(?:--user\s+)?status\b/i,
+  /(?:^|\s)~?\/?morning-health-check\.sh\b/i,
+  /\bnvidia-smi\b/i,
+  /\b(?:nc|lsof|ss)\b.*(?:-z|listen|sport|:)\b/i,
+];
+
+const SWEEP_REPO_PATTERNS = [
+  /\bgh\s+pr\s+list\b/i,
+  /\bfor\s+repo\s+in\b/i,
+  /\bmirror-[\w.-]*sweep\b/i,
+  /\bsweep\b.*\brepos?\b/i,
+];
+
+const LOOP_SHELL_PATTERNS = [
+  /\bwhile\b[\s\S]*\bsleep\b/i,
+  /(^|\s)watch\s+/i,
+  /\bsleep\s+\d+(?:\.\d+)?\s*&&/i,
+];
+
+const SELF_WORK_PATTERNS = [
+  /\bnpm\s+test\b/i,
+  /\bpytest\b/i,
+  /\bnode\s+--test\b/i,
+  /\b(?:cargo|go)\s+test\b/i,
+  /\bbenchmark\b/i,
+];
+
+function isDispatchArtifactPath(filePath) {
+  const s = String(filePath || '').toLowerCase();
+  return !!s && (
+    s.includes('/.sprint/')
+    || s.includes('/sprints/')
+    || s.includes('briefing')
+    || s.includes('dispatch')
+    || s.includes('handoff')
+    || s.includes('result')
+    || s.includes('status')
+  );
+}
+
+function isCodeOrTestPath(filePath) {
+  const s = String(filePath || '').toLowerCase();
+  if (!s || isDispatchArtifactPath(s)) return false;
+  return /(?:^|\/)(?:src|lib|app|server|test|tests|spec)\//.test(s)
+    || /\.(?:js|mjs|cjs|ts|tsx|jsx|py|go|rs|rb|java|c|cc|cpp|h|hpp|sh|json|ya?ml|toml)$/.test(s);
+}
+
+function classifyCommandClass(body, project, panel, role) {
+  const shape = terminalMessageShape(body);
+  const tool = extractToolCommand(shape.toolUse);
+  const name = tool.name.toLowerCase();
+  const command = normalizedText(tool.command || promptCommandCandidate(shape));
+  const filePath = tool.filePath;
+
+  if (command && commandMatches(command, DISPATCH_OK_PATTERNS)) return { commandClass: 'DISPATCH_OK', terminalShape: shape.kind };
+  if (filePath && isDispatchArtifactPath(filePath)) return { commandClass: 'DISPATCH_OK', terminalShape: shape.kind };
+  if (command && commandMatches(command, POLL_CI_PATTERNS)) return { commandClass: 'POLL_CI', terminalShape: shape.kind };
+  if (command && commandMatches(command, POLL_TERMDECK_PATTERNS)) return { commandClass: 'POLL_TERMDECK', terminalShape: shape.kind };
+  if (command && commandMatches(command, POLL_MISER_PATTERNS)) return { commandClass: 'POLL_MISER', terminalShape: shape.kind };
+  if (command && commandMatches(command, POLL_HEALTH_PATTERNS)) return { commandClass: 'POLL_HEALTH', terminalShape: shape.kind };
+  if (command && commandMatches(command, SWEEP_REPO_PATTERNS)) return { commandClass: 'SWEEP_REPO', terminalShape: shape.kind };
+  if (command && commandMatches(command, LOOP_SHELL_PATTERNS)) return { commandClass: 'LOOP_SHELL', terminalShape: shape.kind };
+  if (role === 'ORCH') {
+    if (command && commandMatches(command, SELF_WORK_PATTERNS)) return { commandClass: 'SELF_WORK', terminalShape: shape.kind };
+    if (['edit', 'write', 'multiedit'].includes(name) && isCodeOrTestPath(filePath)) {
+      return { commandClass: 'SELF_WORK', terminalShape: shape.kind };
+    }
+  }
+  return { commandClass: 'NEUTRAL', terminalShape: shape.kind };
+}
+
+function isRedirectableCommandClass(commandClass) {
+  return !['DISPATCH_OK', 'NEUTRAL'].includes(commandClass);
 }
 
 function hasTextMarker(text, markers) {
@@ -501,9 +742,16 @@ function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 
   const selfWorkText = [latestText, collectRecentToolText(body)].join('\n');
   const controlClasses = classifyControl(body, project, panel);
   const pureBradComms = controlClasses.length === 1 && controlClasses[0] === 'brad_comms';
+  const role = deriveRole(body, project, panel);
+  const command = classifyCommandClass(body, project, panel, role);
   return {
     project: project || 'default',
     panel: panel || null,
+    role,
+    conversationFingerprint: conversationFingerprint(body),
+    commandClass: command.commandClass,
+    terminalShape: command.terminalShape,
+    redirectable: isRedirectableCommandClass(command.commandClass),
     latestUserText: latestText,
     latestUserPromptText: latestPromptText,
     pollClass: compactHeaders['x-miser-poll-class'] || compactHeaders['X-Miser-Poll-Class'] || 'unknown',
@@ -546,6 +794,13 @@ function createEnforcementState(opts = {}) {
   const nowMs = opts.nowMs || (() => Date.now());
   const sessions = new Map();
   const events = [];
+  const redirectStats = {
+    wouldSynthesize: 0,
+    byCommandClass: {},
+    byRole: {},
+    byMode: {},
+    byFingerprint: {},
+  };
 
   function get(project, panel) {
     const key = stateKey(project, panel);
@@ -726,6 +981,29 @@ function createEnforcementState(opts = {}) {
     return stamped;
   }
 
+  function recordRedirectDecision(project, panel, event) {
+    const stamped = {
+      ...event,
+      project,
+      panel: panel || null,
+      at: new Date(nowMs()).toISOString(),
+    };
+    if (event.would_synthesize === true) {
+      redirectStats.wouldSynthesize += 1;
+      const commandClass = event.commandClass || 'NEUTRAL';
+      const role = event.role || 'unknown';
+      const mode = event.mode || 'off';
+      const fingerprint = event.fingerprint || 'unknown';
+      redirectStats.byCommandClass[commandClass] = (redirectStats.byCommandClass[commandClass] || 0) + 1;
+      redirectStats.byRole[role] = (redirectStats.byRole[role] || 0) + 1;
+      redirectStats.byMode[mode] = (redirectStats.byMode[mode] || 0) + 1;
+      redirectStats.byFingerprint[fingerprint] = (redirectStats.byFingerprint[fingerprint] || 0) + 1;
+    }
+    events.push(stamped);
+    while (events.length > 500) events.shift();
+    return stamped;
+  }
+
   function snapshot() {
     return {
       warm: sessions.size > 0,
@@ -735,11 +1013,18 @@ function createEnforcementState(opts = {}) {
         controlAt: [...st.controlAt],
         selfWorkAt: [...st.selfWorkAt],
       })),
+      redirect: {
+        wouldSynthesize: redirectStats.wouldSynthesize,
+        byCommandClass: { ...redirectStats.byCommandClass },
+        byRole: { ...redirectStats.byRole },
+        byMode: { ...redirectStats.byMode },
+        byFingerprint: { ...redirectStats.byFingerprint },
+      },
       recentEvents: [...events],
     };
   }
 
-  return { get, resetControlLoop, recordRequest, recordUsage, recordDecision, snapshot };
+  return { get, resetControlLoop, recordRequest, recordUsage, recordDecision, recordRedirectDecision, snapshot };
 }
 
 const defaultState = createEnforcementState();
@@ -895,6 +1180,104 @@ function buildWarningResponse(reason, mode, message, model = 'miser-enforcement-
   };
 }
 
+function syntheticText(text) {
+  const body = String(text || '').trim();
+  if (body.startsWith('[MISER-SYNTHETIC]')) return body;
+  return `[MISER-SYNTHETIC]${body ? ` ${body}` : ''}`;
+}
+
+function zeroUsage() {
+  return {
+    input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 0,
+  };
+}
+
+function miserMessageId(prefix = 'msg_miser') {
+  return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function buildSyntheticMessageResponse(originalBody = {}, text = '', opts = {}) {
+  return {
+    id: opts.id || miserMessageId(),
+    type: 'message',
+    role: 'assistant',
+    model: opts.model || originalBody.model || 'miser-synthetic',
+    content: [{ type: 'text', text: syntheticText(text) }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: zeroUsage(),
+  };
+}
+
+function anthropicSseFrame(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function buildSyntheticSseResponse(originalBody = {}, text = '', opts = {}) {
+  const body = buildSyntheticMessageResponse(originalBody, text, opts);
+  return [
+    anthropicSseFrame('message_start', {
+      type: 'message_start',
+      message: {
+        id: body.id,
+        type: 'message',
+        role: 'assistant',
+        model: body.model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: body.usage,
+      },
+    }),
+    anthropicSseFrame('content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    }),
+    anthropicSseFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: body.content[0].text },
+    }),
+    anthropicSseFrame('content_block_stop', {
+      type: 'content_block_stop',
+      index: 0,
+    }),
+    anthropicSseFrame('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 0 },
+    }),
+    anthropicSseFrame('message_stop', { type: 'message_stop' }),
+  ].join('');
+}
+
+function maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps) {
+  const redirectMode = policy.redirect && policy.redirect.mode ? policy.redirect.mode : DEFAULT_POLICY.redirect.mode;
+  if (redirectMode !== 'shadow') return;
+  const event = {
+    decision: 'would_synthesize',
+    reason: 'zero-llm-redirect-shadow',
+    mode: redirectMode,
+    would_synthesize: classification.redirectable === true,
+    commandClass: classification.commandClass,
+    role: classification.role,
+    fingerprint: classification.conversationFingerprint,
+    terminalShape: classification.terminalShape,
+  };
+  if (typeof state.recordRedirectDecision === 'function') {
+    state.recordRedirectDecision(project, panel, event);
+  } else {
+    state.recordDecision(project, panel, event);
+  }
+  if (guardDeps.recordEnforcementEvent) {
+    guardDeps.recordEnforcementEvent(project, event, guardDeps.nowFn || (() => new Date()));
+  }
+}
+
 function modeDecision(mode) {
   if (mode === 'observe') return 'would_block';
   if (mode === 'alert') return 'alert';
@@ -953,6 +1336,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
 
   const state = guardDeps.enforcementState || defaultState;
   const classification = classifyRequest(project, panel, body, compactHeaders, rawTokens);
+  maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps);
   const promptText = classification.latestUserPromptText || '';
   classification.revisionLike = textLooksRevisionLike(promptText, policy.orchControl && policy.orchControl.revisionMarkers);
   classification.handoffMarked = isHandoffMarkedTurn(policy, promptText, requestHeaders);
@@ -1133,6 +1517,9 @@ module.exports = {
   parseEnforcement,
   resolvePolicy,
   classifyRequest,
+  conversationFingerprint,
+  buildSyntheticMessageResponse,
+  buildSyntheticSseResponse,
   createEnforcementState,
   checkEnforcement,
   recordEnforcementUsage,
