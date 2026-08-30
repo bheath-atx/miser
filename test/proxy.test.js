@@ -447,10 +447,11 @@ test('enforcement canary warns before blocking repeated NACHO ORCH-control poll 
   const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok', usage: { input_tokens: 1 } } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {
     MISER_ENFORCEMENT: JSON.stringify({
-      '*': { mode: 'observe' },
+      '*': { mode: 'observe', override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' } },
       'nacho-orch': {
         mode: 'throttle',
         poll: { maxLikelyPollsPer10Min: 1, maxLikelyPollsPerHour: 6, minIdlePollSpacingSec: 600 },
+        orchControl: { enabled: true, panels: ['sprints'], maxManagementTurnsPerAssignment: 99 },
       },
     }),
   });
@@ -492,10 +493,11 @@ test('enforcement warning honors Anthropic streaming requests with SSE', async (
   const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok', usage: { input_tokens: 1 } } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {
     MISER_ENFORCEMENT: JSON.stringify({
-      '*': { mode: 'observe' },
+      '*': { mode: 'observe', override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' } },
       'nacho-orch': {
         mode: 'throttle',
         poll: { maxLikelyPollsPer10Min: 1, maxLikelyPollsPerHour: 6, minIdlePollSpacingSec: 600 },
+        orchControl: { enabled: true, panels: ['sprints'], maxManagementTurnsPerAssignment: 99 },
       },
     }),
   });
