@@ -1534,6 +1534,10 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   const now = guardDeps.nowFn ? guardDeps.nowFn().getTime() : Date.now();
   pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
   pruneTimes(st.controlAt, now - 60 * 60 * 1000);
+
+  const redirect = buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body);
+  if (redirect) return redirect;
+
   if (overrideActive) return null;
 
   const toolMode = policy.toolResults && policy.toolResults.mode;
@@ -1671,9 +1675,6 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
       'miser: poll-heavy session exceeded allowed ratio; move monitoring to an artifact',
       600);
   }
-
-  const redirect = buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body);
-  if (redirect) return redirect;
 
   return null;
 }

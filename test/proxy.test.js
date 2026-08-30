@@ -660,20 +660,24 @@ function redirectTurnBody(command, extra = {}) {
   };
 }
 
-function redirectEnv(mode, watchDir) {
+function redirectEnv(mode, watchDir, opts = {}) {
+  const overrideFile = opts.overrideFile || '/tmp/miser-proxy-test-overrides-never.json';
+  const projectPolicy = opts.projectPolicy || null;
+  const config = {
+    '*': {
+      mode: 'observe',
+      redirect: { mode },
+      override: { overrideFile },
+    },
+  };
+  if (projectPolicy) config.aetheria = projectPolicy;
   return {
     MISER_WATCH_DIR: watchDir,
-    MISER_ENFORCEMENT: JSON.stringify({
-      '*': {
-        mode: 'observe',
-        redirect: { mode },
-        override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' },
-      },
-    }),
+    MISER_ENFORCEMENT: JSON.stringify(config),
   };
 }
 
-async function driveRedirectCase({ mode, body, watchDir, echoBody = null }) {
+async function driveRedirectCase({ mode, body, watchDir, echoBody = null, overrideFile = null, projectPolicy = null }) {
   const upstreamBody = echoBody || {
     id: `msg_upstream_${mode}`,
     type: 'message',
@@ -685,7 +689,7 @@ async function driveRedirectCase({ mode, body, watchDir, echoBody = null }) {
     usage: { input_tokens: 1, output_tokens: 1 },
   };
   const echo = await startEcho(() => ({ status: 200, body: upstreamBody }));
-  const { createProxy, restoreEnv } = freshProxy(echo.url, redirectEnv(mode, watchDir));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, redirectEnv(mode, watchDir, { overrideFile, projectPolicy }));
   try {
     const config = require('../src/config.js');
     const { buildGuardDeps } = require('../src/budgets.js');
@@ -825,6 +829,174 @@ test('redirect enforce with missing watcher artifact returns safe no-poll instru
       assert.match(payload.content[0].text, /Do not poll live from Claude/);
       assert.match(payload.content[0].text, /miser\.md/);
       assert.equal(ctx.guardDeps.enforcementState.snapshot().recentEvents[0].artifactMissing, true);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect warn still avoids upstream when a project override is active', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-warn-override-${process.pid}-`));
+  const overrideFile = path.join(watchDir, 'overrides.json');
+  try {
+    fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nfrom watcher\n', 'utf8');
+    fs.writeFileSync(overrideFile, JSON.stringify({ aetheria: true }), 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'warn',
+      watchDir,
+      overrideFile,
+      body: redirectTurnBody('gh run view 123 --log'),
+    });
+    try {
+      const payload = JSON.parse(ctx.res.body());
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'warn');
+      assert.match(payload.content[0].text, /Do not poll live from Claude/);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce still avoids upstream when a project override is active', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-enforce-override-${process.pid}-`));
+  const overrideFile = path.join(watchDir, 'overrides.json');
+  try {
+    fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\noverride window artifact\n', 'utf8');
+    fs.writeFileSync(overrideFile, JSON.stringify({ aetheria: true }), 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      overrideFile,
+      body: redirectTurnBody('gh run view 123 --log'),
+    });
+    try {
+      const payload = JSON.parse(ctx.res.body());
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
+      assert.match(payload.content[0].text, /override window artifact/);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('override still bypasses normal block enforcement for non-redirect turns', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-override-block-${process.pid}-`));
+  const overrideFile = path.join(watchDir, 'overrides.json');
+  try {
+    fs.writeFileSync(overrideFile, JSON.stringify({ aetheria: true }), 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      overrideFile,
+      projectPolicy: {
+        mode: 'throttle',
+        redirect: { mode: 'enforce' },
+        override: { overrideFile },
+        orchControl: {
+          enabled: true,
+          panels: ['orch'],
+          maxManagementTurnsPerAssignment: 0,
+          warnManagementTurnsPerAssignment: 99,
+        },
+      },
+      body: {
+        model: 'claude-sonnet-5-test',
+        max_tokens: 50,
+        system: 'You are the ORCH controller.',
+        messages: [{ role: 'user', content: 'proposal mediation for this assignment' }],
+      },
+    });
+    try {
+      assert.equal(ctx.echo.captured.length, 1);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.deepEqual(JSON.parse(ctx.res.body()), ctx.upstreamBody);
+      assert.ok(!ctx.res.headers['x-miser-redirect']);
+      assert.ok(!ctx.res.headers['x-miser-enforcement']);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce wins over generic poll-budget responses for safe poll turns', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-precedence-${process.pid}-`));
+  try {
+    fs.writeFileSync(path.join(watchDir, 'miser.md'), 'VERDICT: OK\nbudget-edge artifact\n', 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      projectPolicy: {
+        mode: 'throttle',
+        redirect: { mode: 'enforce' },
+        override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' },
+        poll: { maxLikelyPollsPer10Min: 1, maxLikelyPollsPerHour: 1, minIdlePollSpacingSec: 600 },
+        orchControl: {
+          enabled: true,
+          panels: ['orch'],
+          maxManagementTurnsPerAssignment: 99,
+        },
+      },
+      body: redirectTurnBody('curl http://127.0.0.1:20128/api/miser/stats'),
+    });
+    try {
+      const payload = JSON.parse(ctx.res.body());
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
+      assert.equal(ctx.res.headers['x-miser-enforcement'], 'zero-llm-redirect');
+      assert.notEqual(ctx.res.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
+      assert.match(payload.content[0].text, /budget-edge artifact/);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('hard non-redirect ORCH budget blocks still avoid upstream', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-hard-block-${process.pid}-`));
+  try {
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      projectPolicy: {
+        mode: 'throttle',
+        redirect: { mode: 'enforce' },
+        override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' },
+        orchControl: {
+          enabled: true,
+          panels: ['orch'],
+          maxManagementTurnsPerAssignment: 0,
+          warnManagementTurnsPerAssignment: 99,
+        },
+      },
+      body: {
+        model: 'claude-sonnet-5-test',
+        max_tokens: 50,
+        system: 'You are the ORCH controller.',
+        messages: [{ role: 'user', content: 'proposal mediation for this assignment' }],
+      },
+    });
+    try {
+      const payload = JSON.parse(ctx.res.body());
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 429);
+      assert.equal(ctx.res.headers['x-miser-enforcement'], 'orch-assignment-budget');
+      assert.ok(!ctx.res.headers['x-miser-redirect']);
+      assert.match(payload.error.message, /ORCH assignment management budget exceeded/);
     } finally {
       ctx.cleanup();
     }
