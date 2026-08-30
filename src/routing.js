@@ -30,6 +30,7 @@ function classifyRoute(method, reqUrl) {
   if (method === 'GET' && pathname === '/api/miser/stats') return { kind: 'stats' };
   if (method === 'GET' && pathname === '/api/miser/metrics') return { kind: 'metrics' };
   if (method === 'GET' && pathname === '/api/miser/stats/panels') return { kind: 'stats_panels' };
+  if (method === 'POST' && pathname === '/api/miser/watch/refresh') return { kind: 'watch_refresh' };
 
   if (method === 'POST' && pathname === '/v1/messages') return { kind: 'messages', format: 'anthropic' };
   if (method === 'POST' && pathname === '/v1/chat/completions') return { kind: 'messages', format: 'openai' };

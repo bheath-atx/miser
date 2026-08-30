@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Local failover routing and billing observability for Claude Code and the TermDeck stack",
   "main": "src/index.js",
+  "bin": {
+    "miser-watchd": "bin/miser-watchd.js"
+  },
   "scripts": {
     "start": "node src/index.js",
     "test": "node --require ./test/live-file-guard.js --test test/*.test.js"

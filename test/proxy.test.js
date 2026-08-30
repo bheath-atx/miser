@@ -45,7 +45,7 @@ function startEcho(handler) {
 // their pricing dep) must be re-required in the same sweep as stats.
 function freshProxy(anthropicUrl, extraEnv = {}) {
   for (const k of Object.keys(require.cache)) {
-    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage|budgets|policy-watchdog|pricing|daily-rollup|alert-ledger|enforcement)\.js$/.test(k.replace(/\\/g, '/'))) {
+    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage|budgets|policy-watchdog|pricing|daily-rollup|alert-ledger|enforcement|watchd)\.js$/.test(k.replace(/\\/g, '/'))) {
       delete require.cache[k];
     }
   }
@@ -358,6 +358,34 @@ test('/api/miser/stats exposes top-level weekly authority rollup without lowerin
     assert.equal(week.authoritative, false);
     assert.equal(week.nonAuthoritativeReason, 'missing_weekly_provenance');
     assert.equal(week.coverage, undefined);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('/api/miser/watch/refresh runs a configured watcher probe on demand', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: {} }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_WATCH_PROBES: JSON.stringify({ ci: { command: 'echo ok', ttl_s: 90, timeout_s: 5 } }),
+  });
+  try {
+    let calls = 0;
+    const watcher = {
+      async refreshProbe(id) {
+        calls += 1;
+        assert.equal(id, 'ci');
+        return { ok: true, status: 'ok', probe_id: id, in_flight: false };
+      },
+    };
+    const handler = createProxy({ watcher });
+    const res = fakeRes();
+    const done = res.whenDone();
+    handler(fakeReq('POST', '/api/miser/watch/refresh?id=ci', null, {}), res);
+    await done;
+    assert.equal(calls, 1);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(JSON.parse(res.body()), { ok: true, status: 'ok', probe_id: 'ci', in_flight: false });
+    assert.equal(echo.captured.length, 0);
   } finally {
     echo.server.close(); restoreEnv();
   }
