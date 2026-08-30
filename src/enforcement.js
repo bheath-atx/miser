@@ -29,6 +29,10 @@ const DEFAULT_POLICY = Object.freeze({
     maxControlTurnsPerHour: 6,
     maxControlTurnsPerSession: 12,
     maxRevisionCycles: 2,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+    duplicateDebounceMs: 2000,
+    newConversationAssistantTurnDrop: 4,
     assignmentIdHeader: 'x-miser-assignment-id',
     assignmentIdMarker: 'MISER_ASSIGNMENT=',
     approvalHeader: 'x-miser-brad-approval',
@@ -234,6 +238,19 @@ function collectClassifierText(body, project, panel) {
   return parts.join('\n').toLowerCase();
 }
 
+function collectRecentToolText(body, window = 2) {
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const parts = [];
+  for (let i = Math.max(0, messages.length - window); i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block && block.type === 'tool_use') parts.push(textFromContent([block]));
+    }
+  }
+  return parts.join('\n').toLowerCase();
+}
+
 function includesAny(haystack, needles) {
   return needles.some(needle => haystack.includes(needle));
 }
@@ -333,6 +350,103 @@ function textLooksRevisionLike(text, markers = []) {
   ]);
 }
 
+function lineIsNegatedInstruction(line) {
+  const lower = String(line || '').toLowerCase();
+  return /\b(do not|don't|no|never|must not)\b/.test(lower)
+    && /\b(poll|health|census|status|session|api\/sessions)\b/.test(lower);
+}
+
+function lineIsNegatedSelfWorkInstruction(line) {
+  const lower = String(line || '').toLowerCase();
+  return /\b(do not|don't|no|never|must not)\b/.test(lower)
+    && /\b(run|use|call|poll|inspect|check|read|write|edit|build|code|implement|fix|audit)\b/.test(lower);
+}
+
+function textLooksPollingCommandLike(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    if (lineIsNegatedInstruction(lower)) continue;
+    if (includesAny(lower, [
+      '/api/sessions',
+      '/api/miser',
+      'replycount',
+      'lastactivity',
+      'while true',
+      'while sleep',
+      'watch ',
+      'tail -f',
+      'health check',
+      'morning-health-check',
+      'census',
+      'orch-token-gauge',
+      'weekly-pace',
+      'gh run',
+      'gh pr view',
+      'check status',
+      'ci status',
+    ])) return true;
+    if (/\bpoll(?:ing)?\b/.test(lower) && /\b(termdeck|session|fleet|status|audit|result|health)\b/.test(lower)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function textLooksSelfWorkCommandLike(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    if (lineIsNegatedSelfWorkInstruction(lower)) continue;
+
+    const dispatchOnly = includesAny(lower, [
+      'spawn-lane.sh',
+      'td-inject.sh',
+      'spawn-codex-audit.sh',
+      'spawn-grok-audit.sh',
+    ]) && !includesAny(lower, [
+      'while ',
+      ' sleep ',
+      'gh run',
+      'gh pr',
+      'git ',
+      'npm ',
+      'pnpm ',
+      'yarn ',
+      '/api/sessions',
+      '/api/miser',
+    ]);
+    if (dispatchOnly) continue;
+
+    if (includesAny(lower, [
+      'read {"file_path"',
+      'write {"file_path"',
+      'edit {"file_path"',
+      'multiedit {"file_path"',
+      'mcp__plugin_vercel',
+      'mcp__claude_ai_vercel',
+      'mcp__supabase',
+      'plugin:vercel',
+      'gh run',
+      'gh pr',
+      'git status',
+      'git diff',
+      'git show',
+      'git log',
+      'npm run',
+      'pnpm ',
+      'yarn ',
+      'curl ',
+      'sed -n',
+      'nl -ba',
+      'rg ',
+      'cat ',
+      'find ',
+    ])) return true;
+  }
+  return false;
+}
+
 function classifyControl(body, project, panel) {
   const text = collectClassifierText(body, project, panel);
   const classes = [];
@@ -383,7 +497,10 @@ function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
   const latestText = latestUserText(body);
   const latestPromptText = latestUserPromptText(body);
+  const classifierText = collectClassifierText(body, project, panel);
+  const selfWorkText = [latestText, collectRecentToolText(body)].join('\n');
   const controlClasses = classifyControl(body, project, panel);
+  const pureBradComms = controlClasses.length === 1 && controlClasses[0] === 'brad_comms';
   return {
     project: project || 'default',
     panel: panel || null,
@@ -394,6 +511,8 @@ function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 
     isControl: controlClasses.length > 0,
     managementLike: textLooksManagementLike(latestText),
     revisionLike: textLooksRevisionLike(latestText, DEFAULT_POLICY.orchControl.revisionMarkers),
+    pollingCommandLike: textLooksPollingCommandLike(classifierText),
+    selfWorkCommandLike: !pureBradComms && textLooksSelfWorkCommandLike(selfWorkText),
     assistantTurns: assistantTurns(messages),
     messageCount: messages.length,
     rawTokens: Number.isFinite(rawTokens) ? rawTokens : 0,
@@ -436,18 +555,26 @@ function createEnforcementState(opts = {}) {
         panel: panel || null,
         likelyPollAt: [],
         controlAt: [],
+        selfWorkAt: [],
         totalRequests: 0,
         likelyPollRequests: 0,
         controlTurns: 0,
+        selfWorkTurns: 0,
         postCapHandoffTurns: 0,
         inboundBradReplyTurns: 0,
         currentAssignmentId: null,
         assignmentStartedAt: null,
         assignmentManagementTurns: 0,
         assignmentWarningSent: false,
+        selfWorkWarningSent: false,
         assignmentBlocked: false,
         assignmentRevisionCycles: 0,
         dispatchFinalizeUsed: false,
+        lastSeenAt: null,
+        lastAssistantTurns: 0,
+        lastMessageCount: 0,
+        lastCountedAt: null,
+        lastCountedFingerprint: null,
         freshInput: 0,
         weighted: 0,
         blocks: 0,
@@ -473,6 +600,54 @@ function createEnforcementState(opts = {}) {
     return st;
   }
 
+  function resetProtectedSessionWindow(st, now) {
+    st.likelyPollAt = [];
+    st.controlAt = [];
+    st.selfWorkAt = [];
+    st.totalRequests = 0;
+    st.likelyPollRequests = 0;
+    st.controlTurns = 0;
+    st.selfWorkTurns = 0;
+    st.postCapHandoffTurns = 0;
+    st.inboundBradReplyTurns = 0;
+    st.currentAssignmentId = null;
+    st.assignmentStartedAt = now;
+    st.assignmentManagementTurns = 0;
+    st.assignmentWarningSent = false;
+    st.selfWorkWarningSent = false;
+    st.assignmentBlocked = false;
+    st.assignmentRevisionCycles = 0;
+    st.dispatchFinalizeUsed = false;
+    st.lastCountedAt = null;
+    st.lastCountedFingerprint = null;
+    return st;
+  }
+
+  function looksLikeNewConversation(st, classification, opts = {}) {
+    if (!opts.protectedPanel || st.totalRequests === 0) return false;
+    const turnDrop = opts.newConversationAssistantTurnDrop ?? DEFAULT_POLICY.orchControl.newConversationAssistantTurnDrop;
+    if (st.lastAssistantTurns >= turnDrop && classification.assistantTurns <= 1) return true;
+    if (st.lastMessageCount >= 12 && classification.messageCount > 0 && classification.messageCount + 4 < st.lastMessageCount) return true;
+    return false;
+  }
+
+  function countedFingerprint(classification) {
+    return [
+      classification.pollClass || '',
+      classification.assistantTurns || 0,
+      classification.messageCount || 0,
+      classification.latestUserPromptText || classification.latestUserText || '',
+      (classification.controlClasses || []).join(','),
+    ].join('\u001f');
+  }
+
+  function isDuplicateCountedTurn(st, classification, now, opts = {}) {
+    const debounceMs = opts.duplicateDebounceMs ?? DEFAULT_POLICY.orchControl.duplicateDebounceMs;
+    if (!debounceMs || !st.lastCountedAt || now - st.lastCountedAt > debounceMs) return false;
+    const fp = countedFingerprint(classification);
+    return fp === st.lastCountedFingerprint;
+  }
+
   function resetControlLoop(project, panel) {
     const st = get(project, panel);
     st.likelyPollAt = [];
@@ -490,6 +665,10 @@ function createEnforcementState(opts = {}) {
     const st = get(project, panel);
     pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
     pruneTimes(st.controlAt, now - 60 * 60 * 1000);
+    pruneTimes(st.selfWorkAt, now - 60 * 60 * 1000);
+    if (looksLikeNewConversation(st, classification, opts)) {
+      resetProtectedSessionWindow(st, now);
+    }
     if (opts.protectedPanel) {
       if (!st.currentAssignmentId && opts.assignmentId) {
         resetAssignment(st, opts.assignmentId, now, true);
@@ -502,19 +681,29 @@ function createEnforcementState(opts = {}) {
       resetControlLoop(project, panel);
     }
     st.totalRequests += 1;
+    st.lastSeenAt = now;
+    st.lastAssistantTurns = classification.assistantTurns;
+    st.lastMessageCount = classification.messageCount;
+    const duplicateCountedTurn = opts.countedManagement && isDuplicateCountedTurn(st, classification, now, opts);
     const countsForPoll = opts.protectedPanel ? opts.countedManagement : classification.isControl;
     const countsForControl = opts.protectedPanel ? opts.countedManagement && classification.isControl : classification.isControl;
-    if (classification.pollClass === 'likely' && countsForPoll) {
+    if (classification.pollClass === 'likely' && countsForPoll && classification.pollingCommandLike && !duplicateCountedTurn) {
       st.likelyPollRequests += 1;
       st.likelyPollAt.push(now);
     }
-    if (countsForControl) {
+    if (countsForControl && !duplicateCountedTurn) {
       st.controlTurns += 1;
       st.controlAt.push(now);
     }
-    if (opts.protectedPanel && opts.countedManagement) {
+    if (opts.protectedPanel && opts.countedManagement && classification.selfWorkCommandLike && !duplicateCountedTurn) {
+      st.selfWorkTurns += 1;
+      st.selfWorkAt.push(now);
+    }
+    if (opts.protectedPanel && opts.countedManagement && !duplicateCountedTurn) {
       st.assignmentManagementTurns += 1;
       if (classification.revisionLike) st.assignmentRevisionCycles += 1;
+      st.lastCountedAt = now;
+      st.lastCountedFingerprint = countedFingerprint(classification);
     }
     return st;
   }
@@ -540,7 +729,12 @@ function createEnforcementState(opts = {}) {
   function snapshot() {
     return {
       warm: sessions.size > 0,
-      sessions: Array.from(sessions.values()).map(st => ({ ...st, likelyPollAt: [...st.likelyPollAt], controlAt: [...st.controlAt] })),
+      sessions: Array.from(sessions.values()).map(st => ({
+        ...st,
+        likelyPollAt: [...st.likelyPollAt],
+        controlAt: [...st.controlAt],
+        selfWorkAt: [...st.selfWorkAt],
+      })),
       recentEvents: [...events],
     };
   }
@@ -596,6 +790,7 @@ function orchControlApplies(panel, policy) {
 
 function isCountedOrchManagementTurn(policy, classification) {
   const orch = policy.orchControl || {};
+  if (classification.selfWorkCommandLike) return true;
   if (classification.isControl) {
     const classes = Array.isArray(orch.controlClasses) ? orch.controlClasses : [];
     if (classes.length === 0) return true;
@@ -781,6 +976,8 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
     assignmentId,
     resetAssignment,
     resetAllowances,
+    duplicateDebounceMs: policy.orchControl.duplicateDebounceMs,
+    newConversationAssistantTurnDrop: policy.orchControl.newConversationAssistantTurnDrop,
   });
   const now = guardDeps.nowFn ? guardDeps.nowFn().getTime() : Date.now();
   pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
@@ -796,7 +993,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
       null);
   }
 
-  if (classification.pollClass === 'likely' && protectedPanel && countedManagement) {
+  if (classification.pollClass === 'likely' && protectedPanel && countedManagement && classification.pollingCommandLike) {
     const counts = pollCounts(st, now);
     const tenMinLimit = policy.poll.maxLikelyPollsPer10Min || DEFAULT_POLICY.poll.maxLikelyPollsPer10Min;
     const hourLimit = policy.poll.maxLikelyPollsPerHour || DEFAULT_POLICY.poll.maxLikelyPollsPerHour;
@@ -822,6 +1019,36 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
         'architect-revision-budget',
         'miser: architect/proposal revision budget exceeded; Brad approval is required before another automatic revision cycle',
         600);
+    }
+
+    const selfWorkWarnAt = policy.orchControl.warnSelfWorkTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.warnSelfWorkTurnsPerAssignment;
+    const maxSelfWork = policy.orchControl.maxSelfWorkTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.maxSelfWorkTurnsPerAssignment;
+    if (classification.selfWorkCommandLike && st.selfWorkTurns > maxSelfWork) {
+      if (isDispatchFinalizeTurn(policy, classification, requestHeaders) && !st.dispatchFinalizeUsed) {
+        st.dispatchFinalizeUsed = true;
+        return null;
+      }
+      if (policy.orchControl.terminalHandoffAllowed && isTerminalHandoffTurn(classification)
+          && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns ?? DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
+        st.postCapHandoffTurns += 1;
+        return null;
+      }
+      if (isInboundBradTurn(classification)
+          && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns ?? DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
+        st.inboundBradReplyTurns += 1;
+        return null;
+      }
+      return maybeBlock(project, panel, policy, classification, state, guardDeps,
+        'orch-self-work-budget',
+        'miser: ORCH self-work budget exceeded; dispatch to a builder/auditor, write a compact handoff, or get explicit Brad approval before more repo/CI/file/plugin work',
+        600);
+    }
+    if (classification.selfWorkCommandLike && st.selfWorkTurns === selfWorkWarnAt && !st.selfWorkWarningSent) {
+      st.selfWorkWarningSent = true;
+      return maybeWarn(project, panel, policy, classification, state, guardDeps,
+        'orch-self-work-budget-edge',
+        'miser warning: this ORCH has used its self-work allowance; the next repo/CI/file/plugin work continuation will be blocked. Dispatch to a builder/auditor or finish with a compact handoff.',
+        body && body.model);
     }
 
     const warnAt = policy.orchControl.warnManagementTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.warnManagementTurnsPerAssignment;
