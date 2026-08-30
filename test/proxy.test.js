@@ -646,6 +646,266 @@ test('redirect shadow classifies ORCH gh run view but passes upstream response t
   }
 });
 
+function redirectTurnBody(command, extra = {}) {
+  return {
+    model: 'claude-sonnet-5-test',
+    max_tokens: 50,
+    system: 'You are the ORCH controller.',
+    ...extra,
+    messages: [
+      { role: 'user', content: 'MISER_ASSIGNMENT=A check watcher-backed state once' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'poll command output' }] },
+    ],
+  };
+}
+
+function redirectEnv(mode, watchDir) {
+  return {
+    MISER_WATCH_DIR: watchDir,
+    MISER_ENFORCEMENT: JSON.stringify({
+      '*': {
+        mode: 'observe',
+        redirect: { mode },
+        override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' },
+      },
+    }),
+  };
+}
+
+async function driveRedirectCase({ mode, body, watchDir, echoBody = null }) {
+  const upstreamBody = echoBody || {
+    id: `msg_upstream_${mode}`,
+    type: 'message',
+    role: 'assistant',
+    model: 'claude-sonnet-5-test',
+    content: [{ type: 'text', text: `upstream ${mode}` }],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  };
+  const echo = await startEcho(() => ({ status: 200, body: upstreamBody }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, redirectEnv(mode, watchDir));
+  try {
+    const config = require('../src/config.js');
+    const { buildGuardDeps } = require('../src/budgets.js');
+    const guardDeps = buildGuardDeps(config, { createLedger: () => ({ shouldSend: () => false, markSent: () => {} }) });
+    const handler = createProxy({ guardDeps });
+    const res = fakeRes();
+    const done = res.whenDone();
+    handler(fakeReq('POST', '/p/aetheria--orch/v1/messages', body, {}), res);
+    await done;
+    return { res, echo, upstreamBody, guardDeps, cleanup: () => { echo.server.close(); restoreEnv(); } };
+  } catch (err) {
+    echo.server.close(); restoreEnv();
+    throw err;
+  }
+}
+
+test('redirect off passes poll/control turns through to upstream', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-off-${process.pid}-`));
+  try {
+    fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nfrom watcher\n', 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'off',
+      watchDir,
+      body: redirectTurnBody('gh run view 123 --log'),
+    });
+    try {
+      assert.equal(ctx.echo.captured.length, 1);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.deepEqual(JSON.parse(ctx.res.body()), ctx.upstreamBody);
+      assert.ok(!ctx.res.headers['x-miser-redirect']);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect warn returns synthetic watcher guidance and avoids upstream', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-warn-${process.pid}-`));
+  try {
+    fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nfrom watcher\n', 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'warn',
+      watchDir,
+      body: redirectTurnBody('gh run view 123 --log'),
+    });
+    try {
+      const payload = JSON.parse(ctx.res.body());
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['x-miser-redirect'], 'zero-llm-redirect');
+      assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'warn');
+      assert.equal(ctx.res.headers['x-miser-redirect-class'], 'POLL_CI');
+      assert.equal(ctx.res.headers['x-miser-watch-artifact'], path.join(watchDir, 'ci.md'));
+      assert.match(payload.content[0].text, /^\[MISER-SYNTHETIC\]/);
+      assert.match(payload.content[0].text, /Do not poll live from Claude/);
+      assert.match(payload.content[0].text, /ci\.md/);
+      assert.equal(payload.content.some(block => block.type === 'tool_use'), false);
+      assert.equal(ctx.guardDeps.enforcementState.snapshot().redirect.wouldSynthesize, 1);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce returns synthetic watcher artifact content and avoids upstream', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-enforce-${process.pid}-`));
+  try {
+    fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nprobe: ci\nOUTPUT_HEAD:\nall green\n', 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      body: redirectTurnBody('gh run view 123 --log'),
+    });
+    try {
+      const payload = JSON.parse(ctx.res.body());
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['x-miser-enforcement'], 'zero-llm-redirect');
+      assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
+      assert.match(payload.content[0].text, /redirected to zero-LLM watcher artifact/);
+      assert.match(payload.content[0].text, /VERDICT: OK/);
+      assert.match(payload.content[0].text, /all green/);
+      assert.equal(ctx.guardDeps.enforcementState.snapshot().recentEvents[0].decision, 'synthesize');
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce honors Anthropic streaming requests with synthetic SSE and avoids upstream', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-sse-${process.pid}-`));
+  try {
+    fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nstream artifact\n', 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      body: redirectTurnBody('gh run view 123 --log', { stream: true }),
+    });
+    try {
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['content-type'], 'text/event-stream');
+      assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
+      assert.match(ctx.res.body(), /event: message_start/);
+      assert.match(ctx.res.body(), /event: content_block_delta/);
+      assert.match(ctx.res.body(), /stream artifact/);
+      assert.match(ctx.res.body(), /event: message_stop/);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce with missing watcher artifact returns safe no-poll instruction', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-missing-${process.pid}-`));
+  try {
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      body: redirectTurnBody('curl http://127.0.0.1:20128/api/miser/stats'),
+    });
+    try {
+      const payload = JSON.parse(ctx.res.body());
+      const artifact = path.join(watchDir, 'miser.md');
+      assert.equal(ctx.echo.captured.length, 0);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['x-miser-watch-artifact'], artifact);
+      assert.match(payload.content[0].text, /watcher artifact missing for POLL_MISER/);
+      assert.match(payload.content[0].text, /Do not poll live from Claude/);
+      assert.match(payload.content[0].text, /miser\.md/);
+      assert.equal(ctx.guardDeps.enforcementState.snapshot().recentEvents[0].artifactMissing, true);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce does not redirect DISPATCH_OK commands', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-dispatch-${process.pid}-`));
+  try {
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      body: redirectTurnBody('date'),
+    });
+    try {
+      assert.equal(ctx.echo.captured.length, 1);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.deepEqual(JSON.parse(ctx.res.body()), ctx.upstreamBody);
+      assert.ok(!ctx.res.headers['x-miser-redirect']);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce does not redirect NEUTRAL turns', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-neutral-${process.pid}-`));
+  try {
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      body: {
+        model: 'claude-sonnet-5-test',
+        max_tokens: 50,
+        system: 'You are the ORCH controller.',
+        messages: [{ role: 'user', content: 'Summarize the last design decision.' }],
+      },
+    });
+    try {
+      assert.equal(ctx.echo.captured.length, 1);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.deepEqual(JSON.parse(ctx.res.body()), ctx.upstreamBody);
+      assert.ok(!ctx.res.headers['x-miser-redirect']);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('redirect enforce does not redirect forced tool_choice turns', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-tool-choice-${process.pid}-`));
+  try {
+    fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nfrom watcher\n', 'utf8');
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      body: redirectTurnBody('gh run view 123 --log', {
+        tools: [{ name: 'Bash', input_schema: { type: 'object' } }],
+        tool_choice: { type: 'tool', name: 'Bash' },
+      }),
+    });
+    try {
+      assert.equal(ctx.echo.captured.length, 1);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.deepEqual(JSON.parse(ctx.res.body()), ctx.upstreamBody);
+      assert.ok(!ctx.res.headers['x-miser-redirect']);
+      assert.equal(ctx.guardDeps.enforcementState.snapshot().redirect.wouldSynthesize, 0);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
 test('v4 C1: beta merge avoids duplicates and client context_management is never overridden', async () => {
   const echo = await startEcho(() => ({ status: 200, body: { usage: { input_tokens: 1 } } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {

@@ -8,6 +8,22 @@ const { isValidProjectName } = require('./routing.js');
 
 const VALID_MODES = new Set(['observe', 'alert', 'throttle', 'block']);
 const VALID_REDIRECT_MODES = new Set(['off', 'shadow', 'warn', 'enforce']);
+const ACTIVE_REDIRECT_COMMAND_CLASSES = new Set([
+  'POLL_CI',
+  'POLL_TERMDECK',
+  'POLL_MISER',
+  'POLL_HEALTH',
+  'SWEEP_REPO',
+  'LOOP_SHELL',
+]);
+const REDIRECT_ARTIFACT_CANDIDATES = Object.freeze({
+  POLL_CI: Object.freeze(['ci']),
+  POLL_TERMDECK: Object.freeze(['termdeck', 'sessions']),
+  POLL_MISER: Object.freeze(['miser', 'miser-stats', 'stats']),
+  POLL_HEALTH: Object.freeze(['health']),
+  SWEEP_REPO: Object.freeze(['repo-sweep', 'repos', 'repo']),
+  LOOP_SHELL: Object.freeze(['loop-shell', 'watch']),
+});
 const DEFAULT_POLICY = Object.freeze({
   mode: 'observe',
   scarceModeUsedWeeklyPct: 80,
@@ -1255,6 +1271,158 @@ function buildSyntheticSseResponse(originalBody = {}, text = '', opts = {}) {
   ].join('');
 }
 
+function forcedToolChoice(body) {
+  const choice = body && body.tool_choice;
+  if (choice == null) return false;
+  if (typeof choice === 'string') return !['auto', 'none'].includes(choice.toLowerCase());
+  if (typeof choice === 'object') {
+    const type = String(choice.type || '').toLowerCase();
+    if (!type) return true;
+    return !['auto', 'none'].includes(type);
+  }
+  return true;
+}
+
+function safeForSyntheticRedirect(body, classification) {
+  return !!(
+    classification
+    && classification.redirectable === true
+    && ACTIVE_REDIRECT_COMMAND_CLASSES.has(classification.commandClass)
+    && ['tool_result', 'real_user_text', 'notification'].includes(classification.terminalShape)
+    && !forcedToolChoice(body)
+  );
+}
+
+function artifactCandidates(commandClass) {
+  const ids = REDIRECT_ARTIFACT_CANDIDATES[commandClass] || [];
+  return ids.length ? ids : [String(commandClass || 'unknown').toLowerCase()];
+}
+
+function fallbackArtifactPath(id) {
+  return path.join(os.homedir(), '.miser', 'watch', `${id}.md`);
+}
+
+function watcherCompactPath(watcher, id) {
+  if (watcher && typeof watcher.pathsFor === 'function') {
+    try {
+      const paths = watcher.pathsFor(id);
+      if (paths && typeof paths.compact === 'string') return paths.compact;
+    } catch (_) {}
+  }
+  return fallbackArtifactPath(id);
+}
+
+function readWatcherArtifact(commandClass, guardDeps = {}) {
+  const watcher = guardDeps.watcher || null;
+  for (const id of artifactCandidates(commandClass)) {
+    const compactPath = watcherCompactPath(watcher, id);
+    try {
+      const text = fs.readFileSync(compactPath, 'utf8');
+      if (String(text || '').trim()) {
+        return { id, path: compactPath, text, missing: false };
+      }
+    } catch (_) {}
+  }
+  const missingId = artifactCandidates(commandClass)[0];
+  return {
+    id: missingId,
+    path: watcherCompactPath(watcher, missingId),
+    text: '',
+    missing: true,
+  };
+}
+
+function trimSyntheticArtifactText(text, maxBytes = 16 * 1024) {
+  let out = String(text || '').trim();
+  while (Buffer.byteLength(out, 'utf8') > maxBytes) out = out.slice(0, Math.max(0, out.length - 1));
+  return out;
+}
+
+function redirectInstructionText(mode, classification, artifact) {
+  const commandClass = classification.commandClass || 'UNKNOWN';
+  const artifactPath = artifact && artifact.path ? artifact.path : fallbackArtifactPath((artifactCandidates(commandClass)[0]));
+  if (mode === 'warn') {
+    return [
+      `miser warning: ${commandClass} is a zero-LLM watcher redirect class.`,
+      `Do not poll live from Claude. Use watcher artifact ${artifactPath} instead.`,
+      artifact && artifact.missing
+        ? `Missing artifact: ${artifactPath}. Refresh or repair the watcher out-of-band before asking again.`
+        : 'If fresher data is required, refresh the watcher out-of-band and read the artifact path.',
+    ].join('\n');
+  }
+  if (!artifact || artifact.missing) {
+    return [
+      `miser: watcher artifact missing for ${commandClass}: ${artifactPath}.`,
+      'Do not poll live from Claude.',
+      `Refresh or repair the watcher out-of-band, then read ${artifactPath}.`,
+    ].join('\n');
+  }
+  return [
+    `miser: ${commandClass} redirected to zero-LLM watcher artifact ${artifactPath}.`,
+    '',
+    trimSyntheticArtifactText(artifact.text),
+  ].join('\n');
+}
+
+function buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body) {
+  const redirectMode = policy.redirect && policy.redirect.mode ? policy.redirect.mode : DEFAULT_POLICY.redirect.mode;
+  if (!['warn', 'enforce'].includes(redirectMode)) return null;
+  if (!safeForSyntheticRedirect(body, classification)) return null;
+
+  const artifact = readWatcherArtifact(classification.commandClass, guardDeps);
+  const text = redirectInstructionText(redirectMode, classification, artifact);
+  const reason = 'zero-llm-redirect';
+  const responseBody = buildSyntheticMessageResponse(body, text, {
+    model: body && body.model,
+  });
+  const event = {
+    decision: redirectMode === 'warn' ? 'synthesize_warning' : 'synthesize',
+    reason,
+    mode: redirectMode,
+    would_synthesize: true,
+    commandClass: classification.commandClass,
+    role: classification.role,
+    fingerprint: classification.conversationFingerprint,
+    terminalShape: classification.terminalShape,
+    artifactId: artifact.id,
+    artifactPath: artifact.path,
+    artifactMissing: artifact.missing === true,
+  };
+  if (typeof state.recordRedirectDecision === 'function') {
+    state.recordRedirectDecision(project, panel, event);
+  } else {
+    state.recordDecision(project, panel, event);
+  }
+  if (guardDeps.recordEnforcementEvent) {
+    guardDeps.recordEnforcementEvent(project, event, guardDeps.nowFn || (() => new Date()));
+  }
+  const headers = {
+    'content-type': 'application/json',
+    'x-miser-redirect': reason,
+    'x-miser-redirect-mode': redirectMode,
+    'x-miser-redirect-class': classification.commandClass,
+    'x-miser-watch-artifact': artifact.path,
+  };
+  if (redirectMode === 'warn') headers['x-miser-enforcement-warning'] = reason;
+  else headers['x-miser-enforcement'] = reason;
+  return {
+    status: 200,
+    headers,
+    body: responseBody,
+    enforcement: {
+      reason,
+      mode: redirectMode,
+      status: 200,
+      warning: redirectMode === 'warn',
+      synthetic: true,
+      redirect: true,
+      commandClass: classification.commandClass,
+      artifactPath: artifact.path,
+      artifactMissing: artifact.missing === true,
+    },
+  };
+}
+
 function maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps) {
   const redirectMode = policy.redirect && policy.redirect.mode ? policy.redirect.mode : DEFAULT_POLICY.redirect.mode;
   if (redirectMode !== 'shadow') return;
@@ -1504,6 +1672,9 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
       600);
   }
 
+  const redirect = buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body);
+  if (redirect) return redirect;
+
   return null;
 }
 
@@ -1530,5 +1701,7 @@ module.exports = {
     orchControlApplies,
     isCountedOrchManagementTurn,
     extractAssignmentId,
+    safeForSyntheticRedirect,
+    readWatcherArtifact,
   },
 };
