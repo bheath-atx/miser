@@ -21,6 +21,18 @@ Each artifact includes child session id, label, project, cwd, parent id, boot fi
 
 No alert loop was added. The artifact path is printed to stderr on terminal boot-inject failure.
 
+## Revision: Live Helper Sync Safety
+
+Revised the merged PR C helpers after the Grok helper-sync audit at `/home/nacho/sprints/20260830-miser-zero-llm-watcher-arch/ORCH-RESULT.md`.
+
+- Preserved the live helper's slow-start tolerance by keeping one successful boot injection max, then polling for confirmation for the production default window of `20s + 67 * 1.5s`, about 120s total.
+- Kept POST failures bounded to at most 2 attempts.
+- Removed blind re-inject recovery guidance after a successful post with unconfirmed activity. The artifact now tells the operator to inspect the panel manually and only run the conditional re-inject command if the input is visibly absent or truncated.
+- Added deterministic artifacts for spawn POST failure, child-created-but-boot-unconfirmed, and model-brick-after-landed-boot failures.
+- Updated `spawn-lane.sh --boot` failure handling so the child id is printed before the nonzero exit and the delegated `boot-inject.sh` artifact path remains visible.
+- Added tests for routing defaults, required parent, model validation, boot contract validation, max one successful boot POST, extended confirmation wait, no duplicate injection during slow-start confirmation, spawn POST failure artifacts, recovery text, and model-brick artifacts.
+- Did not sync or mutate `/home/nacho/bin`.
+
 ## Files Changed
 
 - `bin/spawn-lane.sh`
@@ -42,8 +54,8 @@ No alert loop was added. The artifact path is printed to stderr on terminal boot
 
 Results:
 
-- Spawn/boot-inject targeted tests: 5 passed
-- Full suite: 645 passed
+- Spawn/boot-inject targeted tests: 14 passed
+- Full suite: 654 passed
 
 ## Intentionally Deferred
 

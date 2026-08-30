@@ -17,6 +17,7 @@ REASON=""
 BASE="${TERMDECK_BASE:-http://127.0.0.1:3200}"
 BASE_EXPLICIT=0
 [[ -n "${TERMDECK_BASE:-}" ]] && BASE_EXPLICIT=1
+ARTIFACT_DIR="${MISER_SPAWN_FAILURE_DIR:-$HOME/.miser/spawn-failures}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -97,10 +98,81 @@ fi
 
 REASON_DEFAULT="spawned via spawn-lane.sh by parent $PARENT"
 [[ -z "$REASON" ]] && REASON="$REASON_DEFAULT"
+COMMAND_ARG="$COMMAND"
 if [[ -n "$MODEL" ]]; then
   printf -v MODEL_SHELL '%q' "$MODEL"
   COMMAND="$COMMAND --model $MODEL_SHELL"
 fi
+
+safe_fragment() {
+  local value="$1"
+  value="${value//[^A-Za-z0-9_.-]/_}"
+  [[ -n "$value" ]] || value="unknown"
+  printf '%s' "$value"
+}
+
+spawn_command() {
+  local bin_q parent_q project_q label_q cwd_q base_q boot_q reason_q type_q command_q model_q role_q
+  printf -v bin_q '%q' "${MISER_BIN_DIR:-$HOME/bin}/spawn-lane.sh"
+  printf -v parent_q '%q' "$PARENT"
+  printf -v project_q '%q' "$PROJECT"
+  printf -v label_q '%q' "$LABEL"
+  printf -v cwd_q '%q' "$CWD"
+  printf -v base_q '%q' "$BASE"
+  printf -v type_q '%q' "$TYPE"
+  printf -v command_q '%q' "$COMMAND_ARG"
+  printf '%s --parent %s --project %s --label %s --cwd %s --base %s --type %s --command %s' \
+    "$bin_q" "$parent_q" "$project_q" "$label_q" "$cwd_q" "$base_q" "$type_q" "$command_q"
+  if [[ "$ROLE" != "null" ]]; then
+    printf -v role_q '%q' "$ROLE"
+    printf ' --role %s' "$role_q"
+  fi
+  if [[ -n "$MODEL" ]]; then
+    printf -v model_q '%q' "$MODEL"
+    printf ' --model %s' "$model_q"
+  fi
+  if [[ -n "$BOOT_FILE" ]]; then
+    printf -v boot_q '%q' "$BOOT_FILE"
+    printf ' --boot %s' "$boot_q"
+  fi
+  if [[ "$NO_INJECT" == "1" ]]; then
+    printf ' --no-inject'
+  fi
+  if [[ "$REASON" != "$REASON_DEFAULT" ]]; then
+    printf -v reason_q '%q' "$REASON"
+    printf ' --reason %s' "$reason_q"
+  fi
+}
+
+write_spawn_failure_artifact() {
+  local last_error="$1"
+  local last_status="$2"
+  local safe_project safe_label artifact manual
+  safe_project="$(safe_fragment "$PROJECT")"
+  safe_label="$(safe_fragment "$LABEL")"
+  artifact="$ARTIFACT_DIR/spawn-lane-${safe_project}-${safe_label}.md"
+  manual="$(spawn_command)"
+  mkdir -p "$ARTIFACT_DIR"
+  {
+    echo "# spawn failure"
+    echo
+    echo "verdict: FAILED"
+    echo "failure_type: spawn_post"
+    echo "child_session_id: unknown"
+    echo "label: ${LABEL:-unknown}"
+    echo "project: ${PROJECT:-unknown}"
+    echo "cwd: ${CWD:-unknown}"
+    echo "parent_session_id: ${PARENT:-unknown}"
+    echo "boot_file: ${BOOT_FILE:-none}"
+    echo "attempts: 1"
+    echo "last_status: ${last_status:-unknown}"
+    echo "last_error: ${last_error:-unknown}"
+    echo
+    echo "manual_recovery_command:"
+    echo "$manual"
+  } > "$artifact"
+  echo "[spawn-lane] failure artifact: $artifact" >&2
+}
 
 PAYLOAD=$(PARENT="$PARENT" PROJECT="$PROJECT" LABEL="$LABEL" CWD="$CWD" \
   ROLE="$ROLE" TYPE="$TYPE" COMMAND="$COMMAND" REASON="$REASON" \
@@ -120,11 +192,18 @@ if role != "null":
 print(json.dumps(p))
 ')
 
+SPAWN_STATUS=0
 RESP=$(curl -sS -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD" \
-  "$BASE/api/sessions")
+  "$BASE/api/sessions") || SPAWN_STATUS=$?
+
+if [[ "$SPAWN_STATUS" != "0" ]]; then
+  write_spawn_failure_artifact "spawn POST failed with curl status $SPAWN_STATUS" "curl_status_$SPAWN_STATUS"
+  echo "spawn-lane: spawn POST failed - curl status $SPAWN_STATUS" >&2
+  exit 1
+fi
 
 CHILD_ID=$(echo "$RESP" | python3 -c '
 import sys, json
@@ -136,6 +215,7 @@ except Exception:
 ')
 
 if [[ -z "$CHILD_ID" ]]; then
+  write_spawn_failure_artifact "spawn POST returned no child id" "missing_child_id"
   echo "spawn-lane: spawn POST failed - response: $RESP" >&2
   exit 1
 fi
@@ -176,10 +256,21 @@ fi
 
 if [[ -n "$BOOT_FILE" && "$NO_INJECT" != "1" ]]; then
   BIN_DIR="${MISER_BIN_DIR:-$HOME/bin}"
-  "$BIN_DIR/boot-inject.sh" \
+  BOOT_ERR=$(mktemp "${TMPDIR:-/tmp}/miser-boot-inject.XXXXXX")
+  if ! "$BIN_DIR/boot-inject.sh" \
     --child "$CHILD_ID" --boot "$BOOT_FILE" --parent "$PARENT" --base "$BASE" \
     --project "$PROJECT" --role "$ROLE" --label "$LABEL" --cwd "$CWD" \
-    >/dev/null
+    >/dev/null 2> >(tee "$BOOT_ERR" >&2); then
+    BOOT_ARTIFACT=$(awk -F': ' '/failure artifact:/ {print $2}' "$BOOT_ERR" | tail -1)
+    rm -f "$BOOT_ERR"
+    echo "[spawn-lane] child id: $CHILD_ID" >&2
+    if [[ -n "$BOOT_ARTIFACT" ]]; then
+      echo "[spawn-lane] failure artifact: $BOOT_ARTIFACT" >&2
+    fi
+    echo "$CHILD_ID"
+    exit 1
+  fi
+  rm -f "$BOOT_ERR"
 fi
 
 echo "$CHILD_ID"
