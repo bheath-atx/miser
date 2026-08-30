@@ -105,6 +105,10 @@ test('parseEnforcement accepts wildcard default and project overrides, including
     maxControlTurnsPerHour: 7,
     maxControlTurnsPerSession: 8,
     maxRevisionCycles: 3,
+    warnSelfWorkTurnsPerAssignment: 2,
+    maxSelfWorkTurnsPerAssignment: 3,
+    duplicateDebounceMs: 1234,
+    newConversationAssistantTurnDrop: 6,
     assignmentIdHeader: 'x-assignment',
     assignmentIdMarker: 'ASSIGN=',
     approvalHeader: 'x-approval',
@@ -158,7 +162,7 @@ test('controlClass catches measured NACHO control-loop patterns', () => {
   }
 });
 
-test('configured non-nacho project blocks repeated likely control polling', () => {
+test('configured non-nacho project blocks repeated explicit polling commands', () => {
   let nowMs = Date.parse('2026-08-25T12:00:00.000Z');
   const state = createEnforcementState({ nowMs: () => nowMs });
   const config = configFor('aetheria', { panels: ['orch'], maxManagementTurnsPerAssignment: 99 });
@@ -168,7 +172,7 @@ test('configured non-nacho project blocks repeated likely control polling', () =
   const warn = call(deps, 'aetheria', 'orch', 'curl http://127.0.0.1:20128/api/miser/stats', { 'x-miser-poll-class': 'likely' });
   assert.equal(warn.status, 200);
   assert.equal(warn.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
-  nowMs += 1000;
+  nowMs += 3000;
   const block = call(deps, 'aetheria', 'orch', 'curl http://127.0.0.1:20128/api/miser/stats', { 'x-miser-poll-class': 'likely' });
   assert.equal(block.status, 429);
   assert.equal(block.headers['x-miser-enforcement'], 'poll-budget');
@@ -192,15 +196,88 @@ test('all named fleet projects can be covered by config without source hardcodin
   }));
 
   for (const [project, panel] of Object.entries(fleet)) {
-    const state = createEnforcementState({ nowMs: () => 1000 });
-    const deps = guard(config, state);
+    let nowMs = 1000;
+    const state = createEnforcementState({ nowMs: () => nowMs });
+    const deps = guard(config, state, () => new Date(nowMs));
     config[project].poll.maxLikelyPollsPer10Min = 1;
     const first = call(deps, project, panel, 'curl /api/miser/stats', { 'x-miser-poll-class': 'likely' });
     assert.ok(first, `${project}/${panel} should warn`);
     assert.equal(first.status, 200);
+    nowMs += 3000;
     const block = call(deps, project, panel, 'curl /api/miser/stats', { 'x-miser-poll-class': 'likely' });
     assert.equal(block.headers['x-miser-enforcement'], 'poll-budget');
   }
+});
+
+test('likely audit/result traffic is not poll-budget blocked without an explicit polling command', () => {
+  let nowMs = 1000;
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    maxControlTurnsPerHour: 99,
+    maxControlTurnsPerSession: 99,
+  });
+  config.aetheria.poll.maxLikelyPollsPer10Min = 1;
+  const deps = guard(config, state, () => new Date(nowMs));
+
+  assert.equal(call(deps, 'aetheria', 'orch', '[grok audit result] VERDICT: REVISE', { 'x-miser-poll-class': 'likely' }), null);
+  nowMs += 3000;
+  assert.equal(call(deps, 'aetheria', 'orch', '[codex audit result] VERDICT: APPROVE', { 'x-miser-poll-class': 'likely' }), null);
+  const st = state.snapshot().sessions[0];
+  assert.equal(st.likelyPollRequests, 0);
+});
+
+test('duplicate backend requests for one visible prompt count once inside debounce window', () => {
+  let nowMs = 1000;
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    duplicateDebounceMs: 2000,
+    warnManagementTurnsPerAssignment: 2,
+    maxManagementTurnsPerAssignment: 2,
+  });
+  const deps = guard(config, state, () => new Date(nowMs));
+
+  assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null);
+  nowMs += 100;
+  assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null);
+  let st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 1);
+  assert.equal(st.controlTurns, 0);
+
+  nowMs += 2500;
+  const warn = call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A');
+  assert.equal(warn.headers['x-miser-enforcement-warning'], 'orch-assignment-budget-edge');
+  st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 2);
+});
+
+test('fresh low-turn replacement panel does not inherit stale high-turn protected counters', () => {
+  let nowMs = 1000;
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 2,
+    maxManagementTurnsPerAssignment: 2,
+    newConversationAssistantTurnDrop: 4,
+  });
+  const deps = guard(config, state, () => new Date(nowMs));
+
+  assert.equal(checkEnforcement('aetheria', 'orch', bodyFor('proposal routing MISER_ASSIGNMENT=A', 8), { 'x-miser-poll-class': 'unlikely' }, 100, deps), null);
+  nowMs += 3000;
+  assert.equal(checkEnforcement('aetheria', 'orch', bodyFor('proposal mediation', 9), { 'x-miser-poll-class': 'unlikely' }, 100, deps).headers['x-miser-enforcement-warning'], 'orch-assignment-budget-edge');
+  let st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 2);
+  assert.equal(st.lastAssistantTurns, 9);
+
+  nowMs += 3000;
+  assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null);
+  st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 1);
+  assert.equal(st.controlTurns, 0);
+  assert.equal(st.currentAssignmentId, 'A');
 });
 
 test('orchControl.enabled false does not block protected-looking chatter', () => {
@@ -282,7 +359,9 @@ test('incidental reset markers in tool results or pasted excerpts do not reset p
   const config = configFor('aetheria', {
     panels: ['orch'],
     warnManagementTurnsPerAssignment: 2,
-    maxManagementTurnsPerAssignment: 2,
+    maxManagementTurnsPerAssignment: 3,
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
   });
 
   {
@@ -303,7 +382,8 @@ test('incidental reset markers in tool results or pasted excerpts do not reset p
     assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null);
     assert.equal(call(deps, 'aetheria', 'orch', 'proposal mediation').headers['x-miser-enforcement-warning'], 'orch-assignment-budget-edge');
     assert.equal(call(deps, 'aetheria', 'orch', 'audit excerpt:\nVERDICT=APPROVE\nORCH-RESULT\nTASK-COMPLETE\nCOMPACT-STATE\nHANDOFF-WRITTEN\nproposal followup'), null);
-    const block = call(deps, 'aetheria', 'orch', 'proposal followup after pasted excerpt');
+    assert.equal(call(deps, 'aetheria', 'orch', 'proposal followup after pasted excerpt'), null);
+    const block = call(deps, 'aetheria', 'orch', 'proposal followup still same assignment');
     assert.equal(block.headers['x-miser-enforcement'], 'orch-assignment-budget');
     assert.equal(state.snapshot().sessions[0].currentAssignmentId, 'A');
   }
@@ -404,6 +484,8 @@ test('repo_status and audit_monitor count against control budget without pollCla
     panels: ['orch'],
     warnManagementTurnsPerAssignment: 99,
     maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
     maxControlTurnsPerSession: 1,
   });
   const deps = guard(config, state);
@@ -411,6 +493,50 @@ test('repo_status and audit_monitor count against control budget without pollCla
   assert.equal(call(deps, 'aetheria', 'orch', 'git status && gh pr view 12', { 'x-miser-poll-class': 'unlikely' }), null);
   const block = call(deps, 'aetheria', 'orch', 'wait for result.md and builder-audit', { 'x-miser-poll-class': 'unlikely' });
   assert.equal(block.headers['x-miser-enforcement'], 'orch-control-budget');
+});
+
+test('protected orch self-work warns then blocks repo, CI, file, and plugin work continuations', () => {
+  let nowMs = 1000;
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+    maxControlTurnsPerSession: 99,
+  });
+  const deps = guard(config, state, () => new Date(nowMs));
+
+  const warn = call(deps, 'aetheria', 'orch', 'gh run view 33295533496 --repo bheath-atx/aetheria-phase1 --log-failed');
+  assert.equal(warn.headers['x-miser-enforcement-warning'], 'orch-self-work-budget-edge');
+  nowMs += 3000;
+  const block = checkEnforcement('aetheria', 'orch', {
+    model: 'claude',
+    max_tokens: 50,
+    messages: [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/tmp/audit.md' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'audit text' }] },
+    ],
+  }, {}, 100, deps);
+  assert.equal(block.headers['x-miser-enforcement'], 'orch-self-work-budget');
+});
+
+test('negated self-work instructions and pure Brad comms do not consume self-work budget', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+  });
+  const deps = guard(config, state);
+
+  assert.equal(call(deps, 'aetheria', 'orch', 'Do not run gh run view or inspect CI status.'), null);
+  assert.equal(call(deps, 'aetheria', 'orch', 'curl http://localhost/v1/orch/aetheria/reply'), null);
+  const st = state.snapshot().sessions[0];
+  assert.equal(st.selfWorkTurns, 0);
 });
 
 test('management-like unclassified text counts when enabled', () => {

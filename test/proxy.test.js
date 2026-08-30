@@ -465,20 +465,25 @@ test('enforcement canary warns before blocking repeated NACHO ORCH-control poll 
       handler(req, res);
       return done;
     };
-    const body = {
+    const firstBody = {
       model: 'claude',
       max_tokens: 50,
       messages: [{ role: 'user', content: 'curl http://127.0.0.1:20128/api/miser/stats' }],
     };
+    const secondBody = {
+      model: 'claude',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: 'curl http://127.0.0.1:20128/api/sessions' }],
+    };
     const first = fakeRes();
-    await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', body, {}), first);
+    await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', firstBody, {}), first);
     assert.equal(first.statusCode, 200);
     assert.equal(first.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
     assert.match(first.body(), /poll budget edge/);
     assert.equal(echo.captured.length, 0);
 
     const second = fakeRes();
-    await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', body, {}), second);
+    await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', secondBody, {}), second);
     assert.equal(second.statusCode, 429);
     assert.equal(second.headers['x-miser-enforcement'], 'poll-budget');
     assert.equal(second.headers['x-miser-enforcement-mode'], 'throttle');

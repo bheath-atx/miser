@@ -56,3 +56,11 @@ Results:
 - Low runtime risk in `shadow` because upstream calls and client responses remain pass-through.
 - Classifier regexes may need calibration against real fleet traffic before enabling future `warn` or `enforce` modes.
 - Role detection is deterministic and conservative, but future PRs should keep unknown roles lenient before live enforcement.
+
+## Merge-Clean Update
+
+- Conflict files: `src/enforcement.js`
+- Resolution: preserved PR A redirect shadow metadata and synthetic helpers while keeping main's ORCH self-work budget, duplicate debounce, and new-conversation reset fields.
+- Tests run: `npm test`
+- Test result: 625 passed
+- Final commit SHA: recorded in the merge-resolution commit pushed after this update.
