@@ -27,6 +27,8 @@ test('orch-dispatch prompt blocks source inspection and caps pre-dispatch tools'
 
   assert.equal(res.status, 0, res.stderr);
   assert.match(res.stdout, /Maximum 8 tool calls before first dispatch/);
+  assert.match(res.stdout, /MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch/);
+  assert.match(res.stdout, /DISPATCH_FINALIZE MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch CHILD_SESSION=pending/);
   assert.match(res.stdout, /Forbidden: grep\/read src\/, app\/, services\/, migrations\/, tests\/, logs, CI/);
   assert.match(res.stdout, /Do not run CI polling loops/);
   assert.match(res.stdout, /After dispatch, stop/);

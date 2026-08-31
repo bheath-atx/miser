@@ -85,10 +85,12 @@ function safe(value) {
 }
 
 function commonHeader(args, facts) {
+  const assignment = args.assignment || `${safe(args.project)}-${safe(args.task).slice(0, 80) || 'task'}`;
   return `# ${args.project} ${args.kind} Prompt
 
 Task: ${args.task}
 Project: ${args.project}
+MISER_ASSIGNMENT=${assignment}
 ${args.pr ? `PR: ${args.pr}\n` : ''}${args.cwd ? `Working directory: ${args.cwd}\n` : ''}${args.parent ? `dispatcher-session-id: ${args.parent}\n` : ''}
 ## Compact Facts
 
@@ -97,7 +99,10 @@ ${facts}
 }
 
 function orchDispatch(args, facts) {
+  const assignment = args.assignment || `${safe(args.project)}-${safe(args.task).slice(0, 80) || 'task'}`;
   return `${commonHeader(args, facts)}
+DISPATCH_FINALIZE MISER_ASSIGNMENT=${assignment} CHILD_SESSION=pending
+
 ## Role
 
 You are the project ORCH. Your job is dispatch and coordination only.
@@ -249,4 +254,3 @@ function main() {
 }
 
 if (require.main === module) main();
-
