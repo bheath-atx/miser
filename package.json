@@ -8,6 +8,7 @@
     "make-lane-prompt": "bin/make-lane-prompt.js",
     "orch-ask.sh": "bin/orch-ask.sh",
     "orch-dispatch.sh": "bin/orch-dispatch.sh",
+    "orch-followup.sh": "bin/orch-followup.sh",
     "spawn-lane.sh": "bin/spawn-lane.sh",
     "boot-inject.sh": "bin/boot-inject.sh",
     "td-inject.sh": "bin/td-inject.sh"

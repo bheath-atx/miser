@@ -94,6 +94,45 @@ test('generates prompt, resolves a unique ORCH session, and injects it', (t) => 
   assert.match(inject, /Dispatch Grok audit for PR351/);
 });
 
+test('refuses duplicate prompt injection to the same session inside ttl', (t) => {
+  const f = setup(t, [
+    { id: 'sid-1', status: 'idle', meta: { project: 'Aetheria-Concierge', label: 'Aetheria-Concierge-ORCH' }, command: 'claude' },
+  ]);
+  const args = [
+    '--project', 'aetheria',
+    '--label', 'ORCH',
+    '--task', 'Dispatch Grok audit for PR351',
+    '--pr', '351',
+    '--fact', 'CI passed run 33345975040',
+  ];
+
+  const first = run(args, f.env);
+  assert.equal(first.status, 0, first.stderr);
+  const second = run(args, f.env);
+
+  assert.notEqual(second.status, 0);
+  assert.match(second.stderr, /duplicate prompt already injected to session sid-1/);
+  assert.match(second.stderr, /refusing to spend another ORCH turn/);
+});
+
+test('force bypasses duplicate prompt injection refusal', (t) => {
+  const f = setup(t, [
+    { id: 'sid-1', status: 'idle', meta: { project: 'Aetheria-Concierge', label: 'Aetheria-Concierge-ORCH' }, command: 'claude' },
+  ]);
+  const args = [
+    '--project', 'aetheria',
+    '--label', 'ORCH',
+    '--task', 'Dispatch Grok audit for PR351',
+    '--pr', '351',
+    '--fact', 'CI passed run 33345975040',
+  ];
+
+  assert.equal(run(args, f.env).status, 0);
+  const forced = run([...args, '--force'], f.env);
+
+  assert.equal(forced.status, 0, forced.stderr);
+});
+
 test('dry-run writes prompt but does not inject', (t) => {
   const f = setup(t, [
     { id: 'sid-1', status: 'idle', meta: { project: 'miser', label: 'miser-ORCH' }, command: 'claude' },
