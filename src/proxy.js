@@ -13,7 +13,7 @@ const {
 } = require('./stats.js');
 const { pruneTools } = require('./toolprune.js');
 const { checkBudget } = require('./budgets.js');
-const { checkEnforcement } = require('./enforcement.js');
+const { checkEnforcement, buildSyntheticSseResponse } = require('./enforcement.js');
 const { checkModelDrift } = require('./policy-watchdog.js');
 const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
@@ -58,6 +58,24 @@ function anthropicSseFrame(event, data) {
 }
 
 function writeLocalAnthropicResponse(res, local, originalBody) {
+  if (local && local.enforcement && local.enforcement.synthetic && wantsAnthropicStream(originalBody)) {
+    const body = local.body || {};
+    const text = Array.isArray(body.content) && body.content[0] && typeof body.content[0].text === 'string'
+      ? body.content[0].text
+      : '';
+    const headers = {
+      ...local.headers,
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+    };
+    res.writeHead(local.status, headers);
+    res.end(buildSyntheticSseResponse(originalBody, text, {
+      id: body.id,
+      model: body.model,
+    }));
+    return;
+  }
+
   const isStreamingWarning = local
     && local.enforcement
     && local.enforcement.warning
@@ -559,7 +577,8 @@ function createProxy(deps = {}) {
         let block = null;
         try {
           const check = guardDeps.checkEnforcement || checkEnforcement;
-          block = check(project, panel, originalBody, compactHeaders, rawTokens, guardDeps, req.headers);
+          const enforcementGuardDeps = guardDeps.watcher ? guardDeps : { ...guardDeps, watcher };
+          block = check(project, panel, originalBody, compactHeaders, rawTokens, enforcementGuardDeps, req.headers);
         } catch (e) {
           console.warn('[miser] enforcement check error (fail-open):', e.message);
         }
