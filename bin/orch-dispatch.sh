@@ -120,6 +120,7 @@ except Exception as exc:
     raise SystemExit(0)
 
 matches = []
+fallbacks = []
 for s in sessions:
     meta = s.get('meta') or {}
     meta_project = str(meta.get('project') or s.get('project') or '').lower()
@@ -133,11 +134,17 @@ for s in sessions:
         continue
     if label_filter and label_filter not in label:
         continue
-    if not label_filter and 'orch' not in label:
-        continue
     if status in {'closed', 'exited', 'dead'}:
         continue
-    matches.append((sid, status, label or '-', meta_project or '-', command or '-'))
+    row = (sid, status, label or '-', meta_project or '-', command or '-')
+    if not label_filter and 'orch' not in label:
+        if command.startswith('claude'):
+            fallbacks.append(row)
+        continue
+    matches.append(row)
+
+if not matches and len(fallbacks) == 1:
+    matches = fallbacks
 
 if len(matches) == 1:
     print('OK\t' + '\t'.join(matches[0]))

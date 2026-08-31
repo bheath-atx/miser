@@ -127,6 +127,22 @@ test('ambiguous ORCH match fails before injection', (t) => {
   assert.equal(fs.existsSync(f.injectLog), false);
 });
 
+test('falls back to a single live Claude project session when no ORCH label exists', (t) => {
+  const f = setup(t, [
+    { id: 'sid-claude', status: 'idle', meta: { project: 'Aetheria-Concierge', label: 'claude' }, command: 'claude' },
+    { id: 'sid-codex', status: 'idle', meta: { project: 'Aetheria-Concierge', label: 'codex' }, command: 'codex' },
+  ]);
+
+  const res = run([
+    '--project', 'aetheria',
+    '--task', 'Dispatch audit',
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  const inject = fs.readFileSync(f.injectLog, 'utf8');
+  assert.match(inject, /sid=sid-claude/);
+});
+
 test('explicit session skips lookup', (t) => {
   const f = setup(t, []);
 
