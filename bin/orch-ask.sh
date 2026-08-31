@@ -11,6 +11,7 @@ BASE="${TERMDECK_BASE:-http://127.0.0.1:3100}"
 OUT_DIR="${MISER_PROMPT_OUT_DIR:-/tmp/miser-prompts}"
 DRY_RUN=0
 MODEL="${MISER_ORCH_ASK_CODEX_MODEL:-}"
+NO_ENRICH=0
 
 usage() {
   cat <<'EOF'
@@ -28,6 +29,7 @@ Options:
   --base <url>     TermDeck base (default: http://127.0.0.1:3100)
   --out-dir <dir>  Prompt/facts output directory (default: /tmp/miser-prompts)
   --model <model>  Codex model override
+  --no-enrich      Skip bounded local/GitHub fact enrichment
   --dry-run        Generate normalized dispatch + prompt, but do not inject
 EOF
 }
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --base) BASE="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
+    --no-enrich) NO_ENRICH=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --*) echo "orch-ask: unknown arg '$1'" >&2; usage >&2; exit 1 ;;
@@ -63,18 +66,26 @@ fi
 case "${PROJECT_ALIAS,,}" in
   aetheria|aetheria-concierge)
     PROJECT="Aetheria-Concierge"
+    GH_REPO="bheath-atx/aetheria-phase1"
+    LANE_ROOT="${AETHERIA_LANE_ROOT:-/tmp/aetheria-lanes}"
     DEFAULT_LABEL="ORCH"
     ;;
   pkachu)
     PROJECT="pkachu"
+    GH_REPO="${PKACHU_GH_REPO:-}"
+    LANE_ROOT="${PKACHU_LANE_ROOT:-/tmp/pkachu-lanes}"
     DEFAULT_LABEL="ORCH"
     ;;
   miser|termdeck-updates|provenspec|nacho-money)
     PROJECT="$PROJECT_ALIAS"
+    GH_REPO="$([[ "${PROJECT_ALIAS,,}" == "miser" ]] && printf 'bheath-atx/miser' || true)"
+    LANE_ROOT="${MISER_LANE_ROOT:-/tmp/miser-lanes}"
     DEFAULT_LABEL="ORCH"
     ;;
   *)
     PROJECT="$PROJECT_ALIAS"
+    GH_REPO=""
+    LANE_ROOT="/tmp/${PROJECT_ALIAS}-lanes"
     DEFAULT_LABEL="ORCH"
     ;;
 esac
@@ -96,12 +107,92 @@ RAW_FILE="$OUT_DIR/${SAFE_PROJECT}-${STAMP}-operator-request.md"
 CODEX_PROMPT_FILE="$OUT_DIR/${SAFE_PROJECT}-${STAMP}-codex-normalize-prompt.md"
 NORMALIZED_FILE="$OUT_DIR/${SAFE_PROJECT}-${STAMP}-dispatch.json"
 FACTS_FILE="$OUT_DIR/${SAFE_PROJECT}-${STAMP}-facts.md"
+ENRICH_FILE="$OUT_DIR/${SAFE_PROJECT}-${STAMP}-enriched-facts.md"
 
 printf '%s\n' "$REQUEST_TEXT" > "$RAW_FILE"
+
+extract_pr_number() {
+  REQUEST_TEXT="$REQUEST_TEXT" python3 - <<'PY'
+import os, re
+text = os.environ['REQUEST_TEXT']
+patterns = [
+    r'(?:pull/|PR\s*#?|pr\s*#?)\s*(\d+)\b',
+    r'\b#(\d+)\b',
+]
+for pattern in patterns:
+    match = re.search(pattern, text, flags=re.I)
+    if match:
+        print(match.group(1))
+        raise SystemExit(0)
+PY
+}
+
+write_enriched_facts() {
+  : > "$ENRICH_FILE"
+  [[ $NO_ENRICH -eq 1 ]] && return 0
+
+  local pr_number
+  pr_number="$(extract_pr_number || true)"
+  if [[ -n "$pr_number" ]]; then
+    printf -- '- Detected PR #%s from operator request.\n' "$pr_number" >> "$ENRICH_FILE"
+    if [[ -n "$GH_REPO" ]] && command -v gh >/dev/null 2>&1; then
+      local pr_json
+      if pr_json=$(gh pr view "$pr_number" --repo "$GH_REPO" --json number,title,state,headRefName,headRefOid,baseRefName,mergeStateStatus,mergeable,isDraft,url,updatedAt 2>/dev/null); then
+        PR_JSON="$pr_json" python3 - <<'PY' >> "$ENRICH_FILE"
+import json, os
+pr = json.loads(os.environ['PR_JSON'])
+print(f"- GitHub PR #{pr.get('number')}: {pr.get('title')} ({pr.get('url')})")
+print(f"- PR state: {pr.get('state')}; mergeStateStatus: {pr.get('mergeStateStatus')}; mergeable: {pr.get('mergeable')}; draft: {pr.get('isDraft')}")
+print(f"- PR branch: {pr.get('headRefName')} -> {pr.get('baseRefName')}; head: {pr.get('headRefOid')}")
+PY
+        local head branch runs
+        head=$(PR_JSON="$pr_json" python3 - <<'PY'
+import json, os
+print(json.loads(os.environ['PR_JSON']).get('headRefOid') or '')
+PY
+)
+        branch=$(PR_JSON="$pr_json" python3 - <<'PY'
+import json, os
+print(json.loads(os.environ['PR_JSON']).get('headRefName') or '')
+PY
+)
+        if [[ -n "$branch" ]] && runs=$(gh run list --repo "$GH_REPO" --branch "$branch" --limit 3 --json databaseId,workflowName,status,conclusion,createdAt,updatedAt,headSha,url 2>/dev/null); then
+          RUNS_JSON="$runs" HEAD_SHA="$head" python3 - <<'PY' >> "$ENRICH_FILE"
+import json, os
+runs = json.loads(os.environ['RUNS_JSON'])
+head = os.environ.get('HEAD_SHA')
+for run in runs:
+    if head and run.get('headSha') != head:
+        continue
+    conclusion = run.get('conclusion') or ''
+    print(f"- CI run {run.get('databaseId')} {run.get('workflowName')}: status={run.get('status')} conclusion={conclusion} url={run.get('url')}")
+    break
+PY
+        fi
+      fi
+    fi
+
+    if [[ -d "$LANE_ROOT" ]]; then
+      local artifact
+      artifact=$(find "$LANE_ROOT" -maxdepth 4 -type f \( -name 'ORCH-RESULT.md' -o -name 'SUMMARY.md' \) -mtime -14 2>/dev/null \
+        | while IFS= read -r file; do
+            if grep -Eiq "(pull/${pr_number}|PR URL:.*${pr_number}|PR #${pr_number}|#${pr_number}\b)" "$file"; then
+              printf '%s\n' "$file"
+            fi
+          done | sort | head -1)
+      if [[ -n "$artifact" ]]; then
+        printf -- '- Matching compact lane artifact: %s\n' "$artifact" >> "$ENRICH_FILE"
+      fi
+    fi
+  fi
+}
+
+write_enriched_facts
+
 cat > "$CODEX_PROMPT_FILE" <<EOF
 You convert Brad's rough operator request into a compact ORCH dispatch JSON object.
 
-Do not use tools. Do not inspect files. Do not browse. Do not add facts not present in the request.
+Do not use tools. Do not inspect files. Do not browse. Use only the operator request and bounded enriched facts below.
 If the request implies an audit of a PR, make task an explicit dispatch-audit task.
 If the request implies a build, make task an explicit dispatch-builder task.
 Keep facts short and operational. Preserve exact PR numbers, URLs, run IDs, paths, and stop conditions.
@@ -114,6 +205,9 @@ Return JSON only, no markdown:
 }
 
 Project: ${PROJECT}
+
+Bounded enriched facts:
+$(<"$ENRICH_FILE")
 
 Operator request:
 ${REQUEST_TEXT}
@@ -182,6 +276,7 @@ DISPATCH_ARGS=(--project "$PROJECT" --label "$LABEL" --task "$TASK" --facts "$FA
 [[ $DRY_RUN -eq 1 ]] && DISPATCH_ARGS+=(--dry-run)
 
 echo "orch-ask: raw=$RAW_FILE" >&2
+echo "orch-ask: enriched=$ENRICH_FILE" >&2
 echo "orch-ask: normalized=$NORMALIZED_FILE" >&2
 echo "orch-ask: facts=$FACTS_FILE" >&2
 "$ORCH_DISPATCH" "${DISPATCH_ARGS[@]}"

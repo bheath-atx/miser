@@ -23,8 +23,11 @@ function setup(t, codexJson = '{"task":"Dispatch Grok audit for PR351","pr":"351
   const outDir = path.join(root, 'prompts');
   const codexLog = path.join(root, 'codex.log');
   const dispatchLog = path.join(root, 'dispatch.log');
+  const ghLog = path.join(root, 'gh.log');
+  const laneRoot = path.join(root, 'lanes');
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(laneRoot, { recursive: true });
 
   writeExecutable(path.join(fakeBin, 'codex'), `#!/usr/bin/env bash
 set -euo pipefail
@@ -44,12 +47,27 @@ printf '%s\n' "$@" > "$FAKE_DISPATCH_LOG"
 echo "/tmp/generated-prompt.md"
 `);
 
+  writeExecutable(path.join(fakeBin, 'gh'), `#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "$FAKE_GH_LOG"
+if [[ "$1 $2" == "pr view" ]]; then
+  printf '{"number":351,"title":"Sprint19 PR-4","state":"OPEN","headRefName":"fix/pr351","headRefOid":"abc123","baseRefName":"main","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"url":"https://github.com/bheath-atx/aetheria-phase1/pull/351","updatedAt":"2026-08-31T00:00:00Z"}\n'
+  exit 0
+fi
+if [[ "$1 $2" == "run list" ]]; then
+  printf '[{"databaseId":33345975040,"workflowName":"CI","status":"completed","conclusion":"success","createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:01:00Z","headSha":"abc123","url":"https://github.com/bheath-atx/aetheria-phase1/actions/runs/33345975040"}]\n'
+  exit 0
+fi
+exit 2
+`);
+
   return {
     root,
     home,
     outDir,
     codexLog,
     dispatchLog,
+    ghLog,
     env: {
       ...process.env,
       HOME: home,
@@ -58,8 +76,10 @@ echo "/tmp/generated-prompt.md"
       MISER_CODEX_BIN: path.join(fakeBin, 'codex'),
       MISER_ORCH_DISPATCH: path.join(fakeBin, 'orch-dispatch.sh'),
       MISER_PROMPT_OUT_DIR: outDir,
+      AETHERIA_LANE_ROOT: laneRoot,
       FAKE_CODEX_LOG: codexLog,
       FAKE_DISPATCH_LOG: dispatchLog,
+      FAKE_GH_LOG: ghLog,
       FAKE_CODEX_JSON: codexJson,
     },
   };
@@ -73,6 +93,26 @@ function run(args, env, input = '') {
     encoding: 'utf8',
   });
 }
+
+test('enriches a PR-only request with GitHub and matching lane artifact facts', (t) => {
+  const f = setup(t, '{"task":"Dispatch Grok audit for PR351","pr":"351","facts":["Use enriched PR facts","Do not poll CI"]}');
+  const lane = path.join(f.env.AETHERIA_LANE_ROOT, 'builder-pr351');
+  fs.mkdirSync(lane, { recursive: true });
+  const artifact = path.join(lane, 'ORCH-RESULT.md');
+  fs.writeFileSync(artifact, 'VERDICT: done\nPR URL: https://github.com/bheath-atx/aetheria-phase1/pull/351\n', 'utf8');
+
+  const res = run(['aetheria', 'run grok on PR351', '--dry-run'], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  const codexInput = fs.readFileSync(f.codexLog, 'utf8');
+  assert.match(codexInput, /GitHub PR #351: Sprint19 PR-4/);
+  assert.match(codexInput, /CI run 33345975040 CI: status=completed conclusion=success/);
+  assert.match(codexInput, new RegExp(artifact.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  const gh = fs.readFileSync(f.ghLog, 'utf8');
+  assert.match(gh, /pr view 351/);
+  assert.match(gh, /run list/);
+});
 
 test('normalizes free text with Codex and dispatches generated facts', (t) => {
   const f = setup(t);

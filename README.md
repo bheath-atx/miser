@@ -209,10 +209,12 @@ Use `--dry-run` to generate the prompt without injecting it. Use `--session <id>
 matching ORCH panels exist and you want to target one explicitly.
 
 For the lowest-friction path, `orch-ask.sh` lets you paste rough text and has Codex normalize it
-into a bounded ORCH dispatch before injection:
+into a bounded ORCH dispatch before injection. If you mention a PR number, it also adds bounded
+local/GitHub facts automatically: PR metadata, the latest matching CI run, and a matching compact
+lane artifact under the project's lane root when one exists.
 
 ```bash
-orch-ask.sh aetheria "run grok on PR351; CI passed run 33345975040; builder result is /tmp/aetheria-lanes/builder-sprint19-pr4-voice-handoff/ORCH-RESULT.md; do not poll CI"
+orch-ask.sh aetheria "run grok on PR351"
 ```
 
 It also accepts stdin:
