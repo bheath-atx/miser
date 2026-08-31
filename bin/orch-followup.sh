@@ -206,6 +206,8 @@ PY
         | while IFS= read -r file; do
             if grep -Eiq "(pull/${PR_NUMBER}|PR URL:.*${PR_NUMBER}|PR #${PR_NUMBER}|#${PR_NUMBER}\b|PR${PR_NUMBER}\b)" "$file"; then
               printf '%s\n' "$file"
+              dir=$(dirname "$file")
+              find "$dir" -maxdepth 1 -type f \( -name 'ORCH-RESULT.md' -o -name 'SUMMARY.md' -o -iname '*AUDIT*.md' -o -iname '*RESULT*.md' \) 2>/dev/null
             fi
           done > "$CANDIDATES_FILE"
       ARTIFACTS_FILE="$MATCHES_FILE" CANDIDATES_FILE="$CANDIDATES_FILE" python3 - <<'PY'
@@ -264,6 +266,13 @@ PY
     else
       while IFS= read -r file; do
         printf -- '- `%s`\n' "$file"
+      done < "$MATCHES_FILE"
+      printf '\n## Artifact Verdicts\n\n'
+      while IFS= read -r file; do
+        verdict=$(grep -Eim1 '(^|[[:space:]])VERDICT:[[:space:]]*' "$file" 2>/dev/null || true)
+        if [[ -n "$verdict" ]]; then
+          printf -- '- `%s`: %s\n' "$file" "$verdict"
+        fi
       done < "$MATCHES_FILE"
       FIRST_ARTIFACT=$(head -1 "$MATCHES_FILE")
       printf '\n## First Matching Artifact Preview\n\n'

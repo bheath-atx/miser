@@ -34,6 +34,11 @@ function setup(t) {
     'Tests: CI passed',
     '',
   ].join('\n'), 'utf8');
+  fs.writeFileSync(path.join(laneRoot, 'builder-pr351', 'GROK-AUDIT-R1.md'), [
+    'VERDICT: REVISE',
+    'This PR needs a live Vapi tool sync fix.',
+    '',
+  ].join('\n'), 'utf8');
 
   writeExecutable(path.join(fakeBin, 'gh'), `#!/usr/bin/env bash
 set -euo pipefail
@@ -85,6 +90,8 @@ test('prints PR, CI, sessions, and matching artifact without injection', (t) => 
   assert.match(res.stdout, /orch-sid status=idle/);
   assert.match(res.stdout, /builder-sid status=idle/);
   assert.match(res.stdout, /ORCH-RESULT.md/);
+  assert.match(res.stdout, /GROK-AUDIT-R1.md/);
+  assert.match(res.stdout, /GROK-AUDIT-R1.md`: VERDICT: REVISE/);
   assert.match(res.stdout, /This report used shell\/GitHub\/TermDeck APIs only; no ORCH turn was spent/);
   assert.match(res.stderr, /orch-followup: report=/);
 });
