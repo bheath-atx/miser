@@ -187,8 +187,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
+REQUEST_HASH=$(
+  {
+    printf 'project=%s\nkind=%s\ntask=%s\npr=%s\n' "$PROJECT" "$KIND" "$TASK" "$PR"
+    cat "$FACTS_FILE"
+  } | sha256sum | awk '{print $1}'
+)
 DEDUP_DIR="$OUT_DIR/.orch-dispatch-injections"
-DEDUP_KEY=$(PROJECT="$PROJECT" SESSION="$SESSION" HASH="$PROMPT_HASH" python3 - <<'PY'
+DEDUP_KEY=$(PROJECT="$PROJECT" SESSION="$SESSION" HASH="$REQUEST_HASH" python3 - <<'PY'
 import os, re
 raw = f"{os.environ['PROJECT']}--{os.environ['SESSION']}--{os.environ['HASH']}"
 print(re.sub(r'[^A-Za-z0-9_.-]+', '-', raw).strip('-') or 'dispatch')
@@ -214,6 +220,7 @@ mkdir -p "$DEDUP_DIR"
   printf 'session=%s\n' "$SESSION"
   printf 'prompt=%s\n' "$PROMPT_FILE"
   printf 'hash=%s\n' "$PROMPT_HASH"
+  printf 'request_hash=%s\n' "$REQUEST_HASH"
   printf 'created_at=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 } > "$DEDUP_FILE"
 echo "$PROMPT_FILE"

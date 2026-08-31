@@ -84,8 +84,15 @@ function safe(value) {
   return String(value).toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
+function defaultAssignment(args) {
+  const base = `${safe(args.project)}-${safe(args.task).slice(0, 80) || 'task'}`;
+  if (args.kind !== 'orch-dispatch') return base;
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 17);
+  return `${base}-${stamp}`;
+}
+
 function commonHeader(args, facts) {
-  const assignment = args.assignment || `${safe(args.project)}-${safe(args.task).slice(0, 80) || 'task'}`;
+  const assignment = args.assignment;
   return `# ${args.project} ${args.kind} Prompt
 
 Task: ${args.task}
@@ -99,9 +106,10 @@ ${facts}
 }
 
 function orchDispatch(args, facts) {
-  const assignment = args.assignment || `${safe(args.project)}-${safe(args.task).slice(0, 80) || 'task'}`;
+  const assignment = args.assignment;
   return `${commonHeader(args, facts)}
 DISPATCH_FINALIZE MISER_ASSIGNMENT=${assignment} CHILD_SESSION=pending
+BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=${assignment}
 
 ## Role
 
@@ -233,6 +241,7 @@ function buildPrompt(args) {
   const task = requireArg(args, 'task');
   if (!KINDS.has(kind)) throw new Error(`unknown --kind '${kind}'`);
   const normalized = { ...args, project, kind, task };
+  normalized.assignment = args.assignment || defaultAssignment(normalized);
   const facts = readFacts(args.facts);
   if (kind === 'orch-dispatch') return orchDispatch(normalized, facts);
   if (kind === 'codex-builder') return codexBuilder(normalized, facts);
