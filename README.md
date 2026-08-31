@@ -208,6 +208,23 @@ orch-dispatch.sh \
 Use `--dry-run` to generate the prompt without injecting it. Use `--session <id>` when multiple
 matching ORCH panels exist and you want to target one explicitly.
 
+For the lowest-friction path, `orch-ask.sh` lets you paste rough text and has Codex normalize it
+into a bounded ORCH dispatch before injection:
+
+```bash
+orch-ask.sh aetheria "run grok on PR351; CI passed run 33345975040; builder result is /tmp/aetheria-lanes/builder-sprint19-pr4-voice-handoff/ORCH-RESULT.md; do not poll CI"
+```
+
+It also accepts stdin:
+
+```bash
+echo "start a Codex builder for the pkachu local Qwen/Gemma query option; avoid Claude burn" \
+  | orch-ask.sh pkachu
+```
+
+Use `orch-ask.sh <project> --dry-run` to see the generated prompt without injection. Use
+`--session <id>` to target a specific ORCH when more than one panel matches.
+
 Zero npm runtime dependencies; Node built-ins only.
 
 Relevant env vars:
