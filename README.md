@@ -169,6 +169,28 @@ npm test
 npm start
 ```
 
+## Lane Prompt Compiler
+
+Use `make-lane-prompt` to generate bounded prompts instead of hand-writing ORCH, builder, architect,
+or audit boot text under pressure.
+
+```bash
+make-lane-prompt \
+  --project aetheria \
+  --kind orch-dispatch \
+  --task "Sprint19 PR-4 Grok audit dispatch" \
+  --pr 351 \
+  --facts /tmp/pr351-facts.md \
+  --out /tmp/aetheria-pr351-orch-prompt.md
+```
+
+Supported `--kind` values: `orch-dispatch`, `codex-builder`, `codex-audit`, `grok-audit`,
+`claude-architect`.
+
+Generated ORCH prompts cap pre-dispatch tool use and forbid source/CI/fleet inspection. Generated
+builder and audit prompts include compact `SUMMARY`/`ORCH-RESULT`, notify-back, and stop contracts
+compatible with `spawn-lane.sh` boot validation.
+
 Zero npm runtime dependencies; Node built-ins only.
 
 Relevant env vars:

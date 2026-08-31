@@ -16,6 +16,13 @@ The global fleet protocol applies here:
 
 Detailed mechanics live in `~/.claude/runbooks/codex-gate.md`; read that runbook before dispatching builders, auditors, or merge-readiness review.
 
+When launching builders, auditors, or architect lanes, do not freehand boot prompts from memory.
+Use `bin/make-lane-prompt.js` / `make-lane-prompt` to generate a bounded role prompt from a
+compact facts file, then pass that prompt to `spawn-lane.sh --boot` or inject it into the intended
+ORCH panel. If the prompt generator cannot express the needed lane, ask Brad/Codex to extend the
+template instead of improvising. ORCH prompts must keep implementation discovery in the builder or
+auditor lane, not in the ORCH panel.
+
 ## Claude Usage Guardrails
 
 Miser-ORCH is not a lane watcher. Use Claude for policy judgment, architecture, routing, risk calls, and compact Brad-facing synthesis. Do not use Claude as the repeated poller for Codex lanes, GitHub/CI state, TermDeck panels, Miser health/stats, service logs, or its own context/turn count.
