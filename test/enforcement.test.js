@@ -614,6 +614,37 @@ test('explicit Brad approval boundary bypasses stale control-loop cap', () => {
   assert.equal(call(deps, 'aetheria', 'orch', 'BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=A dispatch the bounded PR351 fix'), null);
 });
 
+test('operator-generated dispatch prompt bypasses stale control-loop state', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    controlClasses: ['repo_status', 'audit_monitor'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
+    maxControlTurnsPerSession: 1,
+  });
+  const deps = guard(config, state);
+
+  assert.equal(call(deps, 'aetheria', 'orch', 'gh pr view 351 --json statusCheckRollup'), null);
+  const dispatch = [
+    '# Aetheria-Concierge orch-dispatch Prompt',
+    'Task: Dispatch Grok audit for PR #351',
+    'Project: Aetheria-Concierge',
+    'MISER_ASSIGNMENT=aetheria-dispatch-grok-audit-for-pr-351-20260831t184132z',
+    '',
+    'DISPATCH_FINALIZE MISER_ASSIGNMENT=aetheria-dispatch-grok-audit-for-pr-351-20260831t184132z CHILD_SESSION=pending',
+    'BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=aetheria-dispatch-grok-audit-for-pr-351-20260831t184132z',
+    '',
+    'PR state: OPEN; mergeStateStatus: CLEAN; mergeable: MERGEABLE',
+    'CI run 33426015052 CI: status=completed conclusion=success',
+    'Matching audit artifact: /tmp/aetheria-lanes/builder-sprint19-pr4-voice-handoff/GROK-AUDIT-R1.md (VERDICT: REVISE)',
+  ].join('\n');
+
+  assert.equal(call(deps, 'aetheria', 'orch', dispatch), null);
+});
+
 test('architect proposal revision cycle 3 blocks without approval', () => {
   const state = createEnforcementState({ nowMs: () => 1000 });
   const config = configFor('aetheria', {

@@ -1143,7 +1143,6 @@ function isInboundBradTurn(classification) {
 }
 
 function consumeExplicitOperatorBoundary(policy, classification, headers, st) {
-  if (classification.pollingCommandLike) return false;
   if (isDispatchFinalizeTurn(policy, classification, headers) && !st.dispatchFinalizeUsed) {
     st.dispatchFinalizeUsed = true;
     return true;
@@ -1152,6 +1151,7 @@ function consumeExplicitOperatorBoundary(policy, classification, headers, st) {
   if (isApprovalTurn(policy, text, headers) || isCompletionTurn(policy, text, headers)) {
     return true;
   }
+  if (classification.pollingCommandLike) return false;
   return false;
 }
 

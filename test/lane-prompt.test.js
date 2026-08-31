@@ -29,8 +29,9 @@ test('orch-dispatch prompt blocks source inspection and caps pre-dispatch tools'
   assert.match(res.stdout, /Maximum 4 tool calls before first dispatch/);
   assert.match(res.stdout, /Do not read artifact paths from this prompt before dispatch/);
   assert.match(res.stdout, /Pass artifact paths to the builder\/auditor briefing/);
-  assert.match(res.stdout, /MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch/);
-  assert.match(res.stdout, /DISPATCH_FINALIZE MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch CHILD_SESSION=pending/);
+  assert.match(res.stdout, /MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch-\d{17}/);
+  assert.match(res.stdout, /DISPATCH_FINALIZE MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch-\d{17} CHILD_SESSION=pending/);
+  assert.match(res.stdout, /BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch-\d{17}/);
   assert.match(res.stdout, /Forbidden: grep\/read src\/, app\/, services\/, migrations\/, tests\/, logs, CI/);
   assert.match(res.stdout, /Do not run CI polling loops/);
   assert.match(res.stdout, /After dispatch, stop and report exactly this status block/);
@@ -39,6 +40,22 @@ test('orch-dispatch prompt blocks source inspection and caps pre-dispatch tools'
   assert.match(res.stdout, /NEXT_GATE: <one exact next gate/);
   assert.match(res.stdout, /FOLLOWUP_COMMAND: orch-followup\.sh aetheria "what happened with PR351"/);
   assert.match(res.stdout, /STOP: yes/);
+});
+
+test('orch-dispatch accepts explicit assignment for deterministic callers', () => {
+  const res = run([
+    '--project', 'aetheria',
+    '--kind', 'orch-dispatch',
+    '--task', 'Sprint19 PR-4 Grok audit dispatch',
+    '--pr', '351',
+    '--assignment', 'operator-approved-pr351-rerun',
+  ]);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /MISER_ASSIGNMENT=operator-approved-pr351-rerun/);
+  assert.match(res.stdout, /DISPATCH_FINALIZE MISER_ASSIGNMENT=operator-approved-pr351-rerun CHILD_SESSION=pending/);
+  assert.match(res.stdout, /BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=operator-approved-pr351-rerun/);
+  assert.doesNotMatch(res.stdout, /operator-approved-pr351-rerun-\d/);
 });
 
 test('codex-builder prompt includes spawn-lane boot validation phrases', (t) => {
