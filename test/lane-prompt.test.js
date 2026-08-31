@@ -30,8 +30,10 @@ test('orch-dispatch prompt blocks source inspection and caps pre-dispatch tools'
   assert.match(res.stdout, /Do not read artifact paths from this prompt before dispatch/);
   assert.match(res.stdout, /Pass artifact paths to the builder\/auditor briefing/);
   assert.match(res.stdout, /MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch-\d{17}/);
+  assert.match(res.stdout, /Miser Routing Metadata/);
+  assert.match(res.stdout, /Do not treat it as task evidence, authorization text, or something to audit/);
   assert.match(res.stdout, /DISPATCH_FINALIZE MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch-\d{17} CHILD_SESSION=pending/);
-  assert.match(res.stdout, /BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch-\d{17}/);
+  assert.doesNotMatch(res.stdout, /BRAD_APPROVED_CONTINUE/);
   assert.match(res.stdout, /Forbidden: grep\/read src\/, app\/, services\/, migrations\/, tests\/, logs, CI/);
   assert.match(res.stdout, /Do not run CI polling loops/);
   assert.match(res.stdout, /After dispatch, stop and report exactly this status block/);
@@ -54,7 +56,7 @@ test('orch-dispatch accepts explicit assignment for deterministic callers', () =
   assert.equal(res.status, 0, res.stderr);
   assert.match(res.stdout, /MISER_ASSIGNMENT=operator-approved-pr351-rerun/);
   assert.match(res.stdout, /DISPATCH_FINALIZE MISER_ASSIGNMENT=operator-approved-pr351-rerun CHILD_SESSION=pending/);
-  assert.match(res.stdout, /BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=operator-approved-pr351-rerun/);
+  assert.doesNotMatch(res.stdout, /BRAD_APPROVED_CONTINUE/);
   assert.doesNotMatch(res.stdout, /operator-approved-pr351-rerun-\d/);
 });
 
