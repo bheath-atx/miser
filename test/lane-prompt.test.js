@@ -26,12 +26,19 @@ test('orch-dispatch prompt blocks source inspection and caps pre-dispatch tools'
   ]);
 
   assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /Maximum 8 tool calls before first dispatch/);
+  assert.match(res.stdout, /Maximum 4 tool calls before first dispatch/);
+  assert.match(res.stdout, /Do not read artifact paths from this prompt before dispatch/);
+  assert.match(res.stdout, /Pass artifact paths to the builder\/auditor briefing/);
   assert.match(res.stdout, /MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch/);
   assert.match(res.stdout, /DISPATCH_FINALIZE MISER_ASSIGNMENT=aetheria-sprint19-pr-4-grok-audit-dispatch CHILD_SESSION=pending/);
   assert.match(res.stdout, /Forbidden: grep\/read src\/, app\/, services\/, migrations\/, tests\/, logs, CI/);
   assert.match(res.stdout, /Do not run CI polling loops/);
-  assert.match(res.stdout, /After dispatch, stop/);
+  assert.match(res.stdout, /After dispatch, stop and report exactly this status block/);
+  assert.match(res.stdout, /STATUS: DISPATCHED \| BLOCKED/);
+  assert.match(res.stdout, /TASK: Sprint19 PR-4 Grok audit dispatch/);
+  assert.match(res.stdout, /NEXT_GATE: <one exact next gate/);
+  assert.match(res.stdout, /FOLLOWUP_COMMAND: orch-followup\.sh aetheria "what happened with PR351"/);
+  assert.match(res.stdout, /STOP: yes/);
 });
 
 test('codex-builder prompt includes spawn-lane boot validation phrases', (t) => {

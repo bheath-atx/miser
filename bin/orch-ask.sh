@@ -174,16 +174,28 @@ PY
     fi
 
     if [[ -d "$LANE_ROOT" ]]; then
-      local artifact
-      artifact=$(find "$LANE_ROOT" -maxdepth 4 -type f \( -name 'ORCH-RESULT.md' -o -name 'SUMMARY.md' \) -mtime -14 2>/dev/null \
+      local artifact artifacts_file
+      artifacts_file=$(mktemp)
+      find "$LANE_ROOT" -maxdepth 5 -type f \( -name 'ORCH-RESULT.md' -o -name 'SUMMARY.md' -o -iname '*AUDIT*.md' -o -iname '*RESULT*.md' \) -mtime -14 2>/dev/null \
         | while IFS= read -r file; do
             if grep -Eiq "(pull/${pr_number}|PR URL:.*${pr_number}|PR #${pr_number}|#${pr_number}\b)" "$file"; then
               printf '%s\n' "$file"
+              dir=$(dirname "$file")
+              find "$dir" -maxdepth 1 -type f \( -name 'ORCH-RESULT.md' -o -name 'SUMMARY.md' -o -iname '*AUDIT*.md' -o -iname '*RESULT*.md' \) 2>/dev/null
             fi
-          done | sort | head -1)
+          done | sort -u > "$artifacts_file"
+      artifact=$(grep -E '/ORCH-RESULT\.md$' "$artifacts_file" | head -1 || true)
+      if [[ -z "$artifact" ]]; then
+        artifact=$(head -1 "$artifacts_file" || true)
+      fi
       if [[ -n "$artifact" ]]; then
         printf -- '- Matching compact lane artifact: %s\n' "$artifact" >> "$ENRICH_FILE"
       fi
+      while IFS= read -r audit; do
+        verdict=$(grep -Eim1 '(^|[[:space:]])VERDICT:[[:space:]]*' "$audit" 2>/dev/null || true)
+        printf -- '- Matching audit artifact: %s%s\n' "$audit" "${verdict:+ (${verdict})}" >> "$ENRICH_FILE"
+      done < <(grep -Ei '/[^/]*AUDIT[^/]*\.md$' "$artifacts_file" | grep -Evi 'briefing' | head -3 || true)
+      rm -f "$artifacts_file"
     fi
   fi
 }
@@ -198,7 +210,9 @@ try_deterministic_normalize() {
   if REQUEST_TEXT="$REQUEST_TEXT" python3 - <<'PY'
 import os, re, sys
 text = os.environ['REQUEST_TEXT'].lower()
-sys.exit(0 if re.search(r'\b(grok|audit|review)\b', text) else 1)
+fix_like = re.search(r'\b(revise|fix|repair|address|implement|build|update|resolve)\b', text)
+audit_like = re.search(r'\b(grok|audit|review)\b', text)
+sys.exit(0 if audit_like and not fix_like else 1)
 PY
   then
     PR_NUMBER="$pr_number" ENRICH_FILE="$ENRICH_FILE" NORMALIZED_FILE="$NORMALIZED_FILE" python3 - <<'PY'
@@ -216,6 +230,42 @@ if os.path.exists(enrich):
 facts.append('Do not poll CI; use supplied CI and artifact facts only.')
 obj = {
     'task': f'Dispatch Grok audit for PR #{pr}',
+    'pr': pr,
+    'facts': facts,
+}
+with open(os.environ['NORMALIZED_FILE'], 'w', encoding='utf-8') as f:
+    json.dump(obj, f)
+    f.write('\n')
+PY
+    return 0
+  fi
+
+  if REQUEST_TEXT="$REQUEST_TEXT" python3 - <<'PY'
+import os, re, sys
+text = os.environ['REQUEST_TEXT'].lower()
+fix_like = re.search(r'\b(revise|fix|repair|address|implement|build|update|resolve)\b', text)
+blocker_like = re.search(r'\b(blocker|finding|revise|grok|audit)\b', text)
+sys.exit(0 if fix_like and blocker_like else 1)
+PY
+  then
+    PR_NUMBER="$pr_number" ENRICH_FILE="$ENRICH_FILE" NORMALIZED_FILE="$NORMALIZED_FILE" REQUEST_TEXT="$REQUEST_TEXT" python3 - <<'PY'
+import json, os
+
+pr = os.environ['PR_NUMBER']
+request = os.environ['REQUEST_TEXT'].strip()
+facts = []
+enrich = os.environ['ENRICH_FILE']
+if os.path.exists(enrich):
+    with open(enrich, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('- '):
+                facts.append(line[2:])
+facts.append(f'Operator requested revision/fix: {request}')
+facts.append('Dispatch a bounded Codex builder; do not run another audit until the fix result is ready.')
+facts.append('Do not poll CI; use supplied CI and artifact facts only.')
+obj = {
+    'task': f'Dispatch Codex builder to revise PR #{pr} for the specified audit blocker',
     'pr': pr,
     'facts': facts,
 }
@@ -254,7 +304,7 @@ ${REQUEST_TEXT}
 EOF
 
 if try_deterministic_normalize; then
-  echo "orch-ask: normalized without Codex for recognized PR audit request" >&2
+  echo "orch-ask: normalized without Codex for recognized PR request" >&2
 else
   CODEX_ARGS=(exec --ephemeral --skip-git-repo-check --ignore-rules --sandbox read-only -C /tmp -o "$NORMALIZED_FILE")
   [[ -n "$MODEL" ]] && CODEX_ARGS+=(--model "$MODEL")
@@ -324,4 +374,7 @@ echo "orch-ask: raw=$RAW_FILE" >&2
 echo "orch-ask: enriched=$ENRICH_FILE" >&2
 echo "orch-ask: normalized=$NORMALIZED_FILE" >&2
 echo "orch-ask: facts=$FACTS_FILE" >&2
+echo "orch-ask: task=$TASK" >&2
+[[ -n "$PR" ]] && echo "orch-ask: pr=$PR" >&2
+echo "orch-ask: followup=orch-followup.sh ${PROJECT_ALIAS} \"what happened${PR:+ with PR${PR}}\"" >&2
 "$ORCH_DISPATCH" "${DISPATCH_ARGS[@]}"

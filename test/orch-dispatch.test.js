@@ -86,7 +86,8 @@ test('generates prompt, resolves a unique ORCH session, and injects it', (t) => 
   const prompt = fs.readFileSync(promptPath, 'utf8');
   assert.match(prompt, /Dispatch Grok audit for PR351/);
   assert.match(prompt, /CI passed run 33345975040/);
-  assert.match(prompt, /Maximum 8 tool calls before first dispatch/);
+  assert.match(prompt, /Maximum 4 tool calls before first dispatch/);
+  assert.match(prompt, /Do not read artifact paths from this prompt before dispatch/);
 
   const inject = fs.readFileSync(f.injectLog, 'utf8');
   assert.match(inject, /sid=sid-1/);

@@ -106,6 +106,8 @@ test('enriches and deterministically dispatches a PR audit request without Codex
   assert.equal(res.status, 0, res.stderr);
   assert.equal(fs.existsSync(f.codexLog), false);
   assert.match(res.stderr, /normalized without Codex/);
+  assert.match(res.stderr, /orch-ask: task=Dispatch Grok audit for PR #351/);
+  assert.match(res.stderr, /orch-ask: followup=orch-followup\.sh aetheria "what happened with PR351"/);
 
   const dispatch = fs.readFileSync(f.dispatchLog, 'utf8');
   assert.match(dispatch, /--task\nDispatch Grok audit for PR #351/);
@@ -119,6 +121,38 @@ test('enriches and deterministically dispatches a PR audit request without Codex
   const gh = fs.readFileSync(f.ghLog, 'utf8');
   assert.match(gh, /pr view 351/);
   assert.match(gh, /run list/);
+});
+
+test('deterministically dispatches PR revise request as builder even when it mentions Grok', (t) => {
+  const f = setup(t, '{"task":"wrong codex fallback should not run","pr":"","facts":[]}');
+  const lane = path.join(f.env.AETHERIA_LANE_ROOT, 'builder-pr351');
+  fs.mkdirSync(lane, { recursive: true });
+  const result = path.join(lane, 'ORCH-RESULT.md');
+  const audit = path.join(lane, 'GROK-AUDIT-R1.md');
+  fs.writeFileSync(result, 'VERDICT: done\nPR URL: https://github.com/bheath-atx/aetheria-phase1/pull/351\n', 'utf8');
+  fs.writeFileSync(audit, 'VERDICT: REVISE\n[BLOCKER] live Vapi lacks the new handoff tool\n', 'utf8');
+
+  const res = run([
+    'aetheria',
+    'revise PR351 for the Grok blocker: live Vapi must receive create_secure_card_link_handoff',
+    '--dry-run',
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(fs.existsSync(f.codexLog), false);
+  assert.match(res.stderr, /normalized without Codex/);
+  assert.match(res.stderr, /orch-ask: task=Dispatch Codex builder to revise PR #351 for the specified audit blocker/);
+  assert.match(res.stderr, /orch-ask: followup=orch-followup\.sh aetheria "what happened with PR351"/);
+
+  const dispatch = fs.readFileSync(f.dispatchLog, 'utf8');
+  assert.match(dispatch, /--task\nDispatch Codex builder to revise PR #351 for the specified audit blocker/);
+  assert.match(dispatch, /--pr\n351/);
+  const factsPath = dispatch.match(/--facts\n([^\n]+)/)[1];
+  const facts = fs.readFileSync(factsPath, 'utf8');
+  assert.match(facts, new RegExp(audit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(facts, /VERDICT: REVISE/);
+  assert.match(facts, /Operator requested revision\/fix/);
+  assert.match(facts, /Dispatch a bounded Codex builder; do not run another audit/);
 });
 
 test('normalizes free text with Codex and dispatches generated facts', (t) => {

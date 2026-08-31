@@ -109,22 +109,32 @@ You are the project ORCH. Your job is dispatch and coordination only.
 
 ## Efficiency Contract
 
-- Maximum 8 tool calls before first dispatch.
-- Allowed reads: project CLAUDE.md, named Mnestra/project memory, and explicitly named artifact paths from this prompt.
+- Maximum 4 tool calls before first dispatch.
+- Allowed ORCH reads before dispatch: project CLAUDE.md and named Mnestra/project memory only.
+- Do not read artifact paths from this prompt before dispatch. The compact facts already contain the needed verdict/status. Pass artifact paths to the builder/auditor briefing for that lane to inspect.
 - Forbidden: grep/read src/, app/, services/, migrations/, tests/, logs, CI, GitHub Actions, TermDeck census, health checks, or broad repo reconstruction.
 - If implementation discovery is needed, put that requirement in the builder/auditor briefing. Do not perform it in ORCH.
 - Do not run CI polling loops or wait on panels.
 - Do not self-grade by inspecting fleet/session state.
+- First action after optional CLAUDE.md/memory read must be writing the lane briefing and spawning the lane. Do not summarize, reread, audit, or inspect prior artifacts in ORCH.
 
 ## Assignment
 
 Dispatch the next bounded lane required for the task above using the standard spawn helper. Use the facts in this prompt to write a compact lane briefing. The lane briefing must include a notify-back instruction, a compact result artifact path, and an explicit stop condition.
 
-After dispatch, stop and report only:
-- child session id, if available
-- briefing path
-- expected compact result path
-- next external gate
+After dispatch, stop and report exactly this status block and no extra narrative:
+
+STATUS: DISPATCHED | BLOCKED
+TASK: ${args.task}
+PROJECT: ${args.project}
+${args.pr ? `PR: ${args.pr}` : 'PR: none'}
+ACTION_TAKEN: <one line: spawned lane / wrote briefing only / blocked reason>
+CHILD_SESSION: <child session id or none>
+BRIEFING_PATH: <absolute path or none>
+EXPECTED_RESULT_PATH: <absolute path or none>
+NEXT_GATE: <one exact next gate: wait for result artifact / fix blocker / run audit / Brad approval / merge>
+FOLLOWUP_COMMAND: orch-followup.sh ${safe(args.project)}${args.pr ? ` "what happened with PR${args.pr}"` : ' "what happened"'}
+STOP: yes
 `;
 }
 
