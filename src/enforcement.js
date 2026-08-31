@@ -1142,6 +1142,34 @@ function isInboundBradTurn(classification) {
   return classes.has('brad_comms');
 }
 
+function consumeExplicitOperatorBoundary(policy, classification, headers, st) {
+  if (classification.pollingCommandLike) return false;
+  if (isDispatchFinalizeTurn(policy, classification, headers) && !st.dispatchFinalizeUsed) {
+    st.dispatchFinalizeUsed = true;
+    return true;
+  }
+  const text = classification.latestUserPromptText || '';
+  if (isApprovalTurn(policy, text, headers) || isCompletionTurn(policy, text, headers)) {
+    return true;
+  }
+  return false;
+}
+
+function consumePostCapBoundaryAllowance(policy, classification, headers, st) {
+  if (consumeExplicitOperatorBoundary(policy, classification, headers, st)) return true;
+  if (policy.orchControl.terminalHandoffAllowed && isTerminalHandoffTurn(classification)
+      && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns ?? DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
+    st.postCapHandoffTurns += 1;
+    return true;
+  }
+  if (isInboundBradTurn(classification)
+      && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns ?? DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
+    st.inboundBradReplyTurns += 1;
+    return true;
+  }
+  return false;
+}
+
 function responseStatusFor(mode, reason) {
   if (mode === 'throttle') return reason === 'poll-budget' ? 429 : 429;
   return 403;
@@ -1540,6 +1568,10 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
 
   if (overrideActive) return null;
 
+  const boundaryAllowanceConsumed = protectedPanel && countedManagement
+    && consumeExplicitOperatorBoundary(policy, classification, requestHeaders, st);
+  if (boundaryAllowanceConsumed) return null;
+
   const toolMode = policy.toolResults && policy.toolResults.mode;
   if (classification.maxLatestToolResultBytes > (policy.toolResults.maxToolResultBytes || Infinity)
       && toolMode === 'block' && policy.mode === 'block') {
@@ -1580,20 +1612,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
     const selfWorkWarnAt = policy.orchControl.warnSelfWorkTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.warnSelfWorkTurnsPerAssignment;
     const maxSelfWork = policy.orchControl.maxSelfWorkTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.maxSelfWorkTurnsPerAssignment;
     if (classification.selfWorkCommandLike && st.selfWorkTurns > maxSelfWork) {
-      if (isDispatchFinalizeTurn(policy, classification, requestHeaders) && !st.dispatchFinalizeUsed) {
-        st.dispatchFinalizeUsed = true;
-        return null;
-      }
-      if (policy.orchControl.terminalHandoffAllowed && isTerminalHandoffTurn(classification)
-          && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns ?? DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
-        st.postCapHandoffTurns += 1;
-        return null;
-      }
-      if (isInboundBradTurn(classification)
-          && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns ?? DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
-        st.inboundBradReplyTurns += 1;
-        return null;
-      }
+      if (consumePostCapBoundaryAllowance(policy, classification, requestHeaders, st)) return null;
       return maybeBlock(project, panel, policy, classification, state, guardDeps,
         'orch-self-work-budget',
         'miser: ORCH self-work budget exceeded; dispatch to a builder/auditor, write a compact handoff, or get explicit Brad approval before more repo/CI/file/plugin work',
@@ -1610,20 +1629,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
     const warnAt = policy.orchControl.warnManagementTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.warnManagementTurnsPerAssignment;
     const maxTurns = policy.orchControl.maxManagementTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.maxManagementTurnsPerAssignment;
     if (st.assignmentManagementTurns > maxTurns) {
-      if (isDispatchFinalizeTurn(policy, classification, requestHeaders) && !st.dispatchFinalizeUsed) {
-        st.dispatchFinalizeUsed = true;
-        return null;
-      }
-      if (policy.orchControl.terminalHandoffAllowed && isTerminalHandoffTurn(classification)
-          && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns ?? DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
-        st.postCapHandoffTurns += 1;
-        return null;
-      }
-      if (isInboundBradTurn(classification)
-          && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns ?? DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
-        st.inboundBradReplyTurns += 1;
-        return null;
-      }
+      if (consumePostCapBoundaryAllowance(policy, classification, requestHeaders, st)) return null;
       st.assignmentBlocked = true;
       return maybeBlock(project, panel, policy, classification, state, guardDeps,
         'orch-assignment-budget',
@@ -1647,16 +1653,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
     const assistantFreshOver = classification.assistantTurns > (policy.session.maxAssistantTurnsObserve || DEFAULT_POLICY.session.maxAssistantTurnsObserve)
       && (freshOver || weightedOver);
     if (overHour || overSession || assistantFreshOver) {
-      if (policy.orchControl.terminalHandoffAllowed && isTerminalHandoffTurn(classification)
-          && st.postCapHandoffTurns < (policy.orchControl.terminalHandoffMaxTurns ?? DEFAULT_POLICY.orchControl.terminalHandoffMaxTurns)) {
-        st.postCapHandoffTurns += 1;
-        return null;
-      }
-      if (isInboundBradTurn(classification)
-          && st.inboundBradReplyTurns < (policy.orchControl.inboundBradReplyMaxTurns ?? DEFAULT_POLICY.orchControl.inboundBradReplyMaxTurns)) {
-        st.inboundBradReplyTurns += 1;
-        return null;
-      }
+      if (consumePostCapBoundaryAllowance(policy, classification, requestHeaders, st)) return null;
       return maybeBlock(project, panel, policy, classification, state, guardDeps,
         'orch-control-budget',
         'miser: ORCH control-loop budget exceeded; write handoff or use a zero-LLM watcher artifact before continuing',
