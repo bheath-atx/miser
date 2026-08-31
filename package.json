@@ -6,6 +6,7 @@
   "bin": {
     "miser-watchd": "bin/miser-watchd.js",
     "make-lane-prompt": "bin/make-lane-prompt.js",
+    "orch-dispatch.sh": "bin/orch-dispatch.sh",
     "spawn-lane.sh": "bin/spawn-lane.sh",
     "boot-inject.sh": "bin/boot-inject.sh",
     "td-inject.sh": "bin/td-inject.sh"

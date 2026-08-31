@@ -191,6 +191,23 @@ Generated ORCH prompts cap pre-dispatch tool use and forbid source/CI/fleet insp
 builder and audit prompts include compact `SUMMARY`/`ORCH-RESULT`, notify-back, and stop contracts
 compatible with `spawn-lane.sh` boot validation.
 
+For routine operator use, `orch-dispatch.sh` wraps prompt generation, active ORCH lookup, and
+TermDeck injection in one command:
+
+```bash
+orch-dispatch.sh \
+  --project Aetheria-Concierge \
+  --label ORCH \
+  --task "Dispatch Grok audit for Sprint19 PR-4" \
+  --pr 351 \
+  --fact "CI passed run 33345975040" \
+  --fact "Builder result: /tmp/aetheria-lanes/builder-sprint19-pr4-voice-handoff/ORCH-RESULT.md" \
+  --fact "Do not poll CI"
+```
+
+Use `--dry-run` to generate the prompt without injecting it. Use `--session <id>` when multiple
+matching ORCH panels exist and you want to target one explicitly.
+
 Zero npm runtime dependencies; Node built-ins only.
 
 Relevant env vars:
