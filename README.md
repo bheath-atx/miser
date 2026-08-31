@@ -207,6 +207,8 @@ orch-dispatch.sh \
 
 Use `--dry-run` to generate the prompt without injecting it. Use `--session <id>` when multiple
 matching ORCH panels exist and you want to target one explicitly.
+`orch-dispatch.sh` refuses to inject the exact same prompt into the same session again for 10
+minutes, unless `--force` is supplied.
 
 For the lowest-friction path, `orch-ask.sh` lets you paste rough text and has Codex normalize it
 into a bounded ORCH dispatch before injection. If you mention a PR number, it also adds bounded
@@ -226,6 +228,14 @@ echo "start a Codex builder for the pkachu local Qwen/Gemma query option; avoid 
 
 Use `orch-ask.sh <project> --dry-run` to see the generated prompt without injection. Use
 `--session <id>` to target a specific ORCH when more than one panel matches.
+
+When a panel misses notify-back or you need to know what happened, use `orch-followup.sh`. It does
+not inject anything and does not call an LLM; it reads PR state, CI state, TermDeck sessions, and
+recent lane artifacts from shell-accessible sources.
+
+```bash
+orch-followup.sh aetheria "what happened with PR351"
+```
 
 Zero npm runtime dependencies; Node built-ins only.
 

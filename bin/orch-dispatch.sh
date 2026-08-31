@@ -14,6 +14,8 @@ LABEL=""
 BASE="${TERMDECK_BASE:-http://127.0.0.1:3100}"
 OUT_DIR="${MISER_PROMPT_OUT_DIR:-/tmp/miser-prompts}"
 DRY_RUN=0
+FORCE=0
+DEDUP_TTL_SEC="${MISER_ORCH_DISPATCH_DEDUP_TTL_SEC:-600}"
 
 usage() {
   cat <<'EOF'
@@ -36,6 +38,7 @@ Options:
   --base <url>        TermDeck base (default: http://127.0.0.1:3100)
   --out-dir <dir>     Prompt/facts output directory (default: /tmp/miser-prompts)
   --dry-run           Generate prompt and print the command target, but do not inject
+  --force             Bypass duplicate-dispatch refusal
 EOF
 }
 
@@ -52,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --base) BASE="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "orch-dispatch: unknown arg '$1'" >&2; usage >&2; exit 1 ;;
   esac
@@ -182,5 +186,34 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
+PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
+DEDUP_DIR="$OUT_DIR/.orch-dispatch-injections"
+DEDUP_KEY=$(PROJECT="$PROJECT" SESSION="$SESSION" HASH="$PROMPT_HASH" python3 - <<'PY'
+import os, re
+raw = f"{os.environ['PROJECT']}--{os.environ['SESSION']}--{os.environ['HASH']}"
+print(re.sub(r'[^A-Za-z0-9_.-]+', '-', raw).strip('-') or 'dispatch')
+PY
+)
+DEDUP_FILE="$DEDUP_DIR/$DEDUP_KEY"
+if [[ $FORCE -ne 1 && -f "$DEDUP_FILE" ]]; then
+  NOW=$(date +%s)
+  LAST=$(stat -c %Y "$DEDUP_FILE" 2>/dev/null || echo 0)
+  AGE=$((NOW - LAST))
+  if [[ "$DEDUP_TTL_SEC" =~ ^[0-9]+$ && "$AGE" -lt "$DEDUP_TTL_SEC" ]]; then
+    echo "orch-dispatch: duplicate prompt already injected to session $SESSION ${AGE}s ago; refusing to spend another ORCH turn" >&2
+    echo "orch-dispatch: previous=$DEDUP_FILE" >&2
+    echo "orch-dispatch: use --force only if you intentionally want a second ORCH management turn" >&2
+    exit 1
+  fi
+fi
+
 "$TD_INJECT" "$SESSION" "$(<"$PROMPT_FILE")" "$PORT"
+mkdir -p "$DEDUP_DIR"
+{
+  printf 'project=%s\n' "$PROJECT"
+  printf 'session=%s\n' "$SESSION"
+  printf 'prompt=%s\n' "$PROMPT_FILE"
+  printf 'hash=%s\n' "$PROMPT_HASH"
+  printf 'created_at=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+} > "$DEDUP_FILE"
 echo "$PROMPT_FILE"
