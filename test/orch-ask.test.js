@@ -94,7 +94,7 @@ function run(args, env, input = '') {
   });
 }
 
-test('enriches a PR-only request with GitHub and matching lane artifact facts', (t) => {
+test('enriches and deterministically dispatches a PR audit request without Codex', (t) => {
   const f = setup(t, '{"task":"Dispatch Grok audit for PR351","pr":"351","facts":["Use enriched PR facts","Do not poll CI"]}');
   const lane = path.join(f.env.AETHERIA_LANE_ROOT, 'builder-pr351');
   fs.mkdirSync(lane, { recursive: true });
@@ -104,10 +104,17 @@ test('enriches a PR-only request with GitHub and matching lane artifact facts', 
   const res = run(['aetheria', 'run grok on PR351', '--dry-run'], f.env);
 
   assert.equal(res.status, 0, res.stderr);
-  const codexInput = fs.readFileSync(f.codexLog, 'utf8');
-  assert.match(codexInput, /GitHub PR #351: Sprint19 PR-4/);
-  assert.match(codexInput, /CI run 33345975040 CI: status=completed conclusion=success/);
-  assert.match(codexInput, new RegExp(artifact.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(fs.existsSync(f.codexLog), false);
+  assert.match(res.stderr, /normalized without Codex/);
+
+  const dispatch = fs.readFileSync(f.dispatchLog, 'utf8');
+  assert.match(dispatch, /--task\nDispatch Grok audit for PR #351/);
+  const factsPath = dispatch.match(/--facts\n([^\n]+)/)[1];
+  const facts = fs.readFileSync(factsPath, 'utf8');
+  assert.match(facts, /GitHub PR #351: Sprint19 PR-4/);
+  assert.match(facts, /CI run 33345975040 CI: status=completed conclusion=success/);
+  assert.match(facts, new RegExp(artifact.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(facts, /Do not poll CI/);
 
   const gh = fs.readFileSync(f.ghLog, 'utf8');
   assert.match(gh, /pr view 351/);
@@ -116,7 +123,7 @@ test('enriches a PR-only request with GitHub and matching lane artifact facts', 
 
 test('normalizes free text with Codex and dispatches generated facts', (t) => {
   const f = setup(t);
-  const res = run(['aetheria', 'run grok on PR351, CI passed, do not poll'], f.env);
+  const res = run(['aetheria', 'start a bounded builder for no-show reminder copy'], f.env);
 
   assert.equal(res.status, 0, res.stderr);
   assert.equal(res.stdout.trim(), '/tmp/generated-prompt.md');
@@ -127,7 +134,7 @@ test('normalizes free text with Codex and dispatches generated facts', (t) => {
 
   const dispatch = fs.readFileSync(f.dispatchLog, 'utf8');
   assert.match(dispatch, /--project\nAetheria-Concierge/);
-  assert.match(dispatch, /--label\nORCH/);
+  assert.doesNotMatch(dispatch, /--label\n/);
   assert.match(dispatch, /--task\nDispatch Grok audit for PR351/);
   assert.match(dispatch, /--pr\n351/);
 

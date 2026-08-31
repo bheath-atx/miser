@@ -7,6 +7,7 @@ PROJECT_ALIAS=""
 TEXT_PARTS=()
 SESSION=""
 LABEL=""
+LABEL_EXPLICIT=0
 BASE="${TERMDECK_BASE:-http://127.0.0.1:3100}"
 OUT_DIR="${MISER_PROMPT_OUT_DIR:-/tmp/miser-prompts}"
 DRY_RUN=0
@@ -37,7 +38,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --session) SESSION="$2"; shift 2 ;;
-    --label) LABEL="$2"; shift 2 ;;
+    --label) LABEL="$2"; LABEL_EXPLICIT=1; shift 2 ;;
     --base) BASE="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
@@ -68,25 +69,25 @@ case "${PROJECT_ALIAS,,}" in
     PROJECT="Aetheria-Concierge"
     GH_REPO="bheath-atx/aetheria-phase1"
     LANE_ROOT="${AETHERIA_LANE_ROOT:-/tmp/aetheria-lanes}"
-    DEFAULT_LABEL="ORCH"
+    DEFAULT_LABEL=""
     ;;
   pkachu)
     PROJECT="pkachu"
     GH_REPO="${PKACHU_GH_REPO:-}"
     LANE_ROOT="${PKACHU_LANE_ROOT:-/tmp/pkachu-lanes}"
-    DEFAULT_LABEL="ORCH"
+    DEFAULT_LABEL=""
     ;;
   miser|termdeck-updates|provenspec|nacho-money)
     PROJECT="$PROJECT_ALIAS"
     GH_REPO="$([[ "${PROJECT_ALIAS,,}" == "miser" ]] && printf 'bheath-atx/miser' || true)"
     LANE_ROOT="${MISER_LANE_ROOT:-/tmp/miser-lanes}"
-    DEFAULT_LABEL="ORCH"
+    DEFAULT_LABEL=""
     ;;
   *)
     PROJECT="$PROJECT_ALIAS"
     GH_REPO=""
     LANE_ROOT="/tmp/${PROJECT_ALIAS}-lanes"
-    DEFAULT_LABEL="ORCH"
+    DEFAULT_LABEL=""
     ;;
 esac
 [[ -z "$LABEL" ]] && LABEL="$DEFAULT_LABEL"
@@ -189,6 +190,45 @@ PY
 
 write_enriched_facts
 
+try_deterministic_normalize() {
+  local pr_number
+  pr_number="$(extract_pr_number || true)"
+  [[ -n "$pr_number" ]] || return 1
+
+  if REQUEST_TEXT="$REQUEST_TEXT" python3 - <<'PY'
+import os, re, sys
+text = os.environ['REQUEST_TEXT'].lower()
+sys.exit(0 if re.search(r'\b(grok|audit|review)\b', text) else 1)
+PY
+  then
+    PR_NUMBER="$pr_number" ENRICH_FILE="$ENRICH_FILE" NORMALIZED_FILE="$NORMALIZED_FILE" python3 - <<'PY'
+import json, os
+
+pr = os.environ['PR_NUMBER']
+facts = []
+enrich = os.environ['ENRICH_FILE']
+if os.path.exists(enrich):
+    with open(enrich, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('- '):
+                facts.append(line[2:])
+facts.append('Do not poll CI; use supplied CI and artifact facts only.')
+obj = {
+    'task': f'Dispatch Grok audit for PR #{pr}',
+    'pr': pr,
+    'facts': facts,
+}
+with open(os.environ['NORMALIZED_FILE'], 'w', encoding='utf-8') as f:
+    json.dump(obj, f)
+    f.write('\n')
+PY
+    return 0
+  fi
+
+  return 1
+}
+
 cat > "$CODEX_PROMPT_FILE" <<EOF
 You convert Brad's rough operator request into a compact ORCH dispatch JSON object.
 
@@ -213,14 +253,18 @@ Operator request:
 ${REQUEST_TEXT}
 EOF
 
-CODEX_ARGS=(exec --ephemeral --skip-git-repo-check --ignore-rules --sandbox read-only --ask-for-approval never -C /tmp -o "$NORMALIZED_FILE")
-[[ -n "$MODEL" ]] && CODEX_ARGS+=(--model "$MODEL")
-CODEX_ARGS+=("$(<"$CODEX_PROMPT_FILE")")
+if try_deterministic_normalize; then
+  echo "orch-ask: normalized without Codex for recognized PR audit request" >&2
+else
+  CODEX_ARGS=(exec --ephemeral --skip-git-repo-check --ignore-rules --sandbox read-only -C /tmp -o "$NORMALIZED_FILE")
+  [[ -n "$MODEL" ]] && CODEX_ARGS+=(--model "$MODEL")
+  CODEX_ARGS+=("$(<"$CODEX_PROMPT_FILE")")
 
-if ! "$CODEX_BIN" "${CODEX_ARGS[@]}" >/dev/null; then
-  echo "orch-ask: Codex normalization failed" >&2
-  echo "orch-ask: raw request saved at $RAW_FILE" >&2
-  exit 1
+  if ! "$CODEX_BIN" "${CODEX_ARGS[@]}" >/dev/null; then
+    echo "orch-ask: Codex normalization failed" >&2
+    echo "orch-ask: raw request saved at $RAW_FILE" >&2
+    exit 1
+  fi
 fi
 
 PARSED=$(NORMALIZED_FILE="$NORMALIZED_FILE" FACTS_FILE="$FACTS_FILE" python3 - <<'PY'
@@ -270,7 +314,8 @@ fi
 TASK=$(sed -n '2p' <<<"$PARSED")
 PR=$(sed -n '3p' <<<"$PARSED")
 
-DISPATCH_ARGS=(--project "$PROJECT" --label "$LABEL" --task "$TASK" --facts "$FACTS_FILE" --base "$BASE" --out-dir "$OUT_DIR")
+DISPATCH_ARGS=(--project "$PROJECT" --task "$TASK" --facts "$FACTS_FILE" --base "$BASE" --out-dir "$OUT_DIR")
+[[ $LABEL_EXPLICIT -eq 1 && -n "$LABEL" ]] && DISPATCH_ARGS+=(--label "$LABEL")
 [[ -n "$PR" ]] && DISPATCH_ARGS+=(--pr "$PR")
 [[ -n "$SESSION" ]] && DISPATCH_ARGS+=(--session "$SESSION")
 [[ $DRY_RUN -eq 1 ]] && DISPATCH_ARGS+=(--dry-run)
