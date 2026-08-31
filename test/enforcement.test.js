@@ -571,6 +571,49 @@ test('one marked DISPATCH_FINALIZE is allowed once and does not reset budget', (
   assert.equal(block.headers['x-miser-enforcement'], 'orch-assignment-budget');
 });
 
+test('marked DISPATCH_FINALIZE bypasses stale control-loop cap once', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    controlClasses: ['repo_status', 'audit_monitor'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
+    maxControlTurnsPerSession: 1,
+  });
+  const deps = guard(config, state);
+
+  assert.equal(call(deps, 'aetheria', 'orch', 'git status && gh pr view 351'), null);
+  assert.equal(call(deps, 'aetheria', 'orch', [
+    'DISPATCH_FINALIZE MISER_ASSIGNMENT=A CHILD_SESSION=pending',
+    'Dispatch Grok audit for PR351',
+    'CI run 33345975040 status=success',
+  ].join('\n')), null);
+  const block = call(deps, 'aetheria', 'orch', [
+    'DISPATCH_FINALIZE MISER_ASSIGNMENT=A CHILD_SESSION=pending',
+    'Dispatch Grok audit for PR351 retry',
+  ].join('\n'));
+  assert.equal(block.headers['x-miser-enforcement'], 'orch-control-budget');
+});
+
+test('explicit Brad approval boundary bypasses stale control-loop cap', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    controlClasses: ['repo_status', 'audit_monitor'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
+    maxControlTurnsPerSession: 1,
+  });
+  const deps = guard(config, state);
+
+  assert.equal(call(deps, 'aetheria', 'orch', 'git status && gh pr view 351'), null);
+  assert.equal(call(deps, 'aetheria', 'orch', 'BRAD_APPROVED_CONTINUE MISER_ASSIGNMENT=A dispatch the bounded PR351 fix'), null);
+});
+
 test('architect proposal revision cycle 3 blocks without approval', () => {
   const state = createEnforcementState({ nowMs: () => 1000 });
   const config = configFor('aetheria', {
