@@ -1,0 +1,252 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const KINDS = new Set([
+  'orch-dispatch',
+  'codex-builder',
+  'codex-audit',
+  'grok-audit',
+  'claude-architect',
+]);
+
+function usage() {
+  return `Usage:
+  make-lane-prompt --project <name> --kind <kind> --task <text> [options]
+
+Kinds:
+  orch-dispatch   Clean prompt for an existing ORCH panel to dispatch work
+  codex-builder   Boot prompt for a Codex builder lane
+  codex-audit     Boot prompt for a Codex read-only audit lane
+  grok-audit      Prompt for a Grok one-shot audit lane
+  claude-architect Boot prompt for a bounded Claude architect lane
+
+Options:
+  --facts <file>             Include compact task facts from file
+  --pr <number-or-url>       PR identifier for audit prompts
+  --cwd <path>               Lane working directory
+  --parent <session-id>      Dispatcher session id
+  --result <path>            Compact result artifact path
+  --summary <path>           Summary artifact path
+  --notify-url <url>         Notify-back endpoint or channel description
+  --notify-token-file <path> Notify-back bearer token file
+  --out <file>               Write prompt to file instead of stdout
+`;
+}
+
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '-h' || arg === '--help') {
+      args.help = true;
+      continue;
+    }
+    if (!arg.startsWith('--')) {
+      throw new Error(`unknown positional arg '${arg}'`);
+    }
+    const key = arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    const value = argv[i + 1];
+    if (!value || value.startsWith('--')) {
+      throw new Error(`missing value for ${arg}`);
+    }
+    args[key] = value;
+    i += 1;
+  }
+  return args;
+}
+
+function requireArg(args, key) {
+  if (!args[key]) throw new Error(`missing --${key.replace(/[A-Z]/g, c => `-${c.toLowerCase()}`)}`);
+  return args[key];
+}
+
+function readFacts(file) {
+  if (!file) return 'No separate facts file provided. Use only the task text and named authority files.';
+  const resolved = path.resolve(file);
+  return fs.readFileSync(resolved, 'utf8').trimEnd();
+}
+
+function defaultResult(kind, project, task) {
+  const safeProject = safe(project);
+  const safeTask = safe(task).slice(0, 80) || 'task';
+  if (kind === 'orch-dispatch') return `/tmp/${safeProject}-${safeTask}-orch-result.md`;
+  return `/tmp/${safeProject}-${safeTask}/ORCH-RESULT.md`;
+}
+
+function defaultSummary(project, task) {
+  return `/tmp/${safe(project)}-${safe(task).slice(0, 80) || 'task'}/SUMMARY.md`;
+}
+
+function safe(value) {
+  return String(value).toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function commonHeader(args, facts) {
+  return `# ${args.project} ${args.kind} Prompt
+
+Task: ${args.task}
+Project: ${args.project}
+${args.pr ? `PR: ${args.pr}\n` : ''}${args.cwd ? `Working directory: ${args.cwd}\n` : ''}${args.parent ? `dispatcher-session-id: ${args.parent}\n` : ''}
+## Compact Facts
+
+${facts}
+`;
+}
+
+function orchDispatch(args, facts) {
+  return `${commonHeader(args, facts)}
+## Role
+
+You are the project ORCH. Your job is dispatch and coordination only.
+
+## Efficiency Contract
+
+- Maximum 8 tool calls before first dispatch.
+- Allowed reads: project CLAUDE.md, named Mnestra/project memory, and explicitly named artifact paths from this prompt.
+- Forbidden: grep/read src/, app/, services/, migrations/, tests/, logs, CI, GitHub Actions, TermDeck census, health checks, or broad repo reconstruction.
+- If implementation discovery is needed, put that requirement in the builder/auditor briefing. Do not perform it in ORCH.
+- Do not run CI polling loops or wait on panels.
+- Do not self-grade by inspecting fleet/session state.
+
+## Assignment
+
+Dispatch the next bounded lane required for the task above using the standard spawn helper. Use the facts in this prompt to write a compact lane briefing. The lane briefing must include a notify-back instruction, a compact result artifact path, and an explicit stop condition.
+
+After dispatch, stop and report only:
+- child session id, if available
+- briefing path
+- expected compact result path
+- next external gate
+`;
+}
+
+function codexBuilder(args, facts) {
+  const result = args.result || defaultResult(args.kind, args.project, args.task);
+  const summary = args.summary || defaultSummary(args.project, args.task);
+  const notify = args.notifyUrl || 'the dispatcher notify-back channel';
+  return `${commonHeader(args, facts)}
+## Role
+
+You are a bounded Codex builder lane. Implement only the task above.
+
+## Builder Discovery Contract
+
+- You may inspect repo/source files as needed for implementation.
+- Do not inspect fleet/session state.
+- Do not poll CI in a loop.
+- Do not launch other model lanes.
+- Do not merge.
+
+## Deliverables
+
+1. Implement the requested change in the working directory.
+2. Run focused tests appropriate to the changed files.
+3. Open or update the PR if requested by the compact facts.
+4. Write SUMMARY at: ${summary}
+5. Write compact ORCH-RESULT at: ${result}
+
+The ORCH-RESULT must be under 4KB and include VERDICT, PR URL or branch, one-line summary, tests run, route class, and next action.
+
+## Notify Back
+
+Do not wait to be polled. After writing ORCH-RESULT, notify-back to ${notify}${args.notifyTokenFile ? ` using bearer token file ${args.notifyTokenFile}` : ''} with one line pointing to ${result}.
+
+Stop after notify-back.
+`;
+}
+
+function auditPrompt(args, facts, auditorName) {
+  const result = args.result || defaultResult(args.kind, args.project, args.task);
+  return `${commonHeader(args, facts)}
+## Role
+
+You are a bounded ${auditorName} audit lane. Perform a read-only adversarial audit of the target task/PR.
+
+## Audit Contract
+
+- Read-only: no edits, commits, pushes, merges, deployment changes, DB writes, or external side effects.
+- Inspect only the target PR/diff and files needed to verify the stated acceptance criteria.
+- Do not poll CI in a loop. One status lookup is allowed only if explicitly needed.
+- Do not launch other model lanes.
+- Default to REVISE unless the evidence supports APPROVE.
+
+## Output
+
+Write the audit artifact to: ${result}
+
+Use this structure:
+- VERDICT: APPROVE or REVISE
+- Scope audited
+- Findings ordered by severity with file:line evidence
+- Tests/checks observed or run, if any
+- Residual risks
+- Next action
+
+Then notify-back to ${args.notifyUrl || 'the dispatcher notify-back channel'}${args.notifyTokenFile ? ` using bearer token file ${args.notifyTokenFile}` : ''} with one line pointing to ${result}. Stop after notify-back.
+`;
+}
+
+function claudeArchitect(args, facts) {
+  const result = args.result || defaultResult(args.kind, args.project, args.task);
+  return `${commonHeader(args, facts)}
+## Role
+
+You are a bounded Claude architect lane for ambiguous design work only.
+
+## Architect Contract
+
+- Produce architecture/spec only; do not implement code.
+- Read only files needed to resolve the design question.
+- Do not poll CI, TermDeck, or builder status.
+- Do not launch other lanes.
+- Stop at a compact proposal or blocked decision request.
+
+## Output
+
+Write a compact architecture result to: ${result}
+
+Include VERDICT, recommended design, rejected alternatives, acceptance criteria for a future builder, open Brad decisions, and next action. Then notify-back to ${args.notifyUrl || 'the dispatcher notify-back channel'}${args.notifyTokenFile ? ` using bearer token file ${args.notifyTokenFile}` : ''} with one line pointing to ${result}. Stop after notify-back.
+`;
+}
+
+function buildPrompt(args) {
+  const project = requireArg(args, 'project');
+  const kind = requireArg(args, 'kind');
+  const task = requireArg(args, 'task');
+  if (!KINDS.has(kind)) throw new Error(`unknown --kind '${kind}'`);
+  const normalized = { ...args, project, kind, task };
+  const facts = readFacts(args.facts);
+  if (kind === 'orch-dispatch') return orchDispatch(normalized, facts);
+  if (kind === 'codex-builder') return codexBuilder(normalized, facts);
+  if (kind === 'codex-audit') return auditPrompt(normalized, facts, 'Codex');
+  if (kind === 'grok-audit') return auditPrompt(normalized, facts, 'Grok');
+  if (kind === 'claude-architect') return claudeArchitect(normalized, facts);
+  throw new Error(`unhandled kind '${kind}'`);
+}
+
+function main() {
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    if (args.help) {
+      process.stdout.write(usage());
+      return;
+    }
+    const prompt = buildPrompt(args);
+    if (args.out) {
+      fs.mkdirSync(path.dirname(path.resolve(args.out)), { recursive: true });
+      fs.writeFileSync(args.out, prompt, 'utf8');
+    } else {
+      process.stdout.write(prompt);
+    }
+  } catch (err) {
+    process.stderr.write(`make-lane-prompt: ${err.message}\n`);
+    process.stderr.write(usage());
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) main();
+
