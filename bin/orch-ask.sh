@@ -213,7 +213,7 @@ Operator request:
 ${REQUEST_TEXT}
 EOF
 
-CODEX_ARGS=(exec --ephemeral --skip-git-repo-check --ignore-rules --sandbox read-only --ask-for-approval never -C /tmp -o "$NORMALIZED_FILE")
+CODEX_ARGS=(exec --ephemeral --skip-git-repo-check --ignore-rules --sandbox read-only -C /tmp -o "$NORMALIZED_FILE")
 [[ -n "$MODEL" ]] && CODEX_ARGS+=(--model "$MODEL")
 CODEX_ARGS+=("$(<"$CODEX_PROMPT_FILE")")
 
