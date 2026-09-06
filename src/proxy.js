@@ -53,10 +53,6 @@ function wantsAnthropicStream(body) {
   return !!(body && body.stream === true);
 }
 
-function anthropicSseFrame(event, data) {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
 function writeLocalAnthropicResponse(res, local, originalBody) {
   if (local && local.enforcement && local.enforcement.synthetic && wantsAnthropicStream(originalBody)) {
     const body = local.body || {};
@@ -76,68 +72,8 @@ function writeLocalAnthropicResponse(res, local, originalBody) {
     return;
   }
 
-  const isStreamingWarning = local
-    && local.enforcement
-    && local.enforcement.warning
-    && wantsAnthropicStream(originalBody);
-
-  if (!isStreamingWarning) {
-    res.writeHead(local.status, local.headers);
-    res.end(JSON.stringify(local.body));
-    return;
-  }
-
-  const body = local.body || {};
-  const text = Array.isArray(body.content) && body.content[0] && typeof body.content[0].text === 'string'
-    ? body.content[0].text
-    : '';
-  const headers = {
-    ...local.headers,
-    'content-type': 'text/event-stream',
-    'cache-control': 'no-cache',
-  };
-  res.writeHead(local.status, headers);
-  res.write(anthropicSseFrame('message_start', {
-    type: 'message_start',
-    message: {
-      id: body.id || `miser_warning_${Date.now()}`,
-      type: 'message',
-      role: 'assistant',
-      model: body.model || (originalBody && originalBody.model) || 'miser-enforcement-warning',
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-        output_tokens: 0,
-      },
-    },
-  }));
-  res.write(anthropicSseFrame('content_block_start', {
-    type: 'content_block_start',
-    index: 0,
-    content_block: { type: 'text', text: '' },
-  }));
-  if (text) {
-    res.write(anthropicSseFrame('content_block_delta', {
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'text_delta', text },
-    }));
-  }
-  res.write(anthropicSseFrame('content_block_stop', {
-    type: 'content_block_stop',
-    index: 0,
-  }));
-  res.write(anthropicSseFrame('message_delta', {
-    type: 'message_delta',
-    delta: { stop_reason: 'end_turn', stop_sequence: null },
-    usage: { output_tokens: 0 },
-  }));
-  res.write(anthropicSseFrame('message_stop', { type: 'message_stop' }));
-  res.end();
+  res.writeHead(local.status, local.headers);
+  res.end(JSON.stringify(local.body));
 }
 
 function textFromContent(content) {
@@ -303,6 +239,47 @@ function reqPerMin(now = Date.now()) {
   return _reqTimestamps.length;
 }
 
+function watcherStatusPayload(watcher) {
+  if (watcher && typeof watcher.status === 'function') return watcher.status();
+  const probes = watcher && typeof watcher.listProbes === 'function' ? watcher.listProbes() : [];
+  const statuses = probes.map(probe => {
+    const fresh = watcher && typeof watcher.freshness === 'function'
+      ? watcher.freshness(probe.id)
+      : { probe_id: probe.id, state: 'missing', age_s: null, paths: null, artifact: null };
+    return {
+      probe_id: probe.id,
+      command: probe.command,
+      cwd: probe.cwd || null,
+      ttl_s: probe.ttl_s,
+      interval_s: probe.interval_s,
+      timeout_s: probe.timeout_s,
+      state: fresh.state,
+      age_s: fresh.age_s,
+      generated_at: fresh.artifact && fresh.artifact.generated_at ? fresh.artifact.generated_at : null,
+      artifact_status: fresh.artifact && fresh.artifact.status ? fresh.artifact.status : null,
+      paths: fresh.paths,
+    };
+  });
+  const states = new Set(statuses.map(probe => probe.state));
+  const overall = watcher && watcher.enabled === false
+    ? 'disabled'
+    : statuses.length === 0
+      ? 'empty'
+      : states.has('missing')
+        ? 'missing'
+        : states.has('stale')
+          ? 'stale'
+          : 'fresh';
+  return {
+    ok: overall === 'fresh',
+    status: overall,
+    enabled: !!(watcher && watcher.enabled !== false),
+    watchDir: watcher && watcher.watchDir,
+    probe_count: statuses.length,
+    probes: statuses,
+  };
+}
+
 // `deps` is an OPTIONAL injectable seam forwarded verbatim to routeRequest()
 // (transports / getBearer / ollamaCap / breakers / guardDeps). Production callers
 // pass nothing, so routeRequest falls back to its real transports. The offline
@@ -318,7 +295,11 @@ function createProxy(deps = {}) {
     for (const [name, b] of Object.entries(bs)) out[name] = b.getState();
     return out;
   });
-  const watcher = deps.watcher || createWatcher(config.watch || {});
+  let watcher = deps.watcher || null;
+  const getWatcher = () => {
+    if (!watcher) watcher = createWatcher(config.watch || {});
+    return watcher;
+  };
 
   return async function handler(req, res) {
     trackRequest();
@@ -455,6 +436,11 @@ function createProxy(deps = {}) {
       return;
     }
 
+    if (route.kind === 'watch_status') {
+      json(res, 200, watcherStatusPayload(getWatcher()));
+      return;
+    }
+
     if (route.kind === 'watch_refresh') {
       try {
         if (config.watch && config.watch.enabled === false) {
@@ -474,7 +460,7 @@ function createProxy(deps = {}) {
           json(res, 400, { error: { type: 'invalid_request_error', message: 'miser watch refresh requires probe id' } });
           return;
         }
-        const result = await watcher.refreshProbe(id);
+        const result = await getWatcher().refreshProbe(id);
         json(res, result.in_flight ? 202 : 200, result);
       } catch (err) {
         json(res, err.statusCode || 500, { error: { type: 'watch_refresh_error', message: err.message } });
@@ -577,7 +563,9 @@ function createProxy(deps = {}) {
         let block = null;
         try {
           const check = guardDeps.checkEnforcement || checkEnforcement;
-          const enforcementGuardDeps = guardDeps.watcher ? guardDeps : { ...guardDeps, watcher };
+          const enforcementGuardDeps = guardDeps.watcher || guardDeps.watchConfig
+            ? guardDeps
+            : { ...guardDeps, watchConfig: config.watch || {} };
           block = check(project, panel, originalBody, compactHeaders, rawTokens, enforcementGuardDeps, req.headers);
         } catch (e) {
           console.warn('[miser] enforcement check error (fail-open):', e.message);

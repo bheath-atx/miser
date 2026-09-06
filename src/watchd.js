@@ -394,6 +394,47 @@ function createWatcher(opts = {}) {
     };
   }
 
+  function status() {
+    const probesStatus = listProbes().map(probe => {
+      const paths = pathsFor(probe.id);
+      const artifact = readArtifact(probe.id);
+      const fresh = artifactFreshness(artifact, nowMs());
+      return {
+        probe_id: probe.id,
+        command: probe.command,
+        cwd: probe.cwd || null,
+        ttl_s: probe.ttl_s,
+        interval_s: probe.interval_s,
+        timeout_s: probe.timeout_s,
+        state: fresh.state,
+        age_s: fresh.age_s,
+        generated_at: artifact && artifact.generated_at ? artifact.generated_at : null,
+        artifact_status: artifact && artifact.status ? artifact.status : null,
+        paths,
+        compact_exists: fs.existsSync(paths.compact),
+        json_exists: fs.existsSync(paths.json),
+      };
+    });
+    const states = new Set(probesStatus.map(probe => probe.state));
+    const overall = enabled === false
+      ? 'disabled'
+      : probesStatus.length === 0
+        ? 'empty'
+        : states.has('missing')
+          ? 'missing'
+          : states.has('stale')
+            ? 'stale'
+            : 'fresh';
+    return {
+      ok: overall === 'fresh',
+      status: overall,
+      enabled,
+      watchDir,
+      probe_count: probesStatus.length,
+      probes: probesStatus,
+    };
+  }
+
   async function refreshProbe(id) {
     if (!enabled) {
       return {
@@ -460,7 +501,7 @@ function createWatcher(opts = {}) {
     return out;
   }
 
-  return { enabled, watchDir, getProbe, listProbes, pathsFor, readArtifact, freshness, refreshProbe, refreshAll };
+  return { enabled, watchDir, getProbe, listProbes, pathsFor, readArtifact, freshness, status, refreshProbe, refreshAll };
 }
 
 module.exports = {
