@@ -537,9 +537,12 @@ test('enforcement canary warns before blocking repeated NACHO ORCH-control poll 
     };
     const first = fakeRes();
     await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', firstBody, {}), first);
-    assert.equal(first.statusCode, 200);
+    assert.equal(first.statusCode, 429);
+    assert.equal(first.headers['x-miser-control-plane'], 'poll-budget-edge');
+    assert.equal(first.headers['x-miser-enforcement'], 'poll-budget-edge');
     assert.equal(first.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
     assert.match(first.body(), /poll budget edge/);
+    assert.equal(first.body().includes('"role":"assistant"'), false);
     assert.equal(echo.captured.length, 0);
 
     const second = fakeRes();
@@ -554,7 +557,7 @@ test('enforcement canary warns before blocking repeated NACHO ORCH-control poll 
   }
 });
 
-test('enforcement warning honors Anthropic streaming requests with SSE', async () => {
+test('enforcement warning on Anthropic streaming requests returns JSON control-plane error', async () => {
   const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok', usage: { input_tokens: 1 } } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {
     MISER_ENFORCEMENT: JSON.stringify({
@@ -581,13 +584,15 @@ test('enforcement warning honors Anthropic streaming requests with SSE', async (
     }, {}), res);
     await done;
 
-    assert.equal(res.statusCode, 200);
+    assert.equal(res.statusCode, 429);
+    assert.equal(res.headers['x-miser-control-plane'], 'poll-budget-edge');
+    assert.equal(res.headers['x-miser-enforcement'], 'poll-budget-edge');
     assert.equal(res.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
-    assert.equal(res.headers['content-type'], 'text/event-stream');
-    assert.match(res.body(), /event: message_start/);
-    assert.match(res.body(), /event: content_block_delta/);
+    assert.equal(res.headers['content-type'], 'application/json');
+    assert.equal(JSON.parse(res.body()).error.type, 'miser_control_plane_error');
     assert.match(res.body(), /poll budget edge/);
-    assert.match(res.body(), /event: message_stop/);
+    assert.equal(res.body().includes('event: message_start'), false);
+    assert.equal(res.body().includes('"role":"assistant"'), false);
     assert.equal(echo.captured.length, 0);
   } finally {
     echo.server.close(); restoreEnv();

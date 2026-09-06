@@ -53,10 +53,6 @@ function wantsAnthropicStream(body) {
   return !!(body && body.stream === true);
 }
 
-function anthropicSseFrame(event, data) {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
 function writeLocalAnthropicResponse(res, local, originalBody) {
   if (local && local.enforcement && local.enforcement.synthetic && wantsAnthropicStream(originalBody)) {
     const body = local.body || {};
@@ -76,68 +72,8 @@ function writeLocalAnthropicResponse(res, local, originalBody) {
     return;
   }
 
-  const isStreamingWarning = local
-    && local.enforcement
-    && local.enforcement.warning
-    && wantsAnthropicStream(originalBody);
-
-  if (!isStreamingWarning) {
-    res.writeHead(local.status, local.headers);
-    res.end(JSON.stringify(local.body));
-    return;
-  }
-
-  const body = local.body || {};
-  const text = Array.isArray(body.content) && body.content[0] && typeof body.content[0].text === 'string'
-    ? body.content[0].text
-    : '';
-  const headers = {
-    ...local.headers,
-    'content-type': 'text/event-stream',
-    'cache-control': 'no-cache',
-  };
-  res.writeHead(local.status, headers);
-  res.write(anthropicSseFrame('message_start', {
-    type: 'message_start',
-    message: {
-      id: body.id || `miser_warning_${Date.now()}`,
-      type: 'message',
-      role: 'assistant',
-      model: body.model || (originalBody && originalBody.model) || 'miser-enforcement-warning',
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-        output_tokens: 0,
-      },
-    },
-  }));
-  res.write(anthropicSseFrame('content_block_start', {
-    type: 'content_block_start',
-    index: 0,
-    content_block: { type: 'text', text: '' },
-  }));
-  if (text) {
-    res.write(anthropicSseFrame('content_block_delta', {
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'text_delta', text },
-    }));
-  }
-  res.write(anthropicSseFrame('content_block_stop', {
-    type: 'content_block_stop',
-    index: 0,
-  }));
-  res.write(anthropicSseFrame('message_delta', {
-    type: 'message_delta',
-    delta: { stop_reason: 'end_turn', stop_sequence: null },
-    usage: { output_tokens: 0 },
-  }));
-  res.write(anthropicSseFrame('message_stop', { type: 'message_stop' }));
-  res.end();
+  res.writeHead(local.status, local.headers);
+  res.end(JSON.stringify(local.body));
 }
 
 function textFromContent(content) {

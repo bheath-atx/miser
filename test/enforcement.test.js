@@ -170,8 +170,10 @@ test('configured non-nacho project blocks repeated explicit polling commands', (
   const deps = guard(config, state, () => new Date(nowMs));
 
   const warn = call(deps, 'aetheria', 'orch', 'curl http://127.0.0.1:20128/api/miser/stats', { 'x-miser-poll-class': 'likely' });
-  assert.equal(warn.status, 200);
+  assert.equal(warn.status, 429);
+  assert.equal(warn.body.error.type, 'miser_control_plane_error');
   assert.equal(warn.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
+  assert.equal(JSON.stringify(warn.body).includes('"role":"assistant"'), false);
   nowMs += 3000;
   const block = call(deps, 'aetheria', 'orch', 'curl http://127.0.0.1:20128/api/miser/stats', { 'x-miser-poll-class': 'likely' });
   assert.equal(block.status, 429);
@@ -202,7 +204,8 @@ test('all named fleet projects can be covered by config without source hardcodin
     config[project].poll.maxLikelyPollsPer10Min = 1;
     const first = call(deps, project, panel, 'curl /api/miser/stats', { 'x-miser-poll-class': 'likely' });
     assert.ok(first, `${project}/${panel} should warn`);
-    assert.equal(first.status, 200);
+    assert.equal(first.status, 429);
+    assert.equal(first.body.error.type, 'miser_control_plane_error');
     nowMs += 3000;
     const block = call(deps, project, panel, 'curl /api/miser/stats', { 'x-miser-poll-class': 'likely' });
     assert.equal(block.headers['x-miser-enforcement'], 'poll-budget');
@@ -326,7 +329,7 @@ test('protected counters reset only on explicit assignment, approval, completion
     });
     const deps = guard(config, state);
     assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null, label);
-    assert.equal(call(deps, 'aetheria', 'orch', 'proposal mediation').status, 200, label);
+    assert.equal(call(deps, 'aetheria', 'orch', 'proposal mediation').status, 429, label);
     assert.equal(call(deps, 'aetheria', 'orch', resetText, {}, requestHeaders), null, label);
     assert.equal(call(deps, 'aetheria', 'orch', 'proposal follow-up'), null, label);
   }
@@ -418,8 +421,9 @@ test('assignment management warns at 2 and blocks after 3', () => {
 
   assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null);
   const warn = call(deps, 'aetheria', 'orch', 'proposal mediation for builder audit');
-  assert.equal(warn.status, 200);
+  assert.equal(warn.status, 429);
   assert.equal(warn.headers['x-miser-enforcement-warning'], 'orch-assignment-budget-edge');
+  assert.equal(warn.body.error.type, 'miser_control_plane_error');
   assert.equal(call(deps, 'aetheria', 'orch', 'proposal approval gate status'), null);
   const block = call(deps, 'aetheria', 'orch', 'proposal revision routing again');
   assert.equal(block.status, 429);

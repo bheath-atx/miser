@@ -1204,30 +1204,27 @@ function buildEnforcementResponse(reason, mode, message, retryAfter = null) {
   };
 }
 
-function buildWarningResponse(reason, mode, message, model = 'miser-enforcement-warning') {
+function buildWarningResponse(reason, mode, message) {
   return {
-    status: 200,
+    status: 429,
     headers: {
       'content-type': 'application/json',
+      'x-miser-control-plane': reason,
+      'x-miser-enforcement': reason,
       'x-miser-enforcement-warning': reason,
       'x-miser-enforcement-mode': mode,
     },
     body: {
-      id: `miser_warning_${Date.now()}`,
-      type: 'message',
-      role: 'assistant',
-      model: model || 'miser-enforcement-warning',
-      content: [{ type: 'text', text: message }],
-      stop_reason: 'end_turn',
-      stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-        output_tokens: 0,
+      type: 'error',
+      error: {
+        type: 'miser_control_plane_error',
+        reason,
+        message,
+        mode,
+        operator_action: 'operator_boundary_or_out_of_band_control_required',
       },
     },
-    enforcement: { reason, mode, status: 200, warning: true },
+    enforcement: { reason, mode, status: 429, warning: false, control: true },
   };
 }
 
