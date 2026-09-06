@@ -1,9 +1,7 @@
 'use strict';
 
 // Source snapshot: Anthropic pricing docs, https://platform.claude.com/docs/en/about-claude/pricing
-// Pinned 2026-07-22; re-verified 2026-07-23 and 2026-08-09. Values are USD per million tokens.
-// Claude Sonnet 5 has time-tiered docs pricing. DEFAULT_PRICING carries the introductory
-// rate through 2026-08-31; update this entry to the 2026-09-01+ standard rate on rollover.
+// Pinned 2026-07-22; re-verified 2026-09-05. Values are USD per million tokens.
 // Dated API response model IDs (e.g. claude-haiku-4-5-20251001) are aliased to the base ID so
 // priceForModel() never falls through to the * fallback for known models.
 const _HAIKU_4_5 = Object.freeze({
@@ -42,7 +40,28 @@ const DEFAULT_PRICING = Object.freeze({
     cacheWrite5mPerMTok: 2.500000,
     cacheWrite1hPerMTok: 4.000000,
   }),
+  'claude-fable-5-1': Object.freeze({
+    inputPerMTok: 10.000000,
+    outputPerMTok: 50.000000,
+    cacheReadPerMTok: 0.250000,
+    cacheWrite5mPerMTok: 12.500000,
+    cacheWrite1hPerMTok: 20.000000,
+  }),
+  'claude-mythos-5-1': Object.freeze({
+    inputPerMTok: 10.000000,
+    outputPerMTok: 50.000000,
+    cacheReadPerMTok: 0.250000,
+    cacheWrite5mPerMTok: 12.500000,
+    cacheWrite1hPerMTok: 20.000000,
+  }),
   'claude-fable-5': Object.freeze({
+    inputPerMTok: 10.000000,
+    outputPerMTok: 50.000000,
+    cacheReadPerMTok: 1.000000,
+    cacheWrite5mPerMTok: 12.500000,
+    cacheWrite1hPerMTok: 20.000000,
+  }),
+  'claude-mythos-5': Object.freeze({
     inputPerMTok: 10.000000,
     outputPerMTok: 50.000000,
     cacheReadPerMTok: 1.000000,
