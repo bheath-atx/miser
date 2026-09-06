@@ -157,6 +157,10 @@ module.exports = {
   // G4 pre-stream retry with jittered backoff
   retryMaxAttempts: parseInt(process.env.MISER_RETRY_MAX_ATTEMPTS || '3', 10),
   retryBaseMs:      parseInt(process.env.MISER_RETRY_BASE_MS      || '200', 10),
+  // Short local cooldown after an Anthropic 429. This prevents Claude Code
+  // retry loops and sibling panels from spending more upstream requests during
+  // a rate-limit storm; safe fallback/veto logic still decides the response.
+  anthropic429CooldownMs: parseInt(process.env.MISER_ANTHROPIC_429_COOLDOWN_MS || '120000', 10),
   // G4 per-upstream circuit breakers
   breakerThreshold: parseInt(process.env.MISER_BREAKER_THRESHOLD || '5', 10),
   breakerResetMs:   parseInt(process.env.MISER_BREAKER_RESET_MS  || '30000', 10),

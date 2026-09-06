@@ -178,6 +178,37 @@ test('tool-sensitive fallback veto: last tool_result skips Codex and Ollama with
   assert.match(res.body(), /^{"id":"miser_local_.*"content":\[\{"type":"text","text":"miser:/);
 });
 
+test('Anthropic 429 cooldown: tool-sensitive retry skips Anthropic after first 429', async () => {
+  const calls = [];
+  const toolMsgs = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'date' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] },
+  ];
+  const cooldowns = new Map();
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+    anthropic429Cooldowns: cooldowns,
+    anthropic429CooldownMs: 120000,
+  };
+
+  const body = { model: 'claude', max_tokens: 100, messages: toolMsgs };
+  const first = makeRes();
+  await routeRequest(toolMsgs, body, {}, first, 'pkachu', 0, 'anthropic', deps);
+  const second = makeRes();
+  await routeRequest(toolMsgs, body, {}, second, 'pkachu', 0, 'anthropic', deps);
+
+  assert.deepEqual(calls.map(c => c.name), ['anthropic']);
+  assert.equal(first.headers['x-miser-provider'], 'local');
+  assert.equal(second.headers['x-miser-provider'], 'local');
+  assert.match(second.body(), /miser: upstream unavailable/);
+});
+
 test('tool-sensitive fallback veto: Stop-hook repair text skips Codex and Ollama', async () => {
   const calls = [];
   const msgs = [{ role: 'user', content: 'Stop hook blocked: Use the Bash tool now. Do not print curl in markdown. Confirm ok:true for /v1/orch-pkachu/reply.' }];
