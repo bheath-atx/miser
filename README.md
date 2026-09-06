@@ -1,6 +1,6 @@
 # miser
 
-> Local failover router, billing observatory, and opt-in Anthropic context-management injector for Claude Code and the TermDeck stack.
+> Provider admission router, billing observatory, and opt-in Anthropic context-management injector for Claude Code and the TermDeck stack.
 
 **Owner:** Brad Heath / nacho-money  
 **Status:** v4 sprint implementation  
@@ -10,7 +10,7 @@
 
 ## What it does
 
-`miser` is a transparent local proxy for Claude Code panels. It keeps the working failover chain, records billed-usage truth for routed Anthropic requests, and can opt selected projects into Anthropic server-side context editing.
+`miser` is a transparent local proxy for Claude Code panels. It enforces provider admission for Claude routes, records billed-usage truth for routed Anthropic requests, and can opt selected projects into Anthropic server-side context editing.
 
 ```
 Claude Code / orch panel
@@ -19,9 +19,9 @@ Claude Code / orch panel
 ┌──────────────────────────────────────────┐
 │                  miser                   │
 │                                          │
-│  1. Failover router                      │
-│     Anthropic 429 → Codex/OpenAI OAuth   │
-│     Codex unavailable → CPU Ollama       │
+│  1. Provider admission router            │
+│     Claude route → Anthropic only        │
+│     Unavailable → machine error          │
 │                                          │
 │  2. Billing observatory                  │
 │     Anthropic usage → day/project/       │
@@ -133,7 +133,7 @@ MISER_BUDGET_GRACE='["aetheria"]'   # at/over cap: alert only, never block
 - State per project per UTC day: `UNDER → WARNED (≥80%, one pkachu warn alert) → CAPPED (one cap alert, then 429 block until UTC midnight)`. Alerts are deduped once per project per type per day via a persisted ledger (`MISER_ALERT_LEDGER_FILE`, default `~/.miser-alert-ledger.json`).
 - The block is an exact Anthropic-shaped `rate_limit_error` 429 with `retry-after` (seconds to next UTC midnight) and `x-miser-budget: exhausted`. The request is never forwarded and accrues no stats besides a sparse `budget: { blockedCount, firstBlockedAt }` node in `/api/miser/stats`.
 - **Reactive cap:** the check compares already-measured spend against the cap before forwarding; the current request's cost is not estimated or reserved, so one expensive (or concurrent) request can overshoot the cap before the next request blocks.
-- **Anthropic spend only:** budgets bound measured Anthropic-leg dollars. Codex/Ollama/OpenAI-format legs accrue $0 — but a capped project is blocked fleet-wide, including its OpenAI-format requests (cross-leg blocking on Anthropic spend).
+- **Anthropic spend only:** budgets bound measured Anthropic-leg dollars. Codex/Ollama/OpenAI-format legs accrue $0, and Claude routes never substitute Codex/Ollama assistant turns when Anthropic is unavailable. A capped project is blocked fleet-wide, including its OpenAI-format requests (cross-leg blocking on Anthropic spend).
 - **Restart accrual-loss window:** in-memory spend is authoritative; a process crash can lose up to one async-flush window (≤5s) of accrual.
 - **Attribution is advisory:** `x-termdeck-project` (or the `/p/<project>/` path) is trusted as an operator-controlled header, not a security boundary. An absent/empty header attributes to `default`.
 - **Budgeting `default` is legal but discouraged:** `default` aggregates every unattributed panel, so capping it blocks panels that never opted into attribution.
@@ -150,13 +150,15 @@ MISER_POLICY='{"pkachu":{"expectedModel":"claude-sonnet","maxContextTokens":4000
 
 ---
 
-## Failover
+## Provider Admission
 
-Anthropic 429 keeps the existing failover path:
+Claude routes are provider-pinned:
 
-1. Anthropic Messages API
-2. Codex/OpenAI through subscription OAuth
-3. Local Ollama hard-capped fallback
+1. Anthropic Messages API succeeds and is proxied.
+2. Anthropic 429, cooldown, breaker-open, timeout, or transport failure returns a machine-readable Anthropic error.
+3. Codex/OpenAI and local Ollama never produce assistant turns for Claude routes.
+
+The OpenAI-format passthrough route (`/v1/chat/completions`) remains explicit non-Claude compatibility and can use hard-capped Ollama fallback on OpenAI 429.
 
 For C1-injected requests, non-429 upstream errors pass through unchanged and do not write measured usage stats. Three consecutive injected 400s disable context-management for that project for the process lifetime.
 

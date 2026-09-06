@@ -5,7 +5,7 @@
 // EPHEMERAL 127.0.0.1 port. This never touches :20128, the live Miser service,
 // or any real Codex/OpenAI/Anthropic endpoint. It proves Codex-inversion
 // finding #1's fix at the transport level: a 401/403 must reject BEFORE writing
-// response headers, so the router can fail over to Ollama.
+// response headers.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -44,7 +44,7 @@ const RESPONSES_REQ = {
 const BEARER = { token: 'FAKE-SUBSCRIPTION-TOKEN', accountId: 'acct_fake' };
 
 for (const status of [401, 403]) {
-  test(`real forwardToCodex rejects on ${status} WITHOUT writing headers (enables Ollama failover)`, async () => {
+  test(`real forwardToCodex rejects on ${status} WITHOUT writing headers`, async () => {
     await withCodexUpstream(status, '{"error":"expired subscription token"}', async () => {
       const res = makeRes();
       await assert.rejects(

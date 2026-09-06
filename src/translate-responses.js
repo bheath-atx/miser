@@ -50,8 +50,7 @@ function translateToResponses(messages, originalBody = {}) {
     model: mapModel(originalBody),
     input,
     // ALWAYS stream. The Codex transport consumes the response as SSE and
-    // re-emits Anthropic SSE to the client (same as the Ollama fallback leg,
-    // which always streams regardless of the client's stream flag). A
+    // re-emits Anthropic SSE to the client. A
     // non-streaming Codex JSON body would be silently dropped by the SSE
     // translator, so we never honor a client stream:false here.
     stream: true,

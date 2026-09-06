@@ -1314,7 +1314,7 @@ test('v4 C1: injected non-429 non-2xx passes through and writes no usage stats',
   }
 });
 
-test('v4 C1: injected 429 keeps failover behavior', async () => {
+test('v4 C1: injected 429 returns Anthropic unavailable without cross-provider fallback', async () => {
   const calls = [];
   const deps = {
     transports: {
@@ -1344,9 +1344,12 @@ test('v4 C1: injected 429 keeps failover behavior', async () => {
     await drive(() => createProxy(deps), fakeReq('POST', '/p/alpha/v1/messages', {
       model: 'claude', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }],
     }, {}), res);
-    assert.deepEqual(calls.map(c => c.name), ['anthropic', 'codex']);
+    assert.deepEqual(calls.map(c => c.name), ['anthropic']);
     assert.ok(calls[0].body.context_management);
-    assert.equal(res.headers['x-miser-provider'], 'codex');
+    assert.equal(res.statusCode, 429);
+    assert.equal(res.headers['x-miser-provider'], 'anthropic');
+    assert.equal(res.headers['x-miser-fallback'], 'disabled');
+    assert.equal(JSON.parse(res.body()).error.type, 'miser_provider_unavailable');
   } finally {
     echo.server.close(); restoreEnv();
   }
