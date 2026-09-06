@@ -4,9 +4,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-// Subscription OAuth bearer provider for the Codex/OpenAI failover path.
+// Subscription OAuth bearer provider for the Codex/OpenAI transport.
 //
-// User decision (locked): Anthropic-429 failover must use the Codex/OpenAI
+// User decision (locked): any Codex transport call must use the Codex/OpenAI
 // SUBSCRIPTION OAuth token, NOT the metered OPENAI_API_KEY. The Codex CLI stores
 // its subscription session at ~/.codex/auth.json:
 //   { auth_mode, OPENAI_API_KEY, tokens: { id_token, access_token,
@@ -15,9 +15,7 @@ const path = require('node:path');
 // deliberately ignored — reading it here would defeat the whole decision.
 //
 // Fail closed: if the file is missing, unreadable, malformed, or has no
-// access_token, we throw. Callers treat that as "Codex unavailable" and fall
-// through to the hard-capped Ollama path. We never emit a request with no /
-// bogus bearer.
+// access_token, we throw before any request can emit a missing or bogus bearer.
 //
 // Testability: the reader is injected. Tests pass a fake readFile and NEVER
 // touch the real ~/.codex/auth.json. The real path is only ever read through
@@ -30,7 +28,7 @@ class OAuthUnavailableError extends Error {
   constructor(message) {
     super(message);
     this.name = 'OAuthUnavailableError';
-    this.statusCode = 401; // treated as transient-unavailable → Ollama fallback
+    this.statusCode = 401;
   }
 }
 

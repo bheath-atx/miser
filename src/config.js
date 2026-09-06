@@ -124,20 +124,18 @@ module.exports = {
     'claude-3-7-sonnet': 200_000,
     'gpt': 128_000,
   },
-  // Hard cap (rough tokens) applied to the Ollama fallback leg so a
-  // double-fallback (Anthropic 429 → Codex fail → Ollama) can never ship an
-  // over-context payload to the local model. This gates ONLY the degraded
-  // failover leg (out of scope for the compress redesign), never the primary
+  // Hard cap (rough tokens) applied before any explicit Ollama fallback sends a
+  // translated prompt to the local model. This never gates the primary
   // Anthropic/OpenAI forward path.
   ollamaHardCap: parseInt(process.env.MISER_OLLAMA_HARD_CAP || '32000', 10),
   // Max generation tokens (num_predict) the Ollama fallback may request. A
   // passed-through Anthropic max_tokens can be huge; the local model's context
   // is shared between prompt and output, so the fallback clamps generation too.
   ollamaMaxPredict: parseInt(process.env.MISER_OLLAMA_MAX_PREDICT || '4096', 10),
-  // Codex subscription failover endpoint for the Anthropic-429 fallover.
+  // Codex subscription endpoint for the standalone transport. It is not used as
+  // Anthropic/Claude-route fallback; those routes are Anthropic-only.
   // Brad-chosen (2026-07-11): the ChatGPT Codex backend `responses` API, which
-  // is where the subscription OAuth token actually authenticates. Offline tests
-  // mock this transport entirely; no live cutover happens without approval.
+  // is where the subscription OAuth token actually authenticates.
   codexUrl: process.env.MISER_CODEX_URL || 'https://chatgpt.com/backend-api/codex/responses',
   // Wire format for the Codex leg: 'responses' (Codex backend, OAuth) or 'chat'
   // (OpenAI chat/completions, needs an API key). Default 'responses'.
@@ -159,7 +157,8 @@ module.exports = {
   retryBaseMs:      parseInt(process.env.MISER_RETRY_BASE_MS      || '200', 10),
   // Short local cooldown after an Anthropic 429. This prevents Claude Code
   // retry loops and sibling panels from spending more upstream requests during
-  // a rate-limit storm; safe fallback/veto logic still decides the response.
+  // a rate-limit storm; the response remains an Anthropic provider-unavailable
+  // error with cross-provider fallback disabled.
   anthropic429CooldownMs: parseInt(process.env.MISER_ANTHROPIC_429_COOLDOWN_MS || '120000', 10),
   // G4 per-upstream circuit breakers
   breakerThreshold: parseInt(process.env.MISER_BREAKER_THRESHOLD || '5', 10),

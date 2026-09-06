@@ -240,7 +240,7 @@ for (const status of [400, 500]) {
   test(`compact headers are absent on upstream ${status}`, async () => {
     const body = { model: 'claude-sonnet-4-20250514', max_tokens: 10, messages: [{ role: 'user', content: 'hello' }] };
     const { res } = await proxyOnce(body, { status, responseBody: { error: { message: `upstream ${status}` } } });
-    assert.equal(res.statusCode, status);
+    assert.equal(res.statusCode, status === 500 ? 503 : status);
     for (const name of [
       'x-miser-input-tokens-est',
       'x-miser-poll-class',

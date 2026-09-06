@@ -3,10 +3,8 @@
 const https = require('node:https');
 const http = require('node:http');
 const { translateToOllama, translateOllamaStream } = require('./translate.js');
-const { translateToOpenAI, validateOpenAIRequest } = require('./translate-openai.js');
-const { translateToResponses, validateResponsesRequest, translateResponsesStream } = require('./translate-responses.js');
+const { translateResponsesStream } = require('./translate-responses.js');
 const { hardCapOllamaBody } = require('./hardcap.js');
-const { getCodexBearer } = require('./oauth.js');
 const { recordUsage } = require('./quota.js');
 const { recordAnthropicUsage, recordProviderLimitEvent } = require('./stats.js');
 const { recordPanelUsage } = require('./panel-stats.js');
@@ -233,6 +231,44 @@ function writeLocalAnthropicMessage(res, originalBody, text, extraHeaders = {}) 
   res.end();
 }
 
+function anthropicUnavailableError(originalBody, reason, message) {
+  return {
+    type: 'error',
+    error: {
+      type: 'miser_provider_unavailable',
+      message,
+      upstream: 'anthropic',
+      reason,
+      fallback: 'disabled',
+      model: (originalBody && originalBody.model) || 'unknown',
+    },
+  };
+}
+
+function writeAnthropicUnavailable(res, originalBody, reason, opts = {}) {
+  const statusCode = opts.statusCode || 503;
+  const message = opts.message || 'miser: Claude upstream unavailable; cross-provider fallback is disabled for Anthropic routes.';
+  const body = anthropicUnavailableError(originalBody, reason, message);
+  const headers = {
+    'x-miser-provider': 'anthropic',
+    'x-miser-provider-status': 'unavailable',
+    'x-miser-fallback': 'disabled',
+    'x-miser-error': 'provider_unavailable',
+    'x-miser-error-reason': reason,
+    ...(opts.headers || {}),
+  };
+
+  if (!wantsAnthropicStream(originalBody)) {
+    res.writeHead(statusCode, { ...headers, 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+    return;
+  }
+
+  res.writeHead(statusCode, { ...headers, 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+  res.write(anthropicSseFrame('error', body));
+  res.end();
+}
+
 function textOnlyContent(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -256,59 +292,6 @@ function latestRealUserText(messages) {
   return '';
 }
 
-function contentHasToolBlock(content) {
-  return Array.isArray(content) && content.some(block =>
-    block && (block.type === 'tool_use' || block.type === 'tool_result'));
-}
-
-function forcedToolChoice(body) {
-  const choice = body && body.tool_choice;
-  if (choice == null) return false;
-  if (typeof choice === 'string') return !['auto', 'none'].includes(choice.toLowerCase());
-  if (typeof choice === 'object') {
-    const type = String(choice.type || '').toLowerCase();
-    if (!type) return true;
-    return !['auto', 'none'].includes(type);
-  }
-  return true;
-}
-
-function isDeliveryRepairText(text) {
-  const s = String(text || '').toLowerCase();
-  if (!s) return false;
-  return /stop[-_ ]?hook/.test(s)
-    || s.includes('stop_hook_active')
-    || s.includes('use the bash tool')
-    || s.includes('do not print curl')
-    || s.includes('send it now')
-    || s.includes('ok:true')
-    || s.includes('"ok":true')
-    || /\/v1\/orch(?:-[^\s"'`]+|\/[^\s"'`]+)\/reply/.test(s);
-}
-
-function isToolSensitiveFallback(messages, originalBody) {
-  const last = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
-  return !!(
-    (last && contentHasToolBlock(last.content))
-    || forcedToolChoice(originalBody)
-    || isDeliveryRepairText(latestRealUserText(messages || []))
-  );
-}
-
-function isToolResultCompletionTurn(messages) {
-  const last = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
-  return !!(last && last.role === 'user' && contentHasToolBlock(last.content));
-}
-
-function isNonStreamingToolSurface(originalBody) {
-  return !!(
-    originalBody
-    && originalBody.stream !== true
-    && Array.isArray(originalBody.tools)
-    && originalBody.tools.length > 0
-  );
-}
-
 function isTermDeckSuggestionMode(messages) {
   const text = latestRealUserText(messages || []).trimStart();
   return text.startsWith('[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]');
@@ -321,32 +304,17 @@ function writeSuggestionModeNoop(res, originalBody) {
   });
 }
 
-function writeToolResultCompletionNoop(res, originalBody) {
-  writeLocalAnthropicMessage(res, originalBody, '', {
-    'x-miser-enforcement': 'tool-result-zero-llm',
-    'x-miser-enforcement-reason': 'upstream-unavailable-tool-result-zero-llm',
-  });
-}
-
-function writeToolSensitiveFallbackVeto(res, originalBody, project, panel) {
-  const where = panel ? `${project || 'default'}--${panel}` : (project || 'default');
-  const text = `miser: upstream unavailable; local fallback disabled for tool-sensitive Claude Code turn in ${where} because fallback cannot preserve tool_use. Stand down and retry after provider recovery or restart a fresh panel.`;
-  writeLocalAnthropicMessage(res, originalBody, text, {
-    'x-miser-enforcement-reason': 'upstream-unavailable-tool-sensitive',
-  });
-}
-
 // ---------------------------------------------------------------------------
-// Failover chain (anthropic format):
+// Routing chain:
 //
-//   Anthropic          --429 or OPEN-->  Codex/OpenAI (subscription OAuth)
-//   Codex/OpenAI       --429/5xx/OPEN->  hard-capped Ollama
-//   Ollama             --OPEN--------->  503 to client
+//   Anthropic format   --> Anthropic only; unavailability is a machine-readable
+//                          error with cross-provider fallback disabled.
+//   OpenAI format      --> Legacy OpenAI passthrough; explicit OpenAI 429 can
+//                          still use hard-capped Ollama.
 //
 // G4 retry: 529/5xx/connect-errors are retried up to retryMaxAttempts before
-// the leg is considered exhausted. 429 is NOT retried.
+// the Anthropic leg is considered exhausted. 429 is NOT retried.
 // G4 breakers: per-upstream CLOSED/OPEN/HALF_OPEN; only retryable failures count.
-// B3: Codex successes + 429s are recorded in the sub-cap tracker (when enabled).
 //
 // Every network leg goes through an injectable transport seam so the offline
 // test harness can drive the whole chain with zero sockets.
@@ -360,7 +328,6 @@ function defaultDeps() {
       codex: forwardToCodex,
       ollama: forwardToOllama,
     },
-    getBearer: getCodexBearer,
     ollamaCap: config.ollamaHardCap,
   };
 }
@@ -368,7 +335,6 @@ function defaultDeps() {
 async function routeRequest(messages, originalBody, incomingHeaders, res, project, savedTokens, format = 'anthropic', deps = {}) {
   const base = defaultDeps();
   const transports = { ...base.transports, ...(deps.transports || {}) };
-  const getBearer = deps.getBearer || base.getBearer;
   const ollamaCap = deps.ollamaCap != null ? deps.ollamaCap : base.ollamaCap;
   const guardDeps = deps.guardDeps;
   const panel = (deps && deps.panel) || null;
@@ -382,7 +348,9 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     || (deps.transports ? null : _anthropic429Cooldowns);
   const nowMs = _nowMs(guardDeps || {});
   const anthropicCooldownKey = anthropic429CooldownKey(project, panel, originalBody);
-  let skippedAnthropicFor429Cooldown = false;
+  let anthropicUnavailableReason = null;
+  let anthropicUnavailableStatus = 503;
+  let anthropicUnavailableHeaders = {};
 
   const retryOpts = {
     maxAttempts: (deps.retryOpts && deps.retryOpts.maxAttempts) || config.retryMaxAttempts,
@@ -419,7 +387,9 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
 
   // --- Anthropic path ------------------------------------------------------
   if (isAnthropic429CooldownActive(anthropic429Cooldowns, anthropicCooldownKey, nowMs)) {
-    skippedAnthropicFor429Cooldown = true;
+    anthropicUnavailableReason = 'anthropic_429_cooldown';
+    anthropicUnavailableStatus = 429;
+    anthropicUnavailableHeaders = { 'retry-after': String(Math.ceil(anthropic429CooldownMs / 1000)) };
     console.log(`[miser] Anthropic 429 cooldown active — skipping upstream project=${project || 'default'} panel=${panel || ''}`);
   } else if (safeAcquire(breakers.anthropic)) {
     try {
@@ -433,119 +403,33 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
       incrementLegError('anthropic');
       if (res.headersSent) throw err; // streaming started — cannot recover
       if (err.retryable) safeRecord(breakers.anthropic, 'recordFailure');
-      if (err.statusCode !== 429) throw err; // non-429 (5xx after retries) → error to client
-      noteAnthropic429Cooldown(anthropic429Cooldowns, anthropicCooldownKey, nowMs, anthropic429CooldownMs);
-      // is 429 + headers not sent → fall through to Codex leg
-      console.log('[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)');
-    }
-  } else {
-    console.log('[miser] Anthropic breaker OPEN — skipping to Codex');
-  }
-
-  if (skippedAnthropicFor429Cooldown && isToolResultCompletionTurn(messages)) {
-    console.log(`[miser] tool-result completion zero-LLM noop project=${project || 'default'} panel=${panel || ''}`);
-    writeToolResultCompletionNoop(res, originalBody);
-    return;
-  }
-
-  if (isToolSensitiveFallback(messages, originalBody)) {
-    console.log(`[miser] tool-sensitive fallback veto project=${project || 'default'} panel=${panel || ''}`);
-    writeToolSensitiveFallbackVeto(res, originalBody, project, panel);
-    return;
-  }
-
-  if (isNonStreamingToolSurface(originalBody) && config.codexFormat !== 'chat') {
-    console.log(`[miser] non-streaming tool-surface fallback veto project=${project || 'default'} panel=${panel || ''}`);
-    writeLocalAnthropicMessage(res, originalBody,
-      'miser: upstream unavailable; local fallback disabled for non-streaming Claude Code retry with tools because the configured fallback path returns a stream. Retry after provider recovery or start a fresh panel.',
-      { 'x-miser-enforcement-reason': 'upstream-unavailable-nonstream-tool-surface' });
-    return;
-  }
-
-  // --- Leg 2: Codex via subscription OAuth ---------------------------------
-  if (safeAcquire(breakers.codex)) {
-    try {
-      const bearer = await getBearer(); // fail closed: throws if no valid token
-      const useChat = config.codexFormat === 'chat';
-      const codexReq = useChat
-        ? translateToOpenAI(messages, originalBody)
-        : translateToResponses(messages, originalBody);
-      const check = useChat ? validateOpenAIRequest(codexReq) : validateResponsesRequest(codexReq);
-      if (!check.valid) {
-        const e = new Error(`miser: refusing malformed Codex request: ${check.error}`);
-        e.statusCode = 400;
-        throw e;
-      }
-      await retryWithBackoff(
-        () => transports.codex(codexReq, bearer, res, project, savedTokens),
-        res, retryOpts
-      );
-      // B3: record Codex success and maybe alert on cap proximity
-      if (guardDeps && guardDeps.subCapTracker) {
-        const nowMs = _nowMs(guardDeps);
-        guardDeps.subCapTracker.recordSuccess(nowMs);
-        _maybeAlertSubCap(guardDeps, nowMs);
-      }
-      safeRecord(breakers.codex, 'recordSuccess');
-      return;
-    } catch (err) {
-      incrementLegError('codex');
-      if (res.headersSent) throw err; // response already streaming — can't fail over
-      // Normative catch ordering (R3):
-      // 1. Subscription cap (429): B3 event + alert; fall through to Ollama; no breaker record
       if (err.statusCode === 429) {
-        if (guardDeps && guardDeps.subCapTracker) {
-          const nowMs = _nowMs(guardDeps);
-          guardDeps.subCapTracker.record429(nowMs);
-          _maybeAlertSubCap(guardDeps, nowMs);
+        noteAnthropic429Cooldown(anthropic429Cooldowns, anthropicCooldownKey, nowMs, anthropic429CooldownMs);
+        anthropicUnavailableReason = 'anthropic_rate_limited';
+        anthropicUnavailableStatus = 429;
+        if (anthropic429CooldownMs > 0) {
+          anthropicUnavailableHeaders = { 'retry-after': String(Math.ceil(anthropic429CooldownMs / 1000)) };
         }
-        console.log('[miser] Codex 429 — hard-capped Ollama fallback');
-        // fall through to Ollama
-      } else if (err.statusCode === 401 || err.statusCode === 403 || err.statusCode === 400) {
-        // Auth/client errors: NOT retried, NOT a B3 event, NOT a breaker event.
-        // Fall through to Ollama — existing contract (test/failover.test.js:90-119).
-        console.log(`[miser] Codex auth/client error (${err.statusCode}) — Ollama fallback`);
-        // fall through to Ollama
+        console.log('[miser] Anthropic 429 — cross-provider fallback disabled');
       } else if (err.retryable) {
-        // 5xx / connect-error after retries exhausted: record breaker failure; fall through
-        safeRecord(breakers.codex, 'recordFailure');
-        console.log(`[miser] Codex/OpenAI unavailable (${err.statusCode || err.message}) — Ollama fallback`);
-        // fall through to Ollama
+        anthropicUnavailableReason = 'anthropic_transport_unavailable';
+        anthropicUnavailableStatus = 503;
+        console.log(`[miser] Anthropic unavailable (${err.statusCode || err.message}) — cross-provider fallback disabled`);
       } else {
-        // Unknown error shape: propagate
-        throw err;
+        throw err; // non-retryable Anthropic error: preserve existing hard-error behavior
       }
     }
   } else {
-    console.log('[miser] Codex breaker OPEN — skipping to Ollama');
+    anthropicUnavailableReason = 'anthropic_breaker_open';
+    console.log('[miser] Anthropic breaker OPEN — cross-provider fallback disabled');
   }
 
-  // --- Leg 3: hard-capped Ollama ------------------------------------------
-  if (safeAcquire(breakers.ollama)) {
-    try {
-      const result = await transports.ollama(messages, originalBody, res, project, savedTokens, { cap: ollamaCap });
-      if (result && result.ok === false) {
-        safeRecord(breakers.ollama, 'recordFailure');
-      } else {
-        safeRecord(breakers.ollama, 'recordSuccess');
-      }
-    } catch (err) {
-      incrementLegError('ollama');
-      // Only retryable errors (connect-errors, transport failures) count against the breaker.
-      if (err.retryable) safeRecord(breakers.ollama, 'recordFailure');
-      if (!res.headersSent) {
-        writeLocalAnthropicMessage(res, originalBody,
-          `miser: local fallback unavailable (${err.statusCode || err.message}); stand down and retry after provider recovery.`,
-          { 'x-miser-enforcement-reason': 'ollama-unavailable' });
-        return;
-      }
-      throw err;
-    }
-  } else {
-    incrementLegError('ollama');
-    writeLocalAnthropicMessage(res, originalBody,
-      'miser: all upstreams unavailable and local fallback breaker is open; stand down and retry after provider recovery.',
-      { 'x-miser-enforcement-reason': 'ollama-breaker-open' });
+  if (anthropicUnavailableReason) {
+    writeAnthropicUnavailable(res, originalBody, anthropicUnavailableReason, {
+      statusCode: anthropicUnavailableStatus,
+      headers: anthropicUnavailableHeaders,
+    });
+    return;
   }
 }
 
@@ -883,7 +767,6 @@ module.exports = {
     safeRecord,
     retryWithBackoff,
     _maybeAlertSubCap,
-    isToolSensitiveFallback,
     writeLocalAnthropicMessage,
   },
   _buildCappedOllamaBody: (messages, originalBody, cap) =>
