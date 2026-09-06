@@ -295,6 +295,11 @@ function isToolSensitiveFallback(messages, originalBody) {
   );
 }
 
+function isToolResultCompletionTurn(messages) {
+  const last = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
+  return !!(last && last.role === 'user' && contentHasToolBlock(last.content));
+}
+
 function isNonStreamingToolSurface(originalBody) {
   return !!(
     originalBody
@@ -313,6 +318,13 @@ function writeSuggestionModeNoop(res, originalBody) {
   writeLocalAnthropicMessage(res, originalBody, '', {
     'x-miser-enforcement': 'suggestion-mode-zero-llm',
     'x-miser-enforcement-reason': 'termdeck-suggestion-mode-zero-llm',
+  });
+}
+
+function writeToolResultCompletionNoop(res, originalBody) {
+  writeLocalAnthropicMessage(res, originalBody, '', {
+    'x-miser-enforcement': 'tool-result-zero-llm',
+    'x-miser-enforcement-reason': 'upstream-unavailable-tool-result-zero-llm',
   });
 }
 
@@ -370,6 +382,7 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     || (deps.transports ? null : _anthropic429Cooldowns);
   const nowMs = _nowMs(guardDeps || {});
   const anthropicCooldownKey = anthropic429CooldownKey(project, panel, originalBody);
+  let skippedAnthropicFor429Cooldown = false;
 
   const retryOpts = {
     maxAttempts: (deps.retryOpts && deps.retryOpts.maxAttempts) || config.retryMaxAttempts,
@@ -406,6 +419,7 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
 
   // --- Anthropic path ------------------------------------------------------
   if (isAnthropic429CooldownActive(anthropic429Cooldowns, anthropicCooldownKey, nowMs)) {
+    skippedAnthropicFor429Cooldown = true;
     console.log(`[miser] Anthropic 429 cooldown active — skipping upstream project=${project || 'default'} panel=${panel || ''}`);
   } else if (safeAcquire(breakers.anthropic)) {
     try {
@@ -426,6 +440,12 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
     }
   } else {
     console.log('[miser] Anthropic breaker OPEN — skipping to Codex');
+  }
+
+  if (skippedAnthropicFor429Cooldown && isToolResultCompletionTurn(messages)) {
+    console.log(`[miser] tool-result completion zero-LLM noop project=${project || 'default'} panel=${panel || ''}`);
+    writeToolResultCompletionNoop(res, originalBody);
+    return;
   }
 
   if (isToolSensitiveFallback(messages, originalBody)) {
