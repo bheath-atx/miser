@@ -1,6 +1,6 @@
 # miser
 
-> Local failover router, billing observatory, and opt-in Anthropic context-management injector for Claude Code and the TermDeck stack.
+> Provider admission router, billing observatory, and opt-in Anthropic context-management injector for Claude Code and the TermDeck stack.
 
 **Owner:** Brad Heath / nacho-money  
 **Status:** v4 sprint implementation  

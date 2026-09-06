@@ -185,7 +185,7 @@ function writeLocalAnthropicMessage(res, originalBody, text, extraHeaders = {}) 
   const body = localAnthropicMessage((originalBody && originalBody.model) || 'miser-local', text);
   const headers = {
     'x-miser-provider': 'local',
-    'x-miser-enforcement': 'tool-sensitive-fallback-veto',
+    'x-miser-enforcement': 'local-anthropic-message',
     ...extraHeaders,
   };
 

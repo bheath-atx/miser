@@ -37,6 +37,21 @@ function assertAnthropicUnavailable(res, statusCode, reason) {
   assert.ok(!('content' in body), 'provider unavailable response must not substitute assistant content');
 }
 
+function assertStreamingAnthropicUnavailable(res, statusCode, reason) {
+  assert.equal(res.statusCode, statusCode);
+  assert.equal(res.headers['content-type'], 'text/event-stream');
+  assert.equal(res.headers['x-miser-provider'], 'anthropic');
+  assert.equal(res.headers['x-miser-provider-status'], 'unavailable');
+  assert.equal(res.headers['x-miser-fallback'], 'disabled');
+  assert.equal(res.headers['x-miser-error'], 'provider_unavailable');
+  assert.equal(res.headers['x-miser-error-reason'], reason);
+  assert.match(res.body(), /^event: error\ndata: /);
+  assert.match(res.body(), /"type":"miser_provider_unavailable"/);
+  assert.match(res.body(), new RegExp(`"reason":"${reason}"`));
+  assert.doesNotMatch(res.body(), /event: message_start/);
+  assert.doesNotMatch(res.body(), /qwen2\.5-coder/);
+}
+
 function proxyReq(bodyObj, url = '/v1/messages', headers = {}) {
   const raw = JSON.stringify(bodyObj);
   const listeners = {};
@@ -168,14 +183,7 @@ test('streaming Claude unavailability uses SSE error shape without fallback mess
   });
 
   assert.deepEqual(calls.map(c => c.name), ['anthropic']);
-  assert.equal(res.statusCode, 429);
-  assert.equal(res.headers['content-type'], 'text/event-stream');
-  assert.equal(res.headers['x-miser-provider'], 'anthropic');
-  assert.equal(res.headers['x-miser-fallback'], 'disabled');
-  assert.match(res.body(), /^event: error\ndata: /);
-  assert.match(res.body(), /"type":"miser_provider_unavailable"/);
-  assert.doesNotMatch(res.body(), /event: message_start/);
-  assert.doesNotMatch(res.body(), /qwen2\.5-coder/);
+  assertStreamingAnthropicUnavailable(res, 429, 'anthropic_rate_limited');
 });
 
 test('Anthropic retryable transport failure returns 503 without Codex/Ollama fallback', async () => {
@@ -200,6 +208,28 @@ test('Anthropic retryable transport failure returns 503 without Codex/Ollama fal
   assertAnthropicUnavailable(res, 503, 'anthropic_transport_unavailable');
 });
 
+test('streaming Anthropic transport failure returns SSE unavailable error', async () => {
+  const calls = [];
+  const res = makeRes();
+  await routeRequest(ANTH_MSGS, { ...ANTH_BODY, stream: true }, {}, res, 'proj', 0, 'anthropic', {
+    transports: {
+      anthropic: (...args) => {
+        calls.push({ name: 'anthropic', args });
+        const err = new Error('connect ECONNRESET');
+        err.retryable = true;
+        return Promise.reject(err);
+      },
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    retryOpts: fastRetry,
+  });
+
+  assert.deepEqual(calls.map(c => c.name), ['anthropic']);
+  assertStreamingAnthropicUnavailable(res, 503, 'anthropic_transport_unavailable');
+});
+
 test('Anthropic breaker OPEN returns provider-unavailable error without Codex/Ollama fallback', async () => {
   const anthropicBreaker = createBreaker('provider-admission-anth', { threshold: 3 });
   anthropicBreaker.recordFailure(); anthropicBreaker.recordFailure(); anthropicBreaker.recordFailure();
@@ -220,6 +250,28 @@ test('Anthropic breaker OPEN returns provider-unavailable error without Codex/Ol
 
   assert.deepEqual(calls, []);
   assertAnthropicUnavailable(res, 503, 'anthropic_breaker_open');
+});
+
+test('streaming Anthropic breaker OPEN returns SSE unavailable error', async () => {
+  const anthropicBreaker = createBreaker('provider-admission-anth-stream', { threshold: 3 });
+  anthropicBreaker.recordFailure(); anthropicBreaker.recordFailure(); anthropicBreaker.recordFailure();
+  assert.equal(anthropicBreaker.getState().state, 'OPEN');
+
+  const calls = [];
+  const res = makeRes();
+  await routeRequest(ANTH_MSGS, { ...ANTH_BODY, stream: true }, {}, res, 'proj', 0, 'anthropic', {
+    transports: {
+      anthropic: (...a) => { calls.push({ name: 'anthropic', args: a }); throw new Error('anthropic must not be called'); },
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    breakers: { anthropic: anthropicBreaker },
+    getBearer: fakeBearer,
+    retryOpts: fastRetry,
+  });
+
+  assert.deepEqual(calls, []);
+  assertStreamingAnthropicUnavailable(res, 503, 'anthropic_breaker_open');
 });
 
 test('TermDeck suggestion mode returns empty local JSON without touching upstreams', async () => {
