@@ -7,6 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   MAX_COMPACT_BYTES,
+  DEFAULT_PROBE_IDS,
+  defaultProbeRegistry,
   parseProbeRegistry,
   parseWatchConfig,
   artifactFreshness,
@@ -48,6 +50,19 @@ test('watch config can load probe registry from a configured file', () => {
   });
   assert.equal(cfg.watchDir, dir);
   assert.deepEqual(cfg.probes.map(p => p.id), ['stats']);
+});
+
+test('watch config defaults to redirect artifact probes when no registry is configured', () => {
+  const dir = tmpWatchDir('registry-default');
+  const cfg = parseWatchConfig({ MISER_WATCH_DIR: dir });
+
+  assert.equal(cfg.watchDir, dir);
+  assert.deepEqual(cfg.probes.map(p => p.id), DEFAULT_PROBE_IDS);
+  for (const probe of cfg.probes) {
+    assert.equal(typeof probe.command, 'string');
+    assert.ok(probe.command.length > 0);
+    assert.equal(probe.interval_s, probe.ttl_s);
+  }
 });
 
 test('watch config env registry overrides configured file registry', () => {
@@ -128,6 +143,35 @@ test('enabled watcher lists and refreshes configured probes normally', async () 
   const result = await watcher.refreshProbe('ci');
   assert.equal(result.status, 'ok');
   assert.equal(runs, 1);
+});
+
+test('default watcher refreshes every redirect artifact probe', async () => {
+  const dir = tmpWatchDir('default-refresh-all');
+  const runs = [];
+  const watcher = createWatcher({
+    watchDir: dir,
+    probes: defaultProbeRegistry().map(probe => ({
+      ...probe,
+      command: `echo ${probe.id}`,
+      ttl_s: 1,
+      interval_s: 1,
+    })),
+    runCommand: async (_command, opts) => {
+      runs.push(opts.cwd || null);
+      return { status: 'ok', exit_code: 0, signal: null, error: null, output: 'ok', duration_ms: 1 };
+    },
+  });
+
+  const results = await watcher.refreshAll();
+  assert.deepEqual(results.map(result => result.probe_id), DEFAULT_PROBE_IDS);
+  assert.deepEqual(results.map(result => result.status), DEFAULT_PROBE_IDS.map(() => 'ok'));
+  assert.equal(runs.length, DEFAULT_PROBE_IDS.length);
+  for (const id of DEFAULT_PROBE_IDS) {
+    const artifact = readJson(watcher.pathsFor(id).json);
+    assert.equal(artifact.probe_id, id);
+    assert.equal(artifact.status, 'ok');
+    assert.ok(fs.existsSync(watcher.pathsFor(id).compact));
+  }
 });
 
 test('refresh writes JSON, raw, and compact artifacts with verdict-first compact output', async () => {

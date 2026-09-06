@@ -1,0 +1,19 @@
+# miser watcher sidecar systemd user unit
+# Install: cp miser-watchd.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload
+#          systemctl --user enable --now miser-watchd
+
+[Unit]
+Description=miser-watchd - zero-LLM watcher artifact sidecar
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nacho/miser
+ExecStart=node /home/nacho/miser/bin/miser-watchd.js
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-%h/.termdeck/secrets.env
+
+[Install]
+WantedBy=default.target
