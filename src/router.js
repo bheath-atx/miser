@@ -32,6 +32,8 @@ const _breakers = {
   ollama:    createBreaker('ollama',    { threshold: config.breakerThreshold, resetMs: config.breakerResetMs }),
 };
 
+const _anthropic429Cooldowns = new Map();
+
 function getBreakers() {
   return _breakers;
 }
@@ -88,6 +90,27 @@ function safeRecord(breaker, method) {
 // Extract nowMs from guardDeps.nowFn (returns a Date) or fallback to new Date().
 function _nowMs(guardDeps) {
   return ((guardDeps.nowFn || (() => new Date()))()).getTime();
+}
+
+function anthropic429CooldownKey(project, panel, originalBody) {
+  const model = originalBody && originalBody.model ? String(originalBody.model) : '';
+  return `${project || 'default'}\x1f${panel || ''}\x1f${model}`;
+}
+
+function isAnthropic429CooldownActive(store, key, nowMs) {
+  if (!store || !key) return false;
+  const expiresAt = store.get(key);
+  if (!expiresAt) return false;
+  if (expiresAt <= nowMs) {
+    store.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function noteAnthropic429Cooldown(store, key, nowMs, cooldownMs) {
+  if (!store || !key || !(cooldownMs > 0)) return;
+  store.set(key, nowMs + cooldownMs);
 }
 
 // Fire-and-forget sub-cap alert — synchronous section wrapped in try/catch so
@@ -328,6 +351,13 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
 
   // Merge injected breakers for tests; production uses module-level singletons.
   const breakers = { ..._breakers, ...(deps.breakers || {}) };
+  const anthropic429CooldownMs = deps.anthropic429CooldownMs != null
+    ? deps.anthropic429CooldownMs
+    : config.anthropic429CooldownMs;
+  const anthropic429Cooldowns = deps.anthropic429Cooldowns
+    || (deps.transports ? null : _anthropic429Cooldowns);
+  const nowMs = _nowMs(guardDeps || {});
+  const anthropicCooldownKey = anthropic429CooldownKey(project, panel, originalBody);
 
   const retryOpts = {
     maxAttempts: (deps.retryOpts && deps.retryOpts.maxAttempts) || config.retryMaxAttempts,
@@ -357,7 +387,9 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   }
 
   // --- Anthropic path ------------------------------------------------------
-  if (safeAcquire(breakers.anthropic)) {
+  if (isAnthropic429CooldownActive(anthropic429Cooldowns, anthropicCooldownKey, nowMs)) {
+    console.log(`[miser] Anthropic 429 cooldown active — skipping upstream project=${project || 'default'} panel=${panel || ''}`);
+  } else if (safeAcquire(breakers.anthropic)) {
     try {
       await retryWithBackoff(
         () => transports.anthropic(messages, originalBody, incomingHeaders, res, project, panel, savedTokens, guardDeps),
@@ -370,6 +402,7 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
       if (res.headersSent) throw err; // streaming started — cannot recover
       if (err.retryable) safeRecord(breakers.anthropic, 'recordFailure');
       if (err.statusCode !== 429) throw err; // non-429 (5xx after retries) → error to client
+      noteAnthropic429Cooldown(anthropic429Cooldowns, anthropicCooldownKey, nowMs, anthropic429CooldownMs);
       // is 429 + headers not sent → fall through to Codex leg
       console.log('[miser] Anthropic 429 — trying Codex/OpenAI (subscription OAuth)');
     }
