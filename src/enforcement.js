@@ -812,6 +812,7 @@ function createEnforcementState(opts = {}) {
   const events = [];
   const redirectStats = {
     wouldSynthesize: 0,
+    controlErrors: 0,
     byCommandClass: {},
     byRole: {},
     byMode: {},
@@ -1006,6 +1007,11 @@ function createEnforcementState(opts = {}) {
     };
     if (event.would_synthesize === true) {
       redirectStats.wouldSynthesize += 1;
+    }
+    if (event.control_error === true) {
+      redirectStats.controlErrors += 1;
+    }
+    if (event.would_synthesize === true || event.control_error === true) {
       const commandClass = event.commandClass || 'NEUTRAL';
       const role = event.role || 'unknown';
       const mode = event.mode || 'off';
@@ -1031,6 +1037,7 @@ function createEnforcementState(opts = {}) {
       })),
       redirect: {
         wouldSynthesize: redirectStats.wouldSynthesize,
+        controlErrors: redirectStats.controlErrors,
         byCommandClass: { ...redirectStats.byCommandClass },
         byRole: { ...redirectStats.byRole },
         byMode: { ...redirectStats.byMode },
@@ -1340,23 +1347,64 @@ function watcherCompactPath(watcher, id) {
   return fallbackArtifactPath(id);
 }
 
+function watchDirCompactPath(watchConfig, id) {
+  const watchDir = watchConfig && typeof watchConfig.watchDir === 'string' && watchConfig.watchDir.trim()
+    ? expandHome(watchConfig.watchDir)
+    : path.join(os.homedir(), '.miser', 'watch');
+  return path.join(watchDir, `${id}.md`);
+}
+
+function artifactJsonPath(compactPath) {
+  return compactPath.endsWith('.md') ? `${compactPath.slice(0, -3)}.json` : `${compactPath}.json`;
+}
+
+function artifactState(artifact, nowMs = Date.now()) {
+  if (!artifact || !artifact.generated_at || !Number.isFinite(artifact.ttl_s)) return 'missing';
+  const generated = Date.parse(artifact.generated_at);
+  if (!Number.isFinite(generated)) return 'missing';
+  return Math.max(0, nowMs - generated) <= artifact.ttl_s * 1000 ? 'fresh' : 'stale';
+}
+
 function readWatcherArtifact(commandClass, guardDeps = {}) {
   const watcher = guardDeps.watcher || null;
   for (const id of artifactCandidates(commandClass)) {
-    const compactPath = watcherCompactPath(watcher, id);
+    const compactPath = watcher
+      ? watcherCompactPath(watcher, id)
+      : watchDirCompactPath(guardDeps.watchConfig || {}, id);
+    let artifact = null;
+    if (watcher && typeof watcher.readArtifact === 'function') {
+      try { artifact = watcher.readArtifact(id); } catch (_) {}
+    }
+    if (!artifact) {
+      try { artifact = JSON.parse(fs.readFileSync(artifactJsonPath(compactPath), 'utf8')); } catch (_) {}
+    }
+    const state = artifactState(artifact, guardDeps.nowFn ? guardDeps.nowFn().getTime() : Date.now());
     try {
       const text = fs.readFileSync(compactPath, 'utf8');
       if (String(text || '').trim()) {
-        return { id, path: compactPath, text, missing: false };
+        return {
+          id,
+          path: compactPath,
+          text,
+          missing: false,
+          stale: state === 'stale',
+          state: state === 'missing' ? 'unknown' : state,
+          artifact,
+        };
       }
     } catch (_) {}
   }
   const missingId = artifactCandidates(commandClass)[0];
   return {
     id: missingId,
-    path: watcherCompactPath(watcher, missingId),
+    path: watcher
+      ? watcherCompactPath(watcher, missingId)
+      : watchDirCompactPath(guardDeps.watchConfig || {}, missingId),
     text: '',
     missing: true,
+    stale: false,
+    state: 'missing',
+    artifact: null,
   };
 }
 
@@ -1366,30 +1414,16 @@ function trimSyntheticArtifactText(text, maxBytes = 16 * 1024) {
   return out;
 }
 
-function redirectInstructionText(mode, classification, artifact) {
+function redirectControlMessage(mode, classification, artifact) {
   const commandClass = classification.commandClass || 'UNKNOWN';
   const artifactPath = artifact && artifact.path ? artifact.path : fallbackArtifactPath((artifactCandidates(commandClass)[0]));
-  if (mode === 'warn') {
-    return [
-      `miser warning: ${commandClass} is a zero-LLM watcher redirect class.`,
-      `Do not poll live from Claude. Use watcher artifact ${artifactPath} instead.`,
-      artifact && artifact.missing
-        ? `Missing artifact: ${artifactPath}. Refresh or repair the watcher out-of-band before asking again.`
-        : 'If fresher data is required, refresh the watcher out-of-band and read the artifact path.',
-    ].join('\n');
-  }
   if (!artifact || artifact.missing) {
-    return [
-      `miser: watcher artifact missing for ${commandClass}: ${artifactPath}.`,
-      'Do not poll live from Claude.',
-      `Refresh or repair the watcher out-of-band, then read ${artifactPath}.`,
-    ].join('\n');
+    return `miser control-plane redirect blocked ${commandClass}: watcher artifact missing at ${artifactPath}`;
   }
-  return [
-    `miser: ${commandClass} redirected to zero-LLM watcher artifact ${artifactPath}.`,
-    '',
-    trimSyntheticArtifactText(artifact.text),
-  ].join('\n');
+  if (artifact.stale || artifact.state === 'stale') {
+    return `miser control-plane redirect blocked ${commandClass}: watcher artifact stale at ${artifactPath}`;
+  }
+  return `miser control-plane redirect blocked ${commandClass}: read watcher artifact outside the model transcript at ${artifactPath}`;
 }
 
 function buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body) {
@@ -1398,16 +1432,15 @@ function buildRedirectResponse(project, panel, policy, classification, state, gu
   if (!safeForSyntheticRedirect(body, classification)) return null;
 
   const artifact = readWatcherArtifact(classification.commandClass, guardDeps);
-  const text = redirectInstructionText(redirectMode, classification, artifact);
   const reason = 'zero-llm-redirect';
-  const responseBody = buildSyntheticMessageResponse(body, text, {
-    model: body && body.model,
-  });
+  const artifactStateValue = artifact.state || (artifact.missing ? 'missing' : 'unknown');
+  const message = redirectControlMessage(redirectMode, classification, artifact);
   const event = {
-    decision: redirectMode === 'warn' ? 'synthesize_warning' : 'synthesize',
+    decision: 'control_error',
     reason,
     mode: redirectMode,
-    would_synthesize: true,
+    would_synthesize: false,
+    control_error: true,
     commandClass: classification.commandClass,
     role: classification.role,
     fingerprint: classification.conversationFingerprint,
@@ -1415,6 +1448,7 @@ function buildRedirectResponse(project, panel, policy, classification, state, gu
     artifactId: artifact.id,
     artifactPath: artifact.path,
     artifactMissing: artifact.missing === true,
+    artifactState: artifactStateValue,
   };
   if (typeof state.recordRedirectDecision === 'function') {
     state.recordRedirectDecision(project, panel, event);
@@ -1426,27 +1460,49 @@ function buildRedirectResponse(project, panel, policy, classification, state, gu
   }
   const headers = {
     'content-type': 'application/json',
+    'x-miser-control-plane': reason,
     'x-miser-redirect': reason,
     'x-miser-redirect-mode': redirectMode,
     'x-miser-redirect-class': classification.commandClass,
     'x-miser-watch-artifact': artifact.path,
+    'x-miser-watch-artifact-state': artifactStateValue,
+    'x-miser-enforcement': reason,
+    'x-miser-enforcement-reason': reason,
   };
-  if (redirectMode === 'warn') headers['x-miser-enforcement-warning'] = reason;
-  else headers['x-miser-enforcement'] = reason;
   return {
-    status: 200,
+    status: 429,
     headers,
-    body: responseBody,
+    body: {
+      type: 'error',
+      error: {
+        type: 'miser_control_plane_error',
+        reason,
+        message,
+        command_class: classification.commandClass,
+        mode: redirectMode,
+        artifact: {
+          id: artifact.id,
+          path: artifact.path,
+          state: artifactStateValue,
+          missing: artifact.missing === true,
+          stale: artifact.stale === true,
+        },
+        operator_action: artifact.missing || artifact.stale
+          ? 'refresh_or_repair_watcher_out_of_band'
+          : 'read_watcher_artifact_out_of_band',
+      },
+    },
     enforcement: {
       reason,
       mode: redirectMode,
-      status: 200,
-      warning: redirectMode === 'warn',
-      synthetic: true,
+      status: 429,
+      warning: false,
+      synthetic: false,
       redirect: true,
       commandClass: classification.commandClass,
       artifactPath: artifact.path,
       artifactMissing: artifact.missing === true,
+      artifactState: artifactStateValue,
     },
   };
 }
