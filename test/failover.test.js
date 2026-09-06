@@ -178,7 +178,7 @@ test('tool-sensitive fallback veto: last tool_result skips Codex and Ollama with
   assert.match(res.body(), /^{"id":"miser_local_.*"content":\[\{"type":"text","text":"miser:/);
 });
 
-test('Anthropic 429 cooldown: tool-sensitive retry skips Anthropic after first 429', async () => {
+test('Anthropic 429 cooldown: tool-result retry skips Anthropic and ends locally', async () => {
   const calls = [];
   const toolMsgs = [
     { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'date' } }] },
@@ -206,7 +206,9 @@ test('Anthropic 429 cooldown: tool-sensitive retry skips Anthropic after first 4
   assert.deepEqual(calls.map(c => c.name), ['anthropic']);
   assert.equal(first.headers['x-miser-provider'], 'local');
   assert.equal(second.headers['x-miser-provider'], 'local');
-  assert.match(second.body(), /miser: upstream unavailable/);
+  assert.equal(second.headers['x-miser-enforcement'], 'tool-result-zero-llm');
+  assert.equal(second.headers['x-miser-enforcement-reason'], 'upstream-unavailable-tool-result-zero-llm');
+  assert.equal(JSON.parse(second.body()).content[0].text, '');
 });
 
 test('TermDeck suggestion mode returns empty local JSON without touching upstreams', async () => {
