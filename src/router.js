@@ -304,6 +304,18 @@ function isNonStreamingToolSurface(originalBody) {
   );
 }
 
+function isTermDeckSuggestionMode(messages) {
+  const text = latestRealUserText(messages || []).trimStart();
+  return text.startsWith('[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]');
+}
+
+function writeSuggestionModeNoop(res, originalBody) {
+  writeLocalAnthropicMessage(res, originalBody, '', {
+    'x-miser-enforcement': 'suggestion-mode-zero-llm',
+    'x-miser-enforcement-reason': 'termdeck-suggestion-mode-zero-llm',
+  });
+}
+
 function writeToolSensitiveFallbackVeto(res, originalBody, project, panel) {
   const where = panel ? `${project || 'default'}--${panel}` : (project || 'default');
   const text = `miser: upstream unavailable; local fallback disabled for tool-sensitive Claude Code turn in ${where} because fallback cannot preserve tool_use. Stand down and retry after provider recovery or restart a fresh panel.`;
@@ -383,6 +395,12 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
         }
       } else throw err;
     }
+    return;
+  }
+
+  if (isTermDeckSuggestionMode(messages)) {
+    console.log(`[miser] TermDeck suggestion mode zero-LLM noop project=${project || 'default'} panel=${panel || ''}`);
+    writeSuggestionModeNoop(res, originalBody);
     return;
   }
 

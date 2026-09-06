@@ -209,6 +209,58 @@ test('Anthropic 429 cooldown: tool-sensitive retry skips Anthropic after first 4
   assert.match(second.body(), /miser: upstream unavailable/);
 });
 
+test('TermDeck suggestion mode returns empty local JSON without touching upstreams', async () => {
+  const calls = [];
+  const msgs = [{
+    role: 'user',
+    content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion, no quotes or explanation.',
+  }];
+  const deps = {
+    transports: {
+      anthropic: (...a) => { calls.push({ name: 'anthropic', args: a }); throw new Error('anthropic must not be called'); },
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs }, {}, res, 'aetheria', 0, 'anthropic', deps);
+
+  assert.deepEqual(calls, []);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.equal(res.headers['x-miser-enforcement'], 'suggestion-mode-zero-llm');
+  assert.equal(res.headers['x-miser-enforcement-reason'], 'termdeck-suggestion-mode-zero-llm');
+  assert.equal(JSON.parse(res.body()).content[0].text, '');
+});
+
+test('TermDeck suggestion mode returns empty local SSE without touching upstreams', async () => {
+  const calls = [];
+  const msgs = [{
+    role: 'user',
+    content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion, no quotes or explanation.',
+  }];
+  const deps = {
+    transports: {
+      anthropic: (...a) => { calls.push({ name: 'anthropic', args: a }); throw new Error('anthropic must not be called'); },
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs, stream: true }, {}, res, 'aetheria', 0, 'anthropic', deps);
+
+  assert.deepEqual(calls, []);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['content-type'], 'text/event-stream');
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.equal(res.headers['x-miser-enforcement'], 'suggestion-mode-zero-llm');
+  assert.match(res.body(), /event: message_stop/);
+});
+
 test('tool-sensitive fallback veto: Stop-hook repair text skips Codex and Ollama', async () => {
   const calls = [];
   const msgs = [{ role: 'user', content: 'Stop hook blocked: Use the Bash tool now. Do not print curl in markdown. Confirm ok:true for /v1/orch-pkachu/reply.' }];
