@@ -12,6 +12,14 @@ const DEFAULT_LOCK_LEASE_MS = 60_000;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_COMPACT_BYTES = 4096;
 const PROBE_ID_RE = /^[A-Za-z0-9._-]{1,80}$/;
+const DEFAULT_PROBE_IDS = Object.freeze([
+  'ci',
+  'termdeck',
+  'miser',
+  'health',
+  'loop-shell',
+  'repo-sweep',
+]);
 
 function expandHome(file) {
   if (typeof file !== 'string' || !file.trim()) return null;
@@ -89,6 +97,50 @@ function parseProbeRegistry(raw) {
   return out;
 }
 
+function defaultProbeRegistry() {
+  const repoRoot = path.resolve(__dirname, '..');
+  return [
+    {
+      id: 'ci',
+      command: 'gh run list --limit 10',
+      cwd: repoRoot,
+      ttl_s: 90,
+      timeout_s: 20,
+    },
+    {
+      id: 'termdeck',
+      command: 'TOKEN="${TOKEN:-$(sed -n "s/^[[:space:]]*token:[[:space:]]*//p" "$HOME/.termdeck/config.yaml" 2>/dev/null | head -1)}"; test -n "$TOKEN" && (curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3100/api/sessions || curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3200/api/sessions)',
+      ttl_s: 60,
+      timeout_s: 10,
+    },
+    {
+      id: 'miser',
+      command: 'curl -fsS http://127.0.0.1:20128/api/miser/stats/panels',
+      ttl_s: 60,
+      timeout_s: 10,
+    },
+    {
+      id: 'health',
+      command: 'systemctl --user is-active miser.service && curl -fsS http://127.0.0.1:20128/api/miser/health',
+      ttl_s: 60,
+      timeout_s: 10,
+    },
+    {
+      id: 'loop-shell',
+      command: "ps -eo pid,ppid,stat,etime,cmd --sort=etime | awk 'NR==1 || /while|watch|tail -f|gh run watch|td-inject|curl .*api\\\\/sessions|miser-watchd/ { print }' | tail -80",
+      ttl_s: 60,
+      timeout_s: 10,
+    },
+    {
+      id: 'repo-sweep',
+      command: 'git status --short --branch && gh pr list --limit 20',
+      cwd: repoRoot,
+      ttl_s: 300,
+      timeout_s: 30,
+    },
+  ].map(probe => normalizeProbe(probe)).filter(Boolean);
+}
+
 function parseWatchConfig(env = process.env) {
   const watchDir = expandHome(env.MISER_WATCH_DIR || DEFAULT_WATCH_DIR);
   let rawProbes = env.MISER_WATCH_PROBES || '';
@@ -104,7 +156,7 @@ function parseWatchConfig(env = process.env) {
     enabled: !/^(0|false|off|no)$/i.test(env.MISER_WATCH_ENABLED || ''),
     watchDir,
     lockLeaseMs: finiteInt(env.MISER_WATCH_LOCK_LEASE_MS, DEFAULT_LOCK_LEASE_MS, 1000, 24 * 60 * 60 * 1000),
-    probes: parseProbeRegistry(rawProbes),
+    probes: rawProbes ? parseProbeRegistry(rawProbes) : defaultProbeRegistry(),
   };
 }
 
@@ -417,9 +469,11 @@ module.exports = {
   DEFAULT_TTL_S,
   MAX_COMPACT_BYTES,
   PROBE_ID_RE,
+  DEFAULT_PROBE_IDS,
   parseWatchConfig,
   parseProbeRegistry,
   normalizeProbe,
+  defaultProbeRegistry,
   artifactFreshness,
   compactOutput,
   createWatcher,
