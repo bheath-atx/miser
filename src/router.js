@@ -272,6 +272,15 @@ function isToolSensitiveFallback(messages, originalBody) {
   );
 }
 
+function isNonStreamingToolSurface(originalBody) {
+  return !!(
+    originalBody
+    && originalBody.stream !== true
+    && Array.isArray(originalBody.tools)
+    && originalBody.tools.length > 0
+  );
+}
+
 function writeToolSensitiveFallbackVeto(res, originalBody, project, panel) {
   const where = panel ? `${project || 'default'}--${panel}` : (project || 'default');
   const text = `miser: upstream unavailable; local fallback disabled for tool-sensitive Claude Code turn in ${where} because fallback cannot preserve tool_use. Stand down and retry after provider recovery or restart a fresh panel.`;
@@ -371,6 +380,14 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   if (isToolSensitiveFallback(messages, originalBody)) {
     console.log(`[miser] tool-sensitive fallback veto project=${project || 'default'} panel=${panel || ''}`);
     writeToolSensitiveFallbackVeto(res, originalBody, project, panel);
+    return;
+  }
+
+  if (isNonStreamingToolSurface(originalBody) && config.codexFormat !== 'chat') {
+    console.log(`[miser] non-streaming tool-surface fallback veto project=${project || 'default'} panel=${panel || ''}`);
+    writeLocalAnthropicMessage(res, originalBody,
+      'miser: upstream unavailable; local fallback disabled for non-streaming Claude Code retry with tools because the configured fallback path returns a stream. Retry after provider recovery or start a fresh panel.',
+      { 'x-miser-enforcement-reason': 'upstream-unavailable-nonstream-tool-surface' });
     return;
   }
 

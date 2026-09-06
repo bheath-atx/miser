@@ -218,7 +218,7 @@ test('tool-sensitive fallback veto: forced tool_choice skips Codex and Ollama', 
   assert.equal(res.headers['x-miser-provider'], 'local');
 });
 
-test('bare tools array alone is not tool-sensitive: ordinary chat still reaches Ollama fallback', async () => {
+test('non-streaming bare tools array gets local JSON instead of streaming fallback shape', async () => {
   const calls = [];
   const msgs = [{ role: 'user', content: 'hi' }];
   const deps = {
@@ -232,6 +232,27 @@ test('bare tools array alone is not tool-sensitive: ordinary chat still reaches 
   };
   const res = makeRes();
   await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs, tools: [{ name: 'Bash' }], tool_choice: { type: 'auto' } }, {}, res, 'proj', 0, 'anthropic', deps);
+  assert.deepEqual(calls.map(c => c.name), ['anthropic']);
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.equal(res.headers['content-type'], 'application/json');
+  assert.equal(res.headers['x-miser-enforcement-reason'], 'upstream-unavailable-nonstream-tool-surface');
+  assert.match(res.body(), /non-streaming Claude Code retry with tools/);
+});
+
+test('streaming bare tools array alone is not tool-sensitive: ordinary chat still reaches Ollama fallback', async () => {
+  const calls = [];
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const deps = {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: failTransport('codex', calls, 429),
+      ollama: successTransport('ollama', calls),
+    },
+    getBearer: fakeBearer,
+    ollamaCap: 32000,
+  };
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs, stream: true, tools: [{ name: 'Bash' }], tool_choice: { type: 'auto' } }, {}, res, 'proj', 0, 'anthropic', deps);
   assert.deepEqual(calls.map(c => c.name), ['anthropic', 'codex', 'ollama']);
   assert.equal(res.headers['x-miser-provider'], 'ollama');
 });
