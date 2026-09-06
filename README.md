@@ -150,13 +150,15 @@ MISER_POLICY='{"pkachu":{"expectedModel":"claude-sonnet","maxContextTokens":4000
 
 ---
 
-## Failover
+## Provider Admission
 
-Anthropic 429 keeps the existing failover path:
+Claude routes are provider-pinned:
 
-1. Anthropic Messages API
-2. Codex/OpenAI through subscription OAuth
-3. Local Ollama hard-capped fallback
+1. Anthropic Messages API succeeds and is proxied.
+2. Anthropic 429, cooldown, breaker-open, timeout, or transport failure returns a machine-readable Anthropic error.
+3. Codex/OpenAI and local Ollama never produce assistant turns for Claude routes.
+
+The OpenAI-format passthrough route (`/v1/chat/completions`) remains explicit non-Claude compatibility and can use hard-capped Ollama fallback on OpenAI 429.
 
 For C1-injected requests, non-429 upstream errors pass through unchanged and do not write measured usage stats. Three consecutive injected 400s disable context-management for that project for the process lifetime.
 

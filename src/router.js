@@ -325,7 +325,6 @@ function defaultDeps() {
     transports: {
       anthropic: forwardToAnthropic,
       openaiPassthrough: forwardToOpenAI,
-      codex: forwardToCodex,
       ollama: forwardToOllama,
     },
     ollamaCap: config.ollamaHardCap,

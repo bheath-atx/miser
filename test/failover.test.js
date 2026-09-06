@@ -130,6 +130,30 @@ test('tool-result continuation gets provider-unavailable error, not fallback ass
   assert.doesNotMatch(res.body(), /miser_local_/);
 });
 
+test('forced tool_choice turn gets provider-unavailable error, not fallback assistant turn', async () => {
+  const calls = [];
+  const msgs = [{ role: 'user', content: 'run the selected tool' }];
+  const res = makeRes();
+  await routeRequest(msgs, {
+    model: 'claude',
+    max_tokens: 100,
+    messages: msgs,
+    tool_choice: { type: 'tool', name: 'Bash' },
+  }, {}, res, 'proj', 0, 'anthropic', {
+    transports: {
+      anthropic: failTransport('anthropic', calls, 429),
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+    retryOpts: fastRetry,
+  });
+
+  assert.deepEqual(calls.map(c => c.name), ['anthropic']);
+  assertAnthropicUnavailable(res, 429, 'anthropic_rate_limited');
+  assert.doesNotMatch(res.body(), /miser_local_/);
+});
+
 test('streaming Claude unavailability uses SSE error shape without fallback message events', async () => {
   const calls = [];
   const res = makeRes();
@@ -196,6 +220,54 @@ test('Anthropic breaker OPEN returns provider-unavailable error without Codex/Ol
 
   assert.deepEqual(calls, []);
   assertAnthropicUnavailable(res, 503, 'anthropic_breaker_open');
+});
+
+test('TermDeck suggestion mode returns empty local JSON without touching upstreams', async () => {
+  const calls = [];
+  const msgs = [{
+    role: 'user',
+    content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion, no quotes or explanation.',
+  }];
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs }, {}, res, 'aetheria', 0, 'anthropic', {
+    transports: {
+      anthropic: (...a) => { calls.push({ name: 'anthropic', args: a }); throw new Error('anthropic must not be called'); },
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+  });
+
+  assert.deepEqual(calls, []);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.equal(res.headers['x-miser-enforcement'], 'suggestion-mode-zero-llm');
+  assert.equal(res.headers['x-miser-enforcement-reason'], 'termdeck-suggestion-mode-zero-llm');
+  assert.equal(JSON.parse(res.body()).content[0].text, '');
+});
+
+test('TermDeck suggestion mode returns empty local SSE without touching upstreams', async () => {
+  const calls = [];
+  const msgs = [{
+    role: 'user',
+    content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion, no quotes or explanation.',
+  }];
+  const res = makeRes();
+  await routeRequest(msgs, { model: 'claude', max_tokens: 100, messages: msgs, stream: true }, {}, res, 'aetheria', 0, 'anthropic', {
+    transports: {
+      anthropic: (...a) => { calls.push({ name: 'anthropic', args: a }); throw new Error('anthropic must not be called'); },
+      codex: (...a) => { calls.push({ name: 'codex', args: a }); throw new Error('codex must not be called'); },
+      ollama: (...a) => { calls.push({ name: 'ollama', args: a }); throw new Error('ollama must not be called'); },
+    },
+    getBearer: fakeBearer,
+  });
+
+  assert.deepEqual(calls, []);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['content-type'], 'text/event-stream');
+  assert.equal(res.headers['x-miser-provider'], 'local');
+  assert.equal(res.headers['x-miser-enforcement'], 'suggestion-mode-zero-llm');
+  assert.match(res.body(), /event: message_stop/);
 });
 
 test('regression: Ollama qwen2.5-coder cannot answer a Claude-panel request', async () => {
