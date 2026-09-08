@@ -20,6 +20,26 @@ BASE_EXPLICIT=0
 ARTIFACT_DIR="${MISER_SPAWN_FAILURE_DIR:-$HOME/.miser/spawn-failures}"
 STARTED_AT_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+label_has_segment_ci() {
+  local term="${1,,}" lower="${LABEL,,}"
+  [[ "$lower" =~ (^|[-_.[:space:]])${term}($|[-_.[:space:]]) ]]
+}
+
+label_has_orch_segment() {
+  [[ "$LABEL" =~ (^|[-_.[:space:]])ORCH($|[-_.[:space:]]) ]]
+}
+
+label_has_non_orch_segment() {
+  [[ "$LABEL" =~ (^|[-_.[:space:]])[Nn][Oo][Nn][-_.[:space:]]*ORCH($|[-_.[:space:]]) ]]
+}
+
+is_orch_lane() {
+  case "${ROLE,,}" in
+    orch|orchestrator) return 0 ;;
+  esac
+  label_has_orch_segment && ! label_has_non_orch_segment
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --parent)   PARENT="$2"; shift 2 ;;
@@ -49,7 +69,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $BASE_EXPLICIT -eq 0 && "${LABEL^^}" == *-ORCH ]]; then
+if [[ $BASE_EXPLICIT -eq 0 ]] && is_orch_lane; then
   BASE="http://127.0.0.1:3100"
   echo "spawn-lane: label '$LABEL' looks like an orch panel -> targeting master instance $BASE" >&2
 fi
@@ -85,13 +105,17 @@ if [[ -n "$BOOT_FILE" && ! -r "$BOOT_FILE" ]]; then
   exit 1
 fi
 
-if [[ -n "$BOOT_FILE" && "${LABEL^^}" != *-ORCH ]]; then
+if [[ -n "$BOOT_FILE" ]]; then
   BOOT_TEXT=$(<"$BOOT_FILE")
-  if ! grep -Eiq '(td-inject\.sh|notify[- ]?back|Do not wait to be polled|dispatcher-session-id)' <<< "$BOOT_TEXT"; then
+  if is_orch_lane; then
+    if ! grep -Eiq '^[[:space:]]*(MISER_BOOT_SETUP|ORCH_BOOT|PANEL_BOOT)[[:space:]]*$' <<< "$BOOT_TEXT"; then
+      echo "spawn-lane: REFUSING ORCH boot without MISER_BOOT_SETUP/PANEL_BOOT marker: $BOOT_FILE" >&2
+      exit 1
+    fi
+  elif ! grep -Eiq '(td-inject\.sh|notify[- ]?back|Do not wait to be polled|dispatcher-session-id)' <<< "$BOOT_TEXT"; then
     echo "spawn-lane: REFUSING task boot without notify-back instruction: $BOOT_FILE" >&2
     exit 1
-  fi
-  if ! grep -Eiq '(ORCH-RESULT|SUMMARY|compact[- ]?(lane )?result|compact artifact)' <<< "$BOOT_TEXT"; then
+  elif ! grep -Eiq '(ORCH-RESULT|SUMMARY|compact[- ]?(lane )?result|compact artifact)' <<< "$BOOT_TEXT"; then
     echo "spawn-lane: REFUSING task boot without compact result artifact contract: $BOOT_FILE" >&2
     exit 1
   fi
@@ -100,6 +124,77 @@ fi
 REASON_DEFAULT="spawned via spawn-lane.sh by parent $PARENT"
 [[ -z "$REASON" ]] && REASON="$REASON_DEFAULT"
 COMMAND_ARG="$COMMAND"
+
+project_slug() {
+  case "${PROJECT,,}" in
+    aetheria|aetheria-concierge) printf '%s' "aetheria" ;;
+    *) printf '%s' "${PROJECT,,}" ;;
+  esac
+}
+
+panel_slug() {
+  if is_orch_lane; then
+    printf '%s' "orch"
+  elif label_has_segment_ci "architect"; then
+    printf '%s' "architect"
+  elif label_has_segment_ci "sprints"; then
+    printf '%s' "sprints"
+  else
+    printf '%s' ""
+  fi
+}
+
+route_claude_command() {
+  local slug panel project_base_url base_url base_q
+  [[ "${MISER_ROUTE_CLAUDE:-1}" == "0" ]] && return 0
+  [[ "$COMMAND" == claude || "$COMMAND" == claude\ * ]] || return 0
+  [[ "$COMMAND" == *ANTHROPIC_BASE_URL=* || "$COMMAND" == *ANTHROPIC_API_URL=* ]] && return 0
+
+  slug="$(project_slug)"
+  panel="$(panel_slug)"
+  project_base_url="${MISER_CLAUDE_BASE_URL:-http://127.0.0.1:20128}/p/$slug"
+  if [[ -n "$panel" ]]; then
+    base_url="${project_base_url}--$panel"
+  else
+    base_url="$project_base_url"
+  fi
+  stage_claude_project_settings "$project_base_url"
+  printf -v base_q '%q' "$base_url"
+  COMMAND="env ANTHROPIC_BASE_URL=$base_q ANTHROPIC_API_URL=$base_q $COMMAND"
+  echo "spawn-lane: routing Claude command through Miser project '$slug${panel:+--$panel}'" >&2
+}
+
+stage_claude_project_settings() {
+  local base_url="$1" settings_dir settings_file
+  [[ "${MISER_STAGE_CLAUDE_SETTINGS:-1}" == "0" ]] && return 0
+  settings_dir="$CWD/.claude"
+  settings_file="$settings_dir/settings.local.json"
+  mkdir -p "$settings_dir"
+  SETTINGS_FILE="$settings_file" BASE_URL="$base_url" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["SETTINGS_FILE"])
+base = os.environ["BASE_URL"]
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+env = data.get("env")
+if not isinstance(env, dict):
+    env = {}
+data["env"] = env
+env["ANTHROPIC_BASE_URL"] = base
+env["ANTHROPIC_API_URL"] = base
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+  echo "spawn-lane: staged Claude cwd route $settings_file -> $base_url" >&2
+}
+
+route_claude_command
 if [[ -n "$MODEL" ]]; then
   printf -v MODEL_SHELL '%q' "$MODEL"
   COMMAND="$COMMAND --model $MODEL_SHELL"
@@ -248,7 +343,7 @@ print(json.dumps(rec))
 
 echo "[spawn-lane] logged: child=$CHILD_ID label=$LABEL project=$PROJECT parent=$PARENT" >&2
 
-if [[ "$PROJECT" == "pkachu" && ( "$ROLE" == "orchestrator" || "$LABEL" == *ORCH* ) && -z "$BOOT_FILE" ]]; then
+if [[ "$PROJECT" == "pkachu" ]] && is_orch_lane && [[ -z "$BOOT_FILE" ]]; then
   mkdir -p "$HOME/.tg"
   printf '%s\n' "$CHILD_ID" > "$HOME/.tg/orch-session.id"
   echo "[spawn-lane] pkachu orch link auto-updated: ~/.tg/orch-session.id -> $CHILD_ID" >&2

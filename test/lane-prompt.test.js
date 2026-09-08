@@ -26,6 +26,7 @@ test('orch-dispatch prompt blocks source inspection and caps pre-dispatch tools'
   ]);
 
   assert.equal(res.status, 0, res.stderr);
+  assert.doesNotMatch(res.stdout, /^PANEL_BOOT$/m);
   assert.match(res.stdout, /Maximum 4 tool calls before first dispatch/);
   assert.match(res.stdout, /Do not read artifact paths from this prompt before dispatch/);
   assert.match(res.stdout, /Pass artifact paths to the builder\/auditor briefing/);
@@ -79,6 +80,8 @@ test('codex-builder prompt includes spawn-lane boot validation phrases', (t) => 
   ]);
 
   assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /^PANEL_BOOT$/m);
+  assert.match(res.stdout, /fresh panel boot\/handoff setup/);
   assert.match(res.stdout, /dispatcher-session-id: parent-123/);
   assert.match(res.stdout, /notify-back/);
   assert.match(res.stdout, /Do not wait to be polled/);
@@ -98,6 +101,7 @@ test('audit prompt is read-only one-shot with verdict structure', () => {
   ]);
 
   assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /^PANEL_BOOT$/m);
   assert.match(res.stdout, /bounded Grok audit lane/);
   assert.match(res.stdout, /Read-only: no edits, commits, pushes, merges/);
   assert.match(res.stdout, /Default to REVISE unless/);
@@ -120,6 +124,7 @@ test('writes output file and creates parent directory', (t) => {
   assert.equal(res.status, 0, res.stderr);
   assert.equal(res.stdout, '');
   const body = fs.readFileSync(out, 'utf8');
+  assert.match(body, /^PANEL_BOOT$/m);
   assert.match(body, /miser codex-audit Prompt/);
   assert.match(body, /bounded Codex audit lane/);
 });

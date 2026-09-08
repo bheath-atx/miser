@@ -14,6 +14,7 @@ const {
   checkEnforcement,
   recordEnforcementUsage,
 } = require('../src/enforcement.js');
+const { classifyOrchIntent, promptFor, validateAdvisorJson } = require('../src/orch-intent-classifier.js');
 
 const TEST_OVERRIDE_FILE = '/tmp/miser-enforcement-test-overrides-never.json';
 
@@ -51,6 +52,20 @@ function bashToolResultBody(command, system = 'You are the ORCH controller for t
   };
 }
 
+function readToolResultBody(filePath, content, firstPrompt = 'You are a temporary NACHO-ORCH coordinator. First respond STARTED, then read only the minimal launcher setup file and propose the sprint.') {
+  return {
+    model: 'claude-sonnet-5-test',
+    max_tokens: 50,
+    system: 'You are the ORCH controller for this sprint.',
+    messages: [
+      { role: 'user', content: firstPrompt },
+      { role: 'assistant', content: 'STARTED' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: filePath } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content }] },
+    ],
+  };
+}
+
 function promptBody(text, system = 'You are the ORCH controller for this sprint.') {
   return {
     model: 'claude-sonnet-5-test',
@@ -58,6 +73,16 @@ function promptBody(text, system = 'You are the ORCH controller for this sprint.
     system,
     messages: [{ role: 'user', content: text }],
   };
+}
+
+function conversationBody(firstText, latestText, assistantCount = 1) {
+  const messages = [{ role: 'user', content: firstText }];
+  for (let i = 0; i < assistantCount; i++) {
+    messages.push({ role: 'assistant', content: `assistant ${i}` });
+    if (i < assistantCount - 1) messages.push({ role: 'user', content: `intermediate ${i}` });
+  }
+  messages.push({ role: 'user', content: latestText });
+  return { model: 'claude', max_tokens: 50, messages };
 }
 
 function guard(config, state, now = () => new Date(1000)) {
@@ -94,6 +119,17 @@ function call(deps, project, panel, text, headers = {}, requestHeaders = {}) {
   return checkEnforcement(project, panel, bodyFor(text), headers, 100, deps, requestHeaders);
 }
 
+function controlText(response) {
+  assert.equal(response.status, 200);
+  assert.equal(response.body.type, 'message');
+  assert.equal(response.body.role, 'assistant');
+  assert.equal(response.body.usage.input_tokens, 0);
+  const text = response.body.content[0].text;
+  assert.match(text, /miser_control_plane_error/);
+  assert.match(text, /retryable=false/);
+  return text;
+}
+
 test('parseEnforcement accepts wildcard default and project overrides, including orchControl fields', () => {
   const orchControl = {
     enabled: true,
@@ -115,6 +151,9 @@ test('parseEnforcement accepts wildcard default and project overrides, including
     approvalMarkers: ['APPROVED'],
     completionMarkers: ['DONE'],
     handoffMarkers: ['HANDOFF_DONE'],
+    bootSetupMarkers: ['BOOT_READY'],
+    bootSetupMaxAssistantTurns: 2,
+    bootSetupMaxMessages: 4,
     revisionMarkers: ['REV='],
     dispatchFinalizeMarker: 'FINALIZE',
     dispatchSessionHeader: 'x-child',
@@ -162,6 +201,36 @@ test('controlClass catches measured NACHO control-loop patterns', () => {
   }
 });
 
+test('Claude Code system-reminder text does not poison orch enforcement classification', () => {
+  const injected = [
+    '<system-reminder>',
+    'Do not poll TermDeck sessions. Check /api/miser/health.',
+    'Use panel_lifecycle, audit_monitor, usage_monitor, repo_status, handoff.',
+    'Run git status and gh pr view only when needed.',
+    '</system-reminder>',
+    '',
+    'Reply exactly: OK',
+  ].join('\n');
+  const c = classifyRequest('provenspec', 'orch', promptBody(injected), { 'x-miser-poll-class': 'likely' }, 100);
+  assert.deepEqual(c.controlClasses, []);
+  assert.equal(c.managementLike, false);
+  assert.equal(c.pollingCommandLike, false);
+  assert.equal(c.selfWorkCommandLike, false);
+  assert.equal(c.commandClass, 'NEUTRAL');
+});
+
+test('real user text after a Claude Code system-reminder still classifies', () => {
+  const injected = [
+    '<system-reminder>Do not poll TermDeck sessions.</system-reminder>',
+    '',
+    'curl http://127.0.0.1:20128/api/miser/stats',
+  ].join('\n');
+  const c = classifyRequest('provenspec', 'orch', promptBody(injected), { 'x-miser-poll-class': 'likely' }, 100);
+  assert.ok(c.controlClasses.includes('usage_monitor'));
+  assert.equal(c.pollingCommandLike, true);
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
 test('configured non-nacho project blocks repeated explicit polling commands', () => {
   let nowMs = Date.parse('2026-08-25T12:00:00.000Z');
   const state = createEnforcementState({ nowMs: () => nowMs });
@@ -170,13 +239,11 @@ test('configured non-nacho project blocks repeated explicit polling commands', (
   const deps = guard(config, state, () => new Date(nowMs));
 
   const warn = call(deps, 'aetheria', 'orch', 'curl http://127.0.0.1:20128/api/miser/stats', { 'x-miser-poll-class': 'likely' });
-  assert.equal(warn.status, 429);
-  assert.equal(warn.body.error.type, 'miser_control_plane_error');
+  assert.match(controlText(warn), /Do not retry/);
   assert.equal(warn.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
-  assert.equal(JSON.stringify(warn.body).includes('"role":"assistant"'), false);
   nowMs += 3000;
   const block = call(deps, 'aetheria', 'orch', 'curl http://127.0.0.1:20128/api/miser/stats', { 'x-miser-poll-class': 'likely' });
-  assert.equal(block.status, 429);
+  assert.match(controlText(block), /poll budget exceeded/);
   assert.equal(block.headers['x-miser-enforcement'], 'poll-budget');
 });
 
@@ -204,8 +271,7 @@ test('all named fleet projects can be covered by config without source hardcodin
     config[project].poll.maxLikelyPollsPer10Min = 1;
     const first = call(deps, project, panel, 'curl /api/miser/stats', { 'x-miser-poll-class': 'likely' });
     assert.ok(first, `${project}/${panel} should warn`);
-    assert.equal(first.status, 429);
-    assert.equal(first.body.error.type, 'miser_control_plane_error');
+    assert.match(controlText(first), /miser_control_plane_error/);
     nowMs += 3000;
     const block = call(deps, project, panel, 'curl /api/miser/stats', { 'x-miser-poll-class': 'likely' });
     assert.equal(block.headers['x-miser-enforcement'], 'poll-budget');
@@ -283,6 +349,351 @@ test('fresh low-turn replacement panel does not inherit stale high-turn protecte
   assert.equal(st.currentAssignmentId, 'A');
 });
 
+test('fresh low-turn replacement panel resets stale protected counters by conversation fingerprint', () => {
+  let nowMs = 1000;
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 2,
+    maxManagementTurnsPerAssignment: 2,
+  });
+  const deps = guard(config, state, () => new Date(nowMs));
+
+  assert.equal(checkEnforcement('aetheria', 'orch', conversationBody('old boot handoff', 'proposal routing MISER_ASSIGNMENT=A'), { 'x-miser-poll-class': 'unlikely' }, 100, deps), null);
+  nowMs += 3000;
+  assert.equal(checkEnforcement('aetheria', 'orch', conversationBody('old boot handoff', 'proposal mediation'), { 'x-miser-poll-class': 'unlikely' }, 100, deps).headers['x-miser-enforcement-warning'], 'orch-assignment-budget-edge');
+  assert.equal(state.snapshot().sessions[0].assignmentManagementTurns, 2);
+
+  nowMs += 3000;
+  assert.equal(call(deps, 'aetheria', 'orch', 'proposal fresh follow-up after replacement'), null);
+  const st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 1);
+  assert.equal(st.currentAssignmentId, null);
+});
+
+test('fresh ORCH boot and handoff setup prompt is not counted or warned', () => {
+  let nowMs = 1000;
+  const state = createEnforcementState({ nowMs: () => nowMs });
+  const config = configFor('termdeck-updates', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 2,
+    maxManagementTurnsPerAssignment: 2,
+  });
+  const deps = guard(config, state, () => new Date(nowMs));
+
+  assert.equal(call(deps, 'termdeck-updates', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null);
+  nowMs += 3000;
+  assert.equal(call(deps, 'termdeck-updates', 'orch', 'proposal mediation').headers['x-miser-enforcement-warning'], 'orch-assignment-budget-edge');
+  assert.equal(state.snapshot().sessions[0].assignmentManagementTurns, 2);
+
+  nowMs += 3000;
+  const bootPrompt = [
+    'MISER_BOOT_SETUP',
+    '# TermDeck ORCH Canary - Boot Prompt',
+    'You are TermDeck-ORCH-CANARY, a live orchestration canary.',
+    'Role: Coordinate only. Do not implement code. Do not edit files. Do not run local status, systemctl, curl, gh, git, test, file-reading, or watcher-poll commands.',
+    'Read the handoff and reply in one short sentence: online.',
+    'Then wait. Do not run tools.',
+  ].join('\n');
+
+  assert.equal(call(deps, 'termdeck-updates', 'orch', bootPrompt), null);
+  const st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 0);
+  assert.equal(st.controlTurns, 0);
+  assert.equal(st.likelyPollRequests, 0);
+});
+
+test('boot setup marker does not bypass explicit polling or self-work', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    maxControlTurnsPerSession: 99,
+    poll: { maxLikelyPollsPer10Min: 1 },
+  });
+  config.aetheria.poll.maxLikelyPollsPer10Min = 1;
+  const deps = guard(config, state);
+
+  const pollWarn = call(deps, 'aetheria', 'orch', 'MISER_BOOT_SETUP\ncurl http://127.0.0.1:20128/api/miser/stats', { 'x-miser-poll-class': 'likely' });
+  assert.equal(pollWarn.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
+
+  const workState = createEnforcementState({ nowMs: () => 1000 });
+  const workConfig = configFor('aetheria', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+  });
+  const workDeps = guard(workConfig, workState);
+  const selfWarn = call(workDeps, 'aetheria', 'orch', 'MISER_BOOT_SETUP\nrun npm test');
+  assert.equal(selfWarn.headers['x-miser-enforcement-warning'], 'orch-self-work-budget-edge');
+});
+
+test('marker-less manual ORCH boot setup Read of spawn-lane is inferred without advisor stub', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('nacho-orch', {
+    panels: ['sprints'],
+    warnManagementTurnsPerAssignment: 1,
+    maxManagementTurnsPerAssignment: 1,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+  });
+  const deps = guard(config, state);
+  const firstPrompt = [
+    'You are `NACHO-ORCH-LAUNCHER-UX-SPRINT-20260907`, a temporary NACHO-ORCH canary/sprint coordinator on TermDeck `:3100`.',
+    '',
+    'Goal: test the normal manual Claude panel spawn + pasted boot-prompt path, then coordinate a small sprint to make ORCH launches easier than the long `spawn-lane.sh` command.',
+    '',
+    'Hard boundaries:',
+    '- You are an ORCH, not the builder.',
+    '- Do not edit code, docs, hooks, settings, or scripts directly.',
+    '- Do not run inline `codex exec`.',
+    '- Do not inspect secrets, `~/.ssh`, `~/.termdeck`, broad `/home/nacho` searches, or unrelated transcripts.',
+    '- Do not poll TermDeck, Miser, CI, GitHub, or watcher artifacts unless Brad explicitly asks for one exact fact.',
+    '- If implementation is needed, dispatch a visible `:3200` builder/integrator lane using the existing safe launcher path.',
+    '- Do not spawn anything until you have summarized the proposed sprint and Brad approves.',
+    '',
+    'First response format exactly:',
+    '### [NACHO-ORCH-LAUNCHER-UX-SPRINT] STARTED',
+    'Manual spawn + pasted boot prompt received.',
+    'I will coordinate, not build.',
+    'Next: read only the minimal launcher files and propose the smallest sprint to make ORCH launch interactive.',
+  ].join('\n');
+  const body = readToolResultBody('/home/nacho/bin/spawn-lane.sh', [
+    '#!/usr/bin/env bash',
+    'curl -sS http://127.0.0.1:3200/api/sessions',
+    'git fetch',
+    'gh pr view 12',
+    'npm test',
+  ].join('\n'), firstPrompt);
+
+  assert.equal(checkEnforcement('nacho-orch', 'sprints', body, { 'x-miser-poll-class': 'unlikely' }, 100, deps), null);
+  const st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 0);
+  assert.equal(st.selfWorkTurns, 0);
+  assert.equal(st.controlTurns, 0);
+});
+
+test('fresh setup Read inference is limited to known launcher/setup files', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('nacho-orch', {
+    panels: ['sprints'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+  });
+  const deps = guard(config, state);
+  const body = readToolResultBody('/home/nacho/miser/src/enforcement.js', 'curl /api/sessions\ngit status\nnpm test');
+
+  const response = checkEnforcement('nacho-orch', 'sprints', body, { 'x-miser-poll-class': 'unlikely' }, 100, deps);
+  assert.equal(response.headers['x-miser-enforcement-warning'], 'orch-self-work-budget-edge');
+});
+
+test('non-ORCH reviewer prompt is not governed by ORCH budget or watcher redirects', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('miser', {
+    panels: ['orch'],
+    warnManagementTurnsPerAssignment: 1,
+    maxManagementTurnsPerAssignment: 1,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+  });
+  config.miser.redirect = { mode: 'warn' };
+  const deps = guard(config, state);
+  const firstPrompt = [
+    '# Claude Architecture Review Briefing: miser-smart-orch-classifier',
+    'ROLE_LABEL: miser-smart-orch-classifier-CLAUDE-AUDIT-20260907',
+    '',
+    'You are a non-ORCH Claude architecture reviewer.',
+    'Do not coordinate other panels. Review the built architecture only.',
+  ].join('\n');
+  const body = {
+    model: 'claude',
+    max_tokens: 50,
+    messages: [
+      { role: 'user', content: firstPrompt },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'curl http://127.0.0.1:20128/api/miser/stats' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'watcher output' }] },
+    ],
+  };
+
+  const classification = classifyRequest('miser', 'orch', body, { 'x-miser-poll-class': 'likely' }, 100);
+  assert.equal(classification.explicitNonOrchRole, true);
+  assert.equal(classification.role, 'worker');
+  assert.equal(checkEnforcement('miser', 'orch', body, { 'x-miser-poll-class': 'likely' }, 100, deps), null);
+  const st = state.snapshot().sessions[0];
+  assert.equal(st.assignmentManagementTurns, 0);
+  assert.equal(st.selfWorkTurns, 0);
+  assert.equal(st.controlTurns, 1);
+});
+
+test('clean canary boot/setup remains clean with local advisor disabled', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('termdeck-updates', { panels: ['orch'] });
+  const deps = guard(config, state);
+  const bootPrompt = [
+    'PANEL_BOOT',
+    '# TermDeck ORCH Canary Boot 3',
+    'You are `termdeck-updates-ORCH-CANARY3-20260907`, a live Claude ORCH cwd-routing canary.',
+    'Reply with exactly:',
+    '`[MISER ORCH CANARY3 READY]`',
+    'Then wait. Do not run tools. Do not inspect files. Do not poll TermDeck, Miser, watcher artifacts, git, GitHub, services, logs, or local status.',
+  ].join('\n');
+
+  assert.equal(call(deps, 'termdeck-updates', 'orch', bootPrompt), null);
+  assert.equal(state.snapshot().sessions[0].assignmentManagementTurns, 0);
+});
+
+test('obvious polling and ORCH self-work remain coached without live advisor execution', () => {
+  const cases = [
+    ['poll', 'curl http://127.0.0.1:20128/api/miser/stats', 'poll-budget-edge'],
+    ['self-work', 'run npm test', 'orch-self-work-budget-edge'],
+  ];
+  for (const [label, text, expected] of cases) {
+    const state = createEnforcementState({ nowMs: () => 1000 });
+    const config = configFor('aetheria', {
+      panels: ['orch'],
+      warnManagementTurnsPerAssignment: 99,
+      maxManagementTurnsPerAssignment: 99,
+      warnSelfWorkTurnsPerAssignment: 1,
+      maxSelfWorkTurnsPerAssignment: 1,
+    });
+    config.aetheria.poll.maxLikelyPollsPer10Min = 1;
+    const deps = guard(config, state);
+    const response = call(deps, 'aetheria', 'orch', text, { 'x-miser-poll-class': label === 'poll' ? 'likely' : 'unlikely' });
+    assert.equal(response.headers['x-miser-enforcement-warning'], expected, label);
+  }
+});
+
+test('Bash git and rg tool-results cannot be uncounted by classifier env', () => {
+  for (const command of ['git status', 'rg TODO /home/nacho']) {
+    const state = createEnforcementState({ nowMs: () => 1000 });
+    const config = configFor('aetheria', {
+      panels: ['orch'],
+      warnManagementTurnsPerAssignment: 99,
+      maxManagementTurnsPerAssignment: 99,
+      warnSelfWorkTurnsPerAssignment: 1,
+      maxSelfWorkTurnsPerAssignment: 1,
+    });
+    const deps = guard(config, state);
+    deps.env = { MISER_ORCH_INTENT_CLASSIFIER: '1', MISER_ORCH_INTENT_CLASSIFIER_CMD: 'false' };
+    const response = checkEnforcement('aetheria', 'orch', bashToolResultBody(command), {}, 100, deps);
+    assert.equal(response.headers['x-miser-enforcement-warning'], 'orch-self-work-budget-edge', command);
+  }
+});
+
+test('hard ORCH safety blocks bypass smart advisor', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
+  });
+  const deps = guard(config, state);
+  deps.env = { MISER_ORCH_INTENT_CLASSIFIER: '1', MISER_ORCH_INTENT_CLASSIFIER_CMD: 'false' };
+  const body = {
+    model: 'claude',
+    max_tokens: 50,
+    system: 'You are the ORCH controller.',
+    messages: [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/home/nacho/.ssh/id_rsa' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'not shown' }] },
+    ],
+  };
+
+  const block = checkEnforcement('aetheria', 'orch', body, {}, 100, deps);
+  assert.equal(block.headers['x-miser-enforcement'], 'orch-hard-safety');
+});
+
+test('staged advisor invalid and low-confidence output are rejected before use', () => {
+  const outputs = [
+    'not json',
+    JSON.stringify({
+      intent: 'boot_setup',
+      confidence: 0.2,
+      should_count: false,
+      action: 'allow',
+      operator_message: 'too unsure',
+      reason: 'low',
+    }),
+  ];
+  for (const output of outputs) {
+    const result = classifyOrchIntent({ project: 'nacho-orch' }, { advisorText: output });
+    assert.equal(result.ok, false);
+  }
+});
+
+test('configured local advisor env does not execute in live enforcement fallback path', () => {
+  const state = createEnforcementState({ nowMs: () => 1000 });
+  const config = configFor('nacho-orch', {
+    panels: ['sprints'],
+    warnManagementTurnsPerAssignment: 99,
+    maxManagementTurnsPerAssignment: 99,
+    warnSelfWorkTurnsPerAssignment: 1,
+    maxSelfWorkTurnsPerAssignment: 1,
+  });
+  const deps = guard(config, state);
+  deps.env = { MISER_ORCH_INTENT_CLASSIFIER: '1', MISER_ORCH_INTENT_CLASSIFIER_CMD: 'sleep 5' };
+
+  const response = checkEnforcement('nacho-orch', 'sprints',
+    readToolResultBody('/home/nacho/miser/src/enforcement.js', 'curl /api/sessions\ngh pr view 1'),
+    { 'x-miser-poll-class': 'unlikely' }, 100, deps);
+  assert.equal(response.headers['x-miser-enforcement-warning'], 'orch-self-work-budget-edge');
+});
+
+test('staged advisor prompt includes boot evidence and not provider API environment values', () => {
+  const classification = classifyRequest('nacho-orch', 'sprints',
+    readToolResultBody('/home/nacho/bin/spawn-lane.sh', 'curl /api/sessions'),
+    {}, 100);
+  const prompt = promptFor({
+    project: 'nacho-orch',
+    panel: 'sprints',
+    classification,
+    tool: { name: 'Read', command: '', filePath: '/home/nacho/bin/spawn-lane.sh' },
+  });
+  const result = classifyOrchIntent({
+    project: 'nacho-orch',
+    panel: 'sprints',
+    classification,
+    tool: { name: 'Read', command: '', filePath: '/home/nacho/bin/spawn-lane.sh' },
+  }, {
+    advisorText: JSON.stringify({
+      intent: 'boot_setup',
+      confidence: 0.95,
+      should_count: false,
+      action: 'allow',
+      operator_message: 'setup allowed',
+      reason: 'setup',
+    }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(prompt, /first_user/);
+  assert.match(prompt, /tool_name/);
+  assert.match(prompt, /tool_file_path/);
+  assert.match(prompt, /spawn-lane\.sh/);
+  assert.ok(!prompt.includes('anthropic-secret-value'));
+  assert.ok(!prompt.includes('openai-secret-value'));
+  assert.ok(!prompt.includes('gemini-secret-value'));
+});
+
+test('staged advisor module has no synchronous process or curl live inference path', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'src', 'orch-intent-classifier.js'), 'utf8');
+  assert.ok(!src.includes('spawnSync'));
+  assert.ok(!src.includes("spawnSync('curl'"));
+  assert.ok(!src.includes('child_process'));
+});
+
+test('smart advisor strict JSON validation rejects malformed schema', () => {
+  assert.equal(validateAdvisorJson('{"intent":"boot_setup","confidence":0.9,"should_count":false,"action":"allow","operator_message":"ok","reason":"boot"}').ok, true);
+  assert.equal(validateAdvisorJson('{"intent":"boot","confidence":0.9,"should_count":false,"action":"allow","operator_message":"ok","reason":"boot"}').reason, 'invalid_intent');
+  assert.equal(validateAdvisorJson('{"intent":"boot_setup","confidence":0.9,"should_count":"no","action":"allow","operator_message":"ok","reason":"boot"}').reason, 'invalid_should_count');
+  assert.equal(validateAdvisorJson('{"intent":"boot_setup","confidence":0.9,"should_count":false,"action":"allow","operator_message":"ok","reason":"has spaces"}').reason, 'invalid_reason');
+});
+
 test('orchControl.enabled false does not block protected-looking chatter', () => {
   const state = createEnforcementState({ nowMs: () => 1000 });
   const config = parseEnforcement(JSON.stringify({
@@ -300,7 +711,11 @@ test('orchControl.enabled false does not block protected-looking chatter', () =>
 
 test('protected counters do not reset on arbitrary non-control work-looking text', () => {
   const state = createEnforcementState({ nowMs: () => 1000 });
-  const config = configFor('aetheria', { panels: ['orch'] });
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
+  });
   const deps = guard(config, state);
 
   assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing for MISER_ASSIGNMENT=A'), null);
@@ -329,7 +744,7 @@ test('protected counters reset only on explicit assignment, approval, completion
     });
     const deps = guard(config, state);
     assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null, label);
-    assert.equal(call(deps, 'aetheria', 'orch', 'proposal mediation').status, 429, label);
+    assert.equal(call(deps, 'aetheria', 'orch', 'proposal mediation').status, 200, label);
     assert.equal(call(deps, 'aetheria', 'orch', resetText, {}, requestHeaders), null, label);
     assert.equal(call(deps, 'aetheria', 'orch', 'proposal follow-up'), null, label);
   }
@@ -421,12 +836,12 @@ test('assignment management warns at 2 and blocks after 3', () => {
 
   assert.equal(call(deps, 'aetheria', 'orch', 'proposal routing MISER_ASSIGNMENT=A'), null);
   const warn = call(deps, 'aetheria', 'orch', 'proposal mediation for builder audit');
-  assert.equal(warn.status, 429);
+  assert.equal(warn.status, 200);
   assert.equal(warn.headers['x-miser-enforcement-warning'], 'orch-assignment-budget-edge');
-  assert.equal(warn.body.error.type, 'miser_control_plane_error');
+  assert.match(controlText(warn), /miser_control_plane_error/);
   assert.equal(call(deps, 'aetheria', 'orch', 'proposal approval gate status'), null);
   const block = call(deps, 'aetheria', 'orch', 'proposal revision routing again');
-  assert.equal(block.status, 429);
+  assert.equal(block.status, 200);
   assert.equal(block.headers['x-miser-enforcement'], 'orch-assignment-budget');
 });
 
@@ -704,9 +1119,12 @@ test('historical oversized tool_result is not blocked unless strict latest-turn 
 
 test('redirect classifier marks ORCH gh run view as POLL_CI and shadow records without blocking', () => {
   const state = createEnforcementState({ nowMs: () => 1000 });
-  const config = parseEnforcement(JSON.stringify({
-    '*': { mode: 'observe', redirect: { mode: 'shadow' }, override: { overrideFile: TEST_OVERRIDE_FILE } },
-  }));
+  const config = configFor('aetheria', {
+    panels: ['orch'],
+    warnSelfWorkTurnsPerAssignment: 99,
+    maxSelfWorkTurnsPerAssignment: 99,
+  });
+  config.aetheria.redirect = { mode: 'shadow' };
   const deps = guard(config, state);
   const body = bashToolResultBody('gh run view 123 --log');
   const c = classifyRequest('aetheria', 'orch', body, { 'x-miser-poll-class': 'unlikely' }, 100);

@@ -93,8 +93,12 @@ function defaultAssignment(args) {
 
 function commonHeader(args, facts) {
   const assignment = args.assignment;
+  const bootSetup = args.kind === 'orch-dispatch'
+    ? ''
+    : 'PANEL_BOOT\n\nMiser setup note: the leading PANEL_BOOT line marks this as fresh panel boot/handoff setup, not an ORCH management continuation.\n\n';
   return `# ${args.project} ${args.kind} Prompt
 
+${bootSetup}
 Task: ${args.task}
 Project: ${args.project}
 MISER_ASSIGNMENT=${assignment}

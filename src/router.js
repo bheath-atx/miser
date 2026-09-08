@@ -297,10 +297,29 @@ function isTermDeckSuggestionMode(messages) {
   return text.startsWith('[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]');
 }
 
+function isClaudeCodeQuotaProbe(messages, body, incomingHeaders = {}) {
+  const beta = String(incomingHeaders['anthropic-beta'] || '');
+  if (!beta.includes('claude-code-')) return false;
+  if (!body || body.max_tokens !== 1) return false;
+  if (body.system != null) return false;
+  if (Array.isArray(body.tools) && body.tools.length > 0) return false;
+  if (!Array.isArray(messages) || messages.length !== 1) return false;
+  const msg = messages[0];
+  if (!msg || msg.role !== 'user') return false;
+  return textOnlyContent(msg.content).trim() === 'quota';
+}
+
 function writeSuggestionModeNoop(res, originalBody) {
   writeLocalAnthropicMessage(res, originalBody, '', {
     'x-miser-enforcement': 'suggestion-mode-zero-llm',
     'x-miser-enforcement-reason': 'termdeck-suggestion-mode-zero-llm',
+  });
+}
+
+function writeClaudeCodeQuotaProbeNoop(res, originalBody) {
+  writeLocalAnthropicMessage(res, originalBody, 'OK', {
+    'x-miser-enforcement': 'claude-code-quota-probe-zero-llm',
+    'x-miser-enforcement-reason': 'claude-code-quota-probe',
   });
 }
 
@@ -381,6 +400,12 @@ async function routeRequest(messages, originalBody, incomingHeaders, res, projec
   if (isTermDeckSuggestionMode(messages)) {
     console.log(`[miser] TermDeck suggestion mode zero-LLM noop project=${project || 'default'} panel=${panel || ''}`);
     writeSuggestionModeNoop(res, originalBody);
+    return;
+  }
+
+  if (isClaudeCodeQuotaProbe(messages, originalBody, incomingHeaders)) {
+    console.log(`[miser] Claude Code quota probe zero-LLM noop project=${project || 'default'} panel=${panel || ''}`);
+    writeClaudeCodeQuotaProbeNoop(res, originalBody);
     return;
   }
 
