@@ -24,6 +24,7 @@ const REDIRECT_ARTIFACT_CANDIDATES = Object.freeze({
   SWEEP_REPO: Object.freeze(['repo-sweep', 'repos', 'repo']),
   LOOP_SHELL: Object.freeze(['loop-shell', 'watch']),
 });
+const CONTROL_PLANE_STATUS = 200;
 const DEFAULT_POLICY = Object.freeze({
   mode: 'observe',
   scarceModeUsedWeeklyPct: 80,
@@ -60,6 +61,9 @@ const DEFAULT_POLICY = Object.freeze({
     approvalMarkers: Object.freeze(['BRAD_APPROVED_CONTINUE']),
     completionMarkers: Object.freeze(['ORCH-RESULT', 'TASK-COMPLETE', 'VERDICT=APPROVE']),
     handoffMarkers: Object.freeze(['COMPACT-STATE', 'HANDOFF-WRITTEN']),
+    bootSetupMarkers: Object.freeze(['MISER_BOOT_SETUP', 'ORCH_BOOT', 'PANEL_BOOT']),
+    bootSetupMaxAssistantTurns: 1,
+    bootSetupMaxMessages: 3,
     revisionMarkers: Object.freeze(['PROPOSAL_REVISION', 'REVISION_BRIEFING', 'REVISION_CYCLE', 'REVISE_PROPOSAL']),
     dispatchFinalizeMarker: 'DISPATCH_FINALIZE',
     dispatchSessionHeader: 'x-miser-dispatch-session',
@@ -261,7 +265,7 @@ function collectClassifierText(body, project, panel) {
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
   const latestUser = latestUserMessage(messages);
   const parts = [project || '', panel || ''];
-  if (latestUser) parts.push(textFromContent(latestUser.content));
+  if (latestUser) parts.push(stripClaudeCodeInjectedContext(textFromContent(latestUser.content)));
   for (let i = Math.max(0, messages.length - 12); i < messages.length; i++) {
     const msg = messages[i];
     if (!msg || !Array.isArray(msg.content)) continue;
@@ -322,10 +326,17 @@ function promptTextFromContent(content) {
   }).filter(Boolean).join('\n');
 }
 
+function stripClaudeCodeInjectedContext(text) {
+  return String(text || '')
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
+    .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/gi, '')
+    .trim();
+}
+
 function latestUserPromptText(body) {
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
   const latest = latestUserMessage(messages);
-  return latest ? promptTextFromContent(latest.content) : '';
+  return latest ? stripClaudeCodeInjectedContext(promptTextFromContent(latest.content)) : '';
 }
 
 function systemPromptHead(body, maxBytes = 2048) {
@@ -374,7 +385,7 @@ function terminalMessageShape(body) {
   const blocks = Array.isArray(latest.content) ? latest.content : [];
   const toolResult = blocks.find(block => block && block.type === 'tool_result');
   if (!toolResult) {
-    const text = promptTextFromContent(latest.content) || textFromContent(latest.content);
+    const text = stripClaudeCodeInjectedContext(promptTextFromContent(latest.content) || textFromContent(latest.content));
     const lower = text.toLowerCase();
     if (lower.includes('<task-notification>')
         || lower.includes('stop-hook')
@@ -422,21 +433,50 @@ function promptCommandCandidate(shape) {
   return text;
 }
 
-function deriveRole(body, project, panel) {
-  const haystack = [
-    project || '',
-    panel || '',
+function textHasExplicitNonOrchRole(text) {
+  const lower = String(text || '').toLowerCase();
+  if (!lower) return false;
+  return /\bnon[-_\s]?orch\b/.test(lower)
+    || /\bnot\s+(?:an?\s+)?orch\b/.test(lower)
+    || /\bdo\s+not\s+use\s+orch\s+behavior\b/.test(lower)
+    || /\bdo\s+not\s+coordinate\s+other\s+panels\b/.test(lower);
+}
+
+function lineHasPositiveOrchRole(line) {
+  const lower = String(line || '').toLowerCase();
+  if (!lower || textHasExplicitNonOrchRole(lower)) return false;
+  return /\b(?:you are|role:|role_label:)\b[^\n]*(?:\borch\b|\borchestrator\b)/.test(lower)
+    || /\b(?:project|live|temporary)\s+orch\b/.test(lower)
+    || /\borch-control\b/.test(lower)
+    || /\bmiser_assignment=/.test(lower)
+    || /\barchitect lane\b/.test(lower);
+}
+
+function hasExplicitNonOrchRoleSignal(body) {
+  const text = [
     systemPromptHead(body, 4096),
+    firstUserPromptText(body, 4096),
     latestUserPromptText(body),
-  ].join('\n').toLowerCase();
-  if (/\borch\b/.test(haystack)
-      || haystack.includes('orchestrator')
-      || haystack.includes('miser_assignment=')
-      || haystack.includes('orch-control')
-      || haystack.includes('architect lane')) {
+  ].join('\n');
+  return textHasExplicitNonOrchRole(text);
+}
+
+function deriveRole(body, project, panel) {
+  if (hasExplicitNonOrchRoleSignal(body)) return 'worker';
+  const panelLower = String(panel || '').toLowerCase();
+  if (['orch', 'architect', 'sprints'].includes(panelLower)) return 'ORCH';
+  const haystack = [
+    systemPromptHead(body, 4096),
+    firstUserPromptText(body, 4096),
+    latestUserPromptText(body),
+  ].join('\n');
+  if (haystack.split(/\r?\n/).some(lineHasPositiveOrchRole)) {
     return 'ORCH';
   }
-  if (haystack.includes('builder') || haystack.includes('codex builder') || haystack.includes('implementation lane')) {
+  const lower = haystack.toLowerCase();
+  if (lower.includes('miser_assignment=') || lower.includes('orch-control')) return 'ORCH';
+  if (lower.includes('builder') || lower.includes('codex builder') || lower.includes('implementation lane')
+      || lower.includes('auditor') || lower.includes('reviewer')) {
     return 'builder';
   }
   return 'unknown';
@@ -752,7 +792,7 @@ function latestToolResultStats(body) {
 
 function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 0) {
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
-  const latestText = latestUserText(body);
+  const latestText = stripClaudeCodeInjectedContext(latestUserText(body));
   const latestPromptText = latestUserPromptText(body);
   const classifierText = collectClassifierText(body, project, panel);
   const selfWorkText = [latestText, collectRecentToolText(body)].join('\n');
@@ -768,6 +808,8 @@ function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 
     commandClass: command.commandClass,
     terminalShape: command.terminalShape,
     redirectable: isRedirectableCommandClass(command.commandClass),
+    explicitNonOrchRole: hasExplicitNonOrchRoleSignal(body),
+    firstUserPromptText: firstUserPromptText(body),
     latestUserText: latestText,
     latestUserPromptText: latestPromptText,
     pollClass: compactHeaders['x-miser-poll-class'] || compactHeaders['X-Miser-Poll-Class'] || 'unknown',
@@ -845,6 +887,8 @@ function createEnforcementState(opts = {}) {
         lastSeenAt: null,
         lastAssistantTurns: 0,
         lastMessageCount: 0,
+        lastConversationFingerprint: null,
+        lastTerminalShape: null,
         lastCountedAt: null,
         lastCountedFingerprint: null,
         freshInput: 0,
@@ -900,6 +944,16 @@ function createEnforcementState(opts = {}) {
     const turnDrop = opts.newConversationAssistantTurnDrop ?? DEFAULT_POLICY.orchControl.newConversationAssistantTurnDrop;
     if (st.lastAssistantTurns >= turnDrop && classification.assistantTurns <= 1) return true;
     if (st.lastMessageCount >= 12 && classification.messageCount > 0 && classification.messageCount + 4 < st.lastMessageCount) return true;
+    if (st.lastConversationFingerprint
+        && classification.conversationFingerprint
+        && st.lastConversationFingerprint !== classification.conversationFingerprint
+        && st.lastTerminalShape !== 'tool_result'
+        && (st.lastAssistantTurns > 0 || st.lastMessageCount > 1)
+        && classification.assistantTurns <= 1
+        && classification.messageCount > 0
+        && classification.messageCount <= 3) {
+      return true;
+    }
     return false;
   }
 
@@ -956,6 +1010,8 @@ function createEnforcementState(opts = {}) {
     st.lastSeenAt = now;
     st.lastAssistantTurns = classification.assistantTurns;
     st.lastMessageCount = classification.messageCount;
+    st.lastConversationFingerprint = classification.conversationFingerprint || st.lastConversationFingerprint;
+    st.lastTerminalShape = classification.terminalShape || st.lastTerminalShape;
     const duplicateCountedTurn = opts.countedManagement && isDuplicateCountedTurn(st, classification, now, opts);
     const countsForPoll = opts.protectedPanel ? opts.countedManagement : classification.isControl;
     const countsForControl = opts.protectedPanel ? opts.countedManagement && classification.isControl : classification.isControl;
@@ -967,7 +1023,8 @@ function createEnforcementState(opts = {}) {
       st.controlTurns += 1;
       st.controlAt.push(now);
     }
-    if (opts.protectedPanel && opts.countedManagement && classification.selfWorkCommandLike && !duplicateCountedTurn) {
+    const selfWorkTurn = classification.selfWorkCommandLike || classification.commandClass === 'SELF_WORK';
+    if (opts.protectedPanel && opts.countedManagement && selfWorkTurn && !duplicateCountedTurn) {
       st.selfWorkTurns += 1;
       st.selfWorkAt.push(now);
     }
@@ -1098,7 +1155,7 @@ function orchControlApplies(panel, policy) {
 
 function isCountedOrchManagementTurn(policy, classification) {
   const orch = policy.orchControl || {};
-  if (classification.selfWorkCommandLike) return true;
+  if (classification.selfWorkCommandLike || classification.commandClass === 'SELF_WORK') return true;
   if (classification.isControl) {
     const classes = Array.isArray(orch.controlClasses) ? orch.controlClasses : [];
     if (classes.length === 0) return true;
@@ -1121,6 +1178,103 @@ function isCompletionTurn(policy, text, headers) {
 function isHandoffMarkedTurn(policy, text, headers) {
   return !!extractAssignmentId(policy, text, headers)
     && hasControlLineMarker(text, (policy.orchControl || {}).handoffMarkers);
+}
+
+function isBootSetupMarkedTurn(policy, text) {
+  return hasControlLineMarker(text, (policy.orchControl || {}).bootSetupMarkers);
+}
+
+function textLooksBootSetupLike(policy, classification) {
+  const text = classification.latestUserPromptText || '';
+  if (isBootSetupMarkedTurn(policy, text)) return true;
+  const lower = text.toLowerCase();
+  if (!lower) return false;
+  const bootOrHandoff = /\b(boot|handoff|compact-state|rotation|successor|predecessor)\b/.test(lower)
+    || /read\s+\S*(?:handoff|boot|compact)/.test(lower);
+  if (!bootOrHandoff) return false;
+  const setupOrAck = lower.includes('reply in one short sentence')
+    || lower.includes('then wait')
+    || lower.includes('waiting for operator')
+    || lower.includes('coordinate only')
+    || lower.includes('do not run tools')
+    || lower.includes('do not run local')
+    || /\b(read|load|resume|start|online)\b/.test(lower);
+  const panelIdentity = /\b(you are|orch|orchestrator|architect|builder|auditor|canary|panel)\b/.test(lower);
+  return setupOrAck && panelIdentity;
+}
+
+function isBootSetupTurn(policy, classification) {
+  const orch = policy.orchControl || {};
+  const maxAssistantTurns = orch.bootSetupMaxAssistantTurns ?? DEFAULT_POLICY.orchControl.bootSetupMaxAssistantTurns;
+  const maxMessages = orch.bootSetupMaxMessages ?? DEFAULT_POLICY.orchControl.bootSetupMaxMessages;
+  if (!['real_user_text', 'notification'].includes(classification.terminalShape)) return false;
+  if (classification.assistantTurns > maxAssistantTurns) return false;
+  if (classification.messageCount > maxMessages) return false;
+  if (classification.pollingCommandLike || classification.selfWorkCommandLike || classification.commandClass === 'SELF_WORK') return false;
+  return textLooksBootSetupLike(policy, classification);
+}
+
+const SAFE_BOOT_SETUP_READ_BASENAMES = new Set([
+  'spawn-lane.sh',
+  'boot-inject.sh',
+  'make-lane-prompt.js',
+  'orch-dispatch.sh',
+  'orch-followup.sh',
+  'CLAUDE.md',
+  'README.md',
+]);
+
+function safeBootSetupReadPath(filePath) {
+  const s = String(filePath || '');
+  if (!s || s.includes('\0')) return false;
+  const lower = s.toLowerCase();
+  if (/(?:^|\/)\.(?:ssh|termdeck|config|gnupg|aws|claude)(?:\/|$)/.test(lower)) return false;
+  return SAFE_BOOT_SETUP_READ_BASENAMES.has(path.basename(s));
+}
+
+function firstPromptLooksManualBootSetup(classification) {
+  const lower = String(classification.firstUserPromptText || '').toLowerCase();
+  if (!lower) return false;
+  if (!/\b(you are|role:|temporary|coordinator|orchestrator|orch)\b/.test(lower)) return false;
+  if (!/\borch\b|orchestrator/.test(lower)) return false;
+  const setup = /\b(boot|setup|manual|spawn|launcher|launch|first response|first response format|read only the minimal|minimal launcher)\b/.test(lower);
+  const bounded = /\b(coordinate|not the builder|do not edit|do not run inline|do not inspect secrets|do not poll|read only the minimal|propose|wait)\b/.test(lower);
+  return setup && bounded;
+}
+
+function isFreshBootSetupRead(policy, classification, body) {
+  const orch = policy.orchControl || {};
+  const maxAssistantTurns = Math.max(2, orch.bootSetupMaxAssistantTurns ?? DEFAULT_POLICY.orchControl.bootSetupMaxAssistantTurns);
+  const maxMessages = Math.max(4, orch.bootSetupMaxMessages ?? DEFAULT_POLICY.orchControl.bootSetupMaxMessages);
+  if (classification.assistantTurns > maxAssistantTurns) return false;
+  if (classification.messageCount > maxMessages) return false;
+  const shape = terminalMessageShape(body);
+  const tool = extractToolCommand(shape.toolUse);
+  if (shape.kind !== 'tool_result') return false;
+  if (String(tool.name || '').toLowerCase() !== 'read') return false;
+  if (!safeBootSetupReadPath(tool.filePath)) return false;
+  return firstPromptLooksManualBootSetup(classification);
+}
+
+function hardSafetyReason(classification, body = null) {
+  const shape = body ? terminalMessageShape(body) : null;
+  const tool = shape ? extractToolCommand(shape.toolUse) : { name: '', command: '', filePath: '' };
+  const prompt = shape ? promptCommandCandidate(shape) : (classification.latestUserPromptText || '');
+  const commandish = normalizedText(tool.command || prompt).toLowerCase();
+  const filePath = String(tool.filePath || '').toLowerCase();
+  if (filePath && /(?:^|\/)\.(?:ssh|termdeck)(?:\/|$)|(?:^|\/)\.claude\.json$|(?:^|\/)\.gitconfig$/.test(filePath)) {
+    return 'sensitive-file-read';
+  }
+  if (/(^|\s)(env|printenv|export|set)(\s|$)/.test(commandish)
+      && /(secret|token|key|password|credential|anthropic|openai|termdeck)/.test(commandish)) return 'sensitive-env';
+  if (/\b(?:cat|sed|nl|rg|grep|find|ls)\b[\s\S]*(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/.test(commandish)) return 'sensitive-file-read';
+  if (/\brg\b[\s\S]*(?:secret|token|password|credential)[\s\S]*\/home\/nacho\b/.test(commandish)) return 'broad-secret-search';
+  if (/\bgit\s+branch\b[\s\S]*(?:-d|-D|--delete)\b/.test(commandish)) return 'destructive-git-branch';
+  if (/\bgit\s+(?:commit|push|merge)\b/.test(commandish)) return 'git-write-operation';
+  if (/\bgh\s+pr\s+(?:create|merge)\b/.test(commandish)) return 'pr-write-operation';
+  if (/\bsystemctl\b[\s\S]*(?:restart|stop|start|reload)\b/.test(commandish)) return 'service-mutation';
+  if (/\bcodex\s+exec\b/.test(commandish)) return 'direct-codex-exec';
+  return '';
 }
 
 function hasDispatchSessionMarker(policy, text, headers) {
@@ -1178,35 +1332,49 @@ function consumePostCapBoundaryAllowance(policy, classification, headers, st) {
 }
 
 function responseStatusFor(mode, reason) {
-  if (mode === 'throttle') return reason === 'poll-budget' ? 429 : 429;
-  return 403;
+  return CONTROL_PLANE_STATUS;
 }
 
 function buildEnforcementResponse(reason, mode, message, retryAfter = null) {
   const status = responseStatusFor(mode, reason);
   const headers = {
     'content-type': 'application/json',
+    'x-miser-control-plane': reason,
     'x-miser-enforcement': reason,
     'x-miser-enforcement-mode': mode,
   };
   if (status === 429 && retryAfter) headers['retry-after'] = String(retryAfter);
+  if (status !== 429) {
+    return buildControlPlaneSyntheticResponse({
+      reason,
+      mode,
+      message,
+      headers,
+      operatorAction: 'operator_boundary_or_out_of_band_control_required',
+      panelAction: 'Do not retry this request from this panel; stop the control-loop and wait for operator/control-plane input.',
+      enforcement: { reason, mode, status, control: true },
+    });
+  }
   return {
-    status,
+    status: 429,
     headers,
     body: {
       type: 'error',
       error: {
-        type: status === 429 ? 'rate_limit_error' : 'invalid_request_error',
+        type: 'rate_limit_error',
         message,
       },
     },
-    enforcement: { reason, mode, status },
+    enforcement: { reason, mode, status: 429 },
   };
 }
 
 function buildWarningResponse(reason, mode, message) {
-  return {
-    status: 429,
+  const panelAction = 'Do not retry this request from this panel; stop the control-loop and wait for an operator/out-of-band dispatch.';
+  return buildControlPlaneSyntheticResponse({
+    reason,
+    mode,
+    message: `${message}; ${panelAction}`,
     headers: {
       'content-type': 'application/json',
       'x-miser-control-plane': reason,
@@ -1214,18 +1382,10 @@ function buildWarningResponse(reason, mode, message) {
       'x-miser-enforcement-warning': reason,
       'x-miser-enforcement-mode': mode,
     },
-    body: {
-      type: 'error',
-      error: {
-        type: 'miser_control_plane_error',
-        reason,
-        message,
-        mode,
-        operator_action: 'operator_boundary_or_out_of_band_control_required',
-      },
-    },
-    enforcement: { reason, mode, status: 429, warning: false, control: true },
-  };
+    operatorAction: 'operator_boundary_or_out_of_band_control_required',
+    panelAction,
+    enforcement: { reason, mode, status: CONTROL_PLANE_STATUS, warning: false, control: true },
+  });
 }
 
 function syntheticText(text) {
@@ -1301,6 +1461,40 @@ function buildSyntheticSseResponse(originalBody = {}, text = '', opts = {}) {
     }),
     anthropicSseFrame('message_stop', { type: 'message_stop' }),
   ].join('');
+}
+
+function buildControlPlaneText(fields) {
+  const lines = [
+    `[MISER-CONTROL] error.type=miser_control_plane_error; reason=${fields.reason}; mode=${fields.mode}; retryable=false.`,
+    `message: ${fields.message}`,
+  ];
+  if (fields.commandClass) lines.push(`command_class: ${fields.commandClass}`);
+  if (fields.artifact) {
+    lines.push(`artifact: ${fields.artifact.path} (${fields.artifact.state || 'unknown'})`);
+  }
+  if (fields.operatorAction) lines.push(`operator_action: ${fields.operatorAction}`);
+  if (fields.operatorMessage) lines.push(`operator_message: ${fields.operatorMessage}`);
+  if (fields.panelAction) lines.push(`panel_action: ${fields.panelAction}`);
+  return lines.join('\n');
+}
+
+function buildControlPlaneSyntheticResponse(opts) {
+  const headers = {
+    'content-type': 'application/json',
+    ...opts.headers,
+  };
+  const body = buildSyntheticMessageResponse(opts.originalBody || {}, buildControlPlaneText(opts), opts.messageOpts || {});
+  return {
+    status: CONTROL_PLANE_STATUS,
+    headers,
+    body,
+    enforcement: {
+      ...(opts.enforcement || {}),
+      status: CONTROL_PLANE_STATUS,
+      control: true,
+      synthetic: true,
+    },
+  };
 }
 
 function forcedToolChoice(body) {
@@ -1414,13 +1608,27 @@ function trimSyntheticArtifactText(text, maxBytes = 16 * 1024) {
 function redirectControlMessage(mode, classification, artifact) {
   const commandClass = classification.commandClass || 'UNKNOWN';
   const artifactPath = artifact && artifact.path ? artifact.path : fallbackArtifactPath((artifactCandidates(commandClass)[0]));
+  const prefix = `miser control-plane redirect blocked ${commandClass}`;
   if (!artifact || artifact.missing) {
-    return `miser control-plane redirect blocked ${commandClass}: watcher artifact missing at ${artifactPath}`;
+    return `${prefix}: watcher artifact missing at ${artifactPath}; do not retry from this panel`;
   }
   if (artifact.stale || artifact.state === 'stale') {
-    return `miser control-plane redirect blocked ${commandClass}: watcher artifact stale at ${artifactPath}`;
+    return `${prefix}: watcher artifact stale at ${artifactPath}; do not retry from this panel`;
   }
-  return `miser control-plane redirect blocked ${commandClass}: read watcher artifact outside the model transcript at ${artifactPath}`;
+  return `${prefix}: read watcher artifact outside the model transcript at ${artifactPath}; do not retry from this panel`;
+}
+
+function redirectOperatorMessage(classification, artifact) {
+  const commandClass = classification.commandClass || 'UNKNOWN';
+  if (!artifact || artifact.missing || artifact.stale || artifact.state === 'stale') {
+    return `Refresh or repair the ${artifact && artifact.id ? artifact.id : commandClass} watcher artifact out-of-band, then inject a compact result or next assignment.`;
+  }
+  return `Read ${artifact.path} out-of-band, then inject a compact result or next assignment; the model panel should not run ${commandClass}.`;
+}
+
+function redirectPanelAction(classification) {
+  const commandClass = classification.commandClass || 'UNKNOWN';
+  return `Stop. Do not retry or run ${commandClass} from this panel; wait for operator/control-plane input.`;
 }
 
 function buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body) {
@@ -1432,6 +1640,8 @@ function buildRedirectResponse(project, panel, policy, classification, state, gu
   const reason = 'zero-llm-redirect';
   const artifactStateValue = artifact.state || (artifact.missing ? 'missing' : 'unknown');
   const message = redirectControlMessage(redirectMode, classification, artifact);
+  const operatorMessage = redirectOperatorMessage(classification, artifact);
+  const panelAction = redirectPanelAction(classification);
   const event = {
     decision: 'control_error',
     reason,
@@ -1466,42 +1676,38 @@ function buildRedirectResponse(project, panel, policy, classification, state, gu
     'x-miser-enforcement': reason,
     'x-miser-enforcement-reason': reason,
   };
-  return {
-    status: 429,
+  return buildControlPlaneSyntheticResponse({
+    reason,
+    mode: redirectMode,
+    message,
     headers,
-    body: {
-      type: 'error',
-      error: {
-        type: 'miser_control_plane_error',
-        reason,
-        message,
-        command_class: classification.commandClass,
-        mode: redirectMode,
-        artifact: {
-          id: artifact.id,
-          path: artifact.path,
-          state: artifactStateValue,
-          missing: artifact.missing === true,
-          stale: artifact.stale === true,
-        },
-        operator_action: artifact.missing || artifact.stale
-          ? 'refresh_or_repair_watcher_out_of_band'
-          : 'read_watcher_artifact_out_of_band',
-      },
+    originalBody: body,
+    commandClass: classification.commandClass,
+    artifact: {
+      id: artifact.id,
+      path: artifact.path,
+      state: artifactStateValue,
+      missing: artifact.missing === true,
+      stale: artifact.stale === true,
     },
+    operatorAction: artifact.missing || artifact.stale
+      ? 'refresh_or_repair_watcher_out_of_band'
+      : 'read_watcher_artifact_out_of_band',
+    operatorMessage,
+    panelAction,
     enforcement: {
       reason,
       mode: redirectMode,
-      status: 429,
+      status: CONTROL_PLANE_STATUS,
       warning: false,
-      synthetic: false,
+      synthetic: true,
       redirect: true,
       commandClass: classification.commandClass,
       artifactPath: artifact.path,
       artifactMissing: artifact.missing === true,
       artifactState: artifactStateValue,
     },
-  };
+  });
 }
 
 function maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps) {
@@ -1585,23 +1791,42 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
 
   const state = guardDeps.enforcementState || defaultState;
   const classification = classifyRequest(project, panel, body, compactHeaders, rawTokens);
-  maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps);
   const promptText = classification.latestUserPromptText || '';
   classification.revisionLike = textLooksRevisionLike(promptText, policy.orchControl && policy.orchControl.revisionMarkers);
   classification.handoffMarked = isHandoffMarkedTurn(policy, promptText, requestHeaders);
-  const protectedPanel = orchControlApplies(panel, policy);
-  const countedManagement = protectedPanel && isCountedOrchManagementTurn(policy, classification);
+  const protectedPanel = orchControlApplies(panel, policy) && classification.explicitNonOrchRole !== true;
+  const redirectEligible = classification.explicitNonOrchRole !== true && classification.role === 'ORCH';
+  if (redirectEligible) maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps);
+  const hardReason = protectedPanel ? hardSafetyReason(classification, body) : '';
+  if (hardReason && !overrideActive) {
+    return maybeBlock(project, panel, policy, classification, state, guardDeps,
+      'orch-hard-safety',
+      `miser: deterministic ORCH hard safety block (${hardReason}); use an approved out-of-band lane or operator action`,
+      600);
+  }
+  classification.bootSetupTurn = protectedPanel && isBootSetupTurn(policy, classification);
+  if (protectedPanel && !classification.bootSetupTurn && isFreshBootSetupRead(policy, classification, body)) {
+    classification.bootSetupTurn = true;
+    classification.selfWorkCommandLike = false;
+    classification.managementLike = false;
+    classification.pollingCommandLike = false;
+    classification.isControl = false;
+    classification.controlClasses = [];
+  }
+  const countedManagement = protectedPanel && !classification.bootSetupTurn && isCountedOrchManagementTurn(policy, classification);
   const assignmentId = protectedPanel ? extractAssignmentId(policy, promptText, requestHeaders) : '';
   const resetAssignment = protectedPanel && (
     overrideActive
     || isApprovalTurn(policy, promptText, requestHeaders)
     || isCompletionTurn(policy, promptText, requestHeaders)
     || classification.handoffMarked
+    || classification.bootSetupTurn
   );
   const resetAllowances = protectedPanel && (
     overrideActive
     || isApprovalTurn(policy, promptText, requestHeaders)
     || isCompletionTurn(policy, promptText, requestHeaders)
+    || classification.bootSetupTurn
   );
   const st = state.recordRequest(project, panel, classification, {
     protectedPanel,
@@ -1616,7 +1841,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
   pruneTimes(st.controlAt, now - 60 * 60 * 1000);
 
-  const redirect = buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body);
+  const redirect = redirectEligible ? buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body) : null;
   if (redirect) return redirect;
 
   if (overrideActive) return null;
@@ -1664,14 +1889,15 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
 
     const selfWorkWarnAt = policy.orchControl.warnSelfWorkTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.warnSelfWorkTurnsPerAssignment;
     const maxSelfWork = policy.orchControl.maxSelfWorkTurnsPerAssignment ?? DEFAULT_POLICY.orchControl.maxSelfWorkTurnsPerAssignment;
-    if (classification.selfWorkCommandLike && st.selfWorkTurns > maxSelfWork) {
+    const selfWorkTurn = classification.selfWorkCommandLike || classification.commandClass === 'SELF_WORK';
+    if (selfWorkTurn && st.selfWorkTurns > maxSelfWork) {
       if (consumePostCapBoundaryAllowance(policy, classification, requestHeaders, st)) return null;
       return maybeBlock(project, panel, policy, classification, state, guardDeps,
         'orch-self-work-budget',
         'miser: ORCH self-work budget exceeded; dispatch to a builder/auditor, write a compact handoff, or get explicit Brad approval before more repo/CI/file/plugin work',
         600);
     }
-    if (classification.selfWorkCommandLike && st.selfWorkTurns === selfWorkWarnAt && !st.selfWorkWarningSent) {
+    if (selfWorkTurn && st.selfWorkTurns === selfWorkWarnAt && !st.selfWorkWarningSent) {
       st.selfWorkWarningSent = true;
       return maybeWarn(project, panel, policy, classification, state, guardDeps,
         'orch-self-work-budget-edge',

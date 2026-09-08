@@ -189,9 +189,30 @@ make-lane-prompt \
 Supported `--kind` values: `orch-dispatch`, `codex-builder`, `codex-audit`, `grok-audit`,
 `claude-architect`.
 
-Generated ORCH prompts cap pre-dispatch tool use and forbid source/CI/fleet inspection. Generated
-builder and audit prompts include compact `SUMMARY`/`ORCH-RESULT`, notify-back, and stop contracts
-compatible with `spawn-lane.sh` boot validation.
+Generated ORCH dispatch prompts cap pre-dispatch tool use and forbid source/CI/fleet inspection.
+Generated builder, audit, and architect boot prompts include a leading `PANEL_BOOT` setup marker,
+compact `SUMMARY`/`ORCH-RESULT`, notify-back, and stop contracts compatible with `spawn-lane.sh`
+boot validation.
+
+When hand-writing a fresh Claude ORCH/architect boot or handoff prompt, include an own-line
+`MISER_BOOT_SETUP` or `PANEL_BOOT` marker before the role instructions. Miser treats that as
+fresh panel setup only on low-turn real prompts; explicit polling, repo status, and self-work still
+hit the normal ORCH caps.
+Miser also infers one narrow marker-less fresh manual setup shape: a low-turn protected ORCH Read of
+a known launcher/setup file, such as `/home/nacho/bin/spawn-lane.sh`, when the first user prompt is
+clearly a bounded ORCH boot/setup prompt. That prevents launcher source text containing `curl`, `git`,
+`gh`, or `npm test` examples from consuming ORCH self-work budget. The local ORCH intent classifier
+module is currently staged as nonblocking prompt/JSON-validation scaffolding only; it does not run a
+local command or Ollama from the live request path. Invalid or absent advisory JSON has no live effect
+and deterministic enforcement remains authoritative.
+Deterministic hard safety blocks for sensitive reads, destructive git, service mutations, PR writes,
+direct `codex exec`, polling, and obvious ORCH self-work are evaluated before any staged advisory
+state.
+`spawn-lane.sh` routes Claude commands through Miser automatically and stages the route into the
+target cwd's `.claude/settings.local.json`, which Claude Code needs in addition to process env.
+Labels/roles containing `ORCH`, `architect`, or `sprints` use `/p/<project>--<panel>/v1/messages`;
+plain worker labels use `/p/<project>/v1/messages`. ORCH boot files are refused before spawn/inject
+unless they contain an own-line `MISER_BOOT_SETUP`, `ORCH_BOOT`, or `PANEL_BOOT` marker.
 
 For routine operator use, `orch-dispatch.sh` wraps prompt generation, active ORCH lookup, and
 TermDeck injection in one command:

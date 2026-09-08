@@ -30,11 +30,17 @@ function setupFixture(t, opts = {}) {
   fs.writeFileSync(path.join(termdeck, 'config.yaml'), 'token: test-token\n', 'utf8');
 
   const bootFile = path.join(root, 'boot.md');
+  const orchBootFile = path.join(root, 'orch-boot.md');
   const badBootFile = path.join(root, 'bad-boot.md');
   const noSummaryBootFile = path.join(root, 'no-summary-boot.md');
   fs.writeFileSync(
     bootFile,
     'Use td-inject.sh to notify-back dispatcher-session-id.\nWrite a compact artifact and ORCH-RESULT.\n',
+    'utf8',
+  );
+  fs.writeFileSync(
+    orchBootFile,
+    'PANEL_BOOT\nYou are the project ORCH. Read the handoff, reply online, then wait. Do not run tools.\n',
     'utf8',
   );
   fs.writeFileSync(badBootFile, 'Do some work without a completion contract.\n', 'utf8');
@@ -46,12 +52,21 @@ function setupFixture(t, opts = {}) {
   writeExecutable(path.join(fakeBin, 'curl'), `#!/usr/bin/env bash
 set -euo pipefail
 url=""
+payload=""
+prev=""
 for arg in "$@"; do
+  if [[ "$prev" == "-d" ]]; then
+    payload="$arg"
+  fi
   case "$arg" in
     http://*|https://*) url="$arg" ;;
   esac
+  prev="$arg"
 done
 echo "url $url" >> "$FAKE_CURL_LOG"
+if [[ -n "$payload" ]]; then
+  echo "payload $payload" >> "$FAKE_CURL_LOG"
+fi
 if [[ "$url" == */api/sessions/*/input ]]; then
   echo "input $url" >> "$FAKE_CURL_LOG"
   if [[ "\${FAKE_CURL_MODE:-success}" == "input-fail" ]]; then
@@ -102,12 +117,16 @@ if [[ "$url" == */api/sessions/* ]]; then
   if [[ -n "\${FAKE_TOUCH_CODEX_TRANSCRIPT_PATH:-}" ]]; then
     touch "$FAKE_TOUCH_CODEX_TRANSCRIPT_PATH"
   fi
+  reply_count="\${FAKE_REPLY_COUNT:-2}"
+  if [[ -n "\${FAKE_REPLY_COUNT_ADVANCE_AFTER:-}" && "$count" -ge "\${FAKE_REPLY_COUNT_ADVANCE_AFTER}" ]]; then
+    reply_count="\${FAKE_REPLY_COUNT_ADVANCED:-1}"
+  fi
   printf '{"meta":{"status":"%s","statusDetail":"%s","lastActivity":"%s","requestCount":%s,"replyCount":%s}}\\n' \
     "$status" \
     "\${FAKE_STATUS_DETAIL:-}" \
     "\${FAKE_LAST_ACTIVITY:-2026-08-30T00:00:00Z}" \
     "\${FAKE_REQUEST_COUNT:-0}" \
-    "\${FAKE_REPLY_COUNT:-2}"
+    "$reply_count"
   exit 0
 fi
 echo "unexpected $url" >> "$FAKE_CURL_LOG"
@@ -134,6 +153,10 @@ exit 2
   }
   if (opts.pollCount !== null) env.MISER_BOOT_INJECT_POLL_COUNT = String(opts.pollCount || 1);
   if (opts.thinkingAfterStatus) env.FAKE_THINKING_AFTER_STATUS = String(opts.thinkingAfterStatus);
+  if (opts.replyCount !== undefined) env.FAKE_REPLY_COUNT = String(opts.replyCount);
+  if (opts.replyCountAdvanceAfter) env.FAKE_REPLY_COUNT_ADVANCE_AFTER = String(opts.replyCountAdvanceAfter);
+  if (opts.replyCountAdvanced !== undefined) env.FAKE_REPLY_COUNT_ADVANCED = String(opts.replyCountAdvanced);
+  if (opts.inputBufferLength !== undefined) env.FAKE_INPUT_BUFFER_LENGTH = String(opts.inputBufferLength);
   if (opts.codexTranscript) {
     env.FAKE_CODEX_TRANSCRIPT_CWD = cwd;
     env.FAKE_CODEX_TRANSCRIPT_AFTER_STATUS = String(opts.codexTranscriptAfterStatus || 1);
@@ -143,7 +166,7 @@ exit 2
   }
   delete env.TERMDECK_BASE;
 
-  return { root, home, cwd, bootFile, badBootFile, noSummaryBootFile, curlLog, sleepLog, artifacts, env };
+  return { root, home, cwd, bootFile, orchBootFile, badBootFile, noSummaryBootFile, curlLog, sleepLog, artifacts, env };
 }
 
 function runScript(script, args, env) {
@@ -177,6 +200,10 @@ function codexRolloutDir(home) {
   const month = String(now.getUTCMonth() + 1).padStart(2, '0');
   const day = String(now.getUTCDate()).padStart(2, '0');
   return path.join(home, '.codex', 'sessions', year, month, day);
+}
+
+function cwdClaudeSettings(cwd) {
+  return JSON.parse(fs.readFileSync(path.join(cwd, '.claude', 'settings.local.json'), 'utf8'));
 }
 
 function writeCodexRollout(file, cwd) {
@@ -249,7 +276,8 @@ test('spawn-lane child-created but boot-unconfirmed writes artifact without dupl
   assert.match(res.stderr, /failure artifact: .+boot-unconfirmed-child-1\.md/);
   assert.equal(countLog(f.curlLog, 'spawn '), 1);
   assert.equal(countLog(f.curlLog, 'input '), 2);
-  assert.equal(countLog(f.curlLog, 'status '), 4);
+  // 1 pre-injection baseline-reply-count capture + 4 poll-loop iterations
+  assert.equal(countLog(f.curlLog, 'status '), 5);
 
   const ledger = fs.readFileSync(path.join(f.home, '.termdeck', 'lane-spawns.jsonl'), 'utf8')
     .trim()
@@ -298,6 +326,34 @@ test('spawn-lane codex boot confirms from fresh Codex transcript without thinkin
   assert.equal(countLog(f.curlLog, 'spawn '), 1);
   assert.equal(countLog(f.curlLog, 'input '), 2);
   assert.equal(countLog(f.curlLog, 'status '), 1);
+  assert.equal(fs.existsSync(artifactPath(f)), false);
+});
+
+test('spawn-lane confirms a fast-completing non-Codex panel via active_empty_buffer_reply_seen', (t) => {
+  const f = setupFixture(t, {
+    status: 'active',
+    pollCount: 5,
+    replyCount: 0,
+    replyCountAdvanceAfter: 2,
+    replyCountAdvanced: 1,
+    inputBufferLength: 0,
+  });
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'aetheria',
+    '--label', 'T1-builder',
+    '--cwd', f.cwd,
+    '--boot', f.bootFile,
+    '--base', 'http://127.0.0.1:3200',
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), 'child-1');
+  assert.match(res.stderr, /confirmed_by=active_empty_buffer_reply_seen/);
+  assert.equal(countLog(f.curlLog, 'spawn '), 1);
+  assert.equal(countLog(f.curlLog, 'input '), 2);
+  // 1 pre-injection baseline capture (replyCount=0) + 1 loop iteration (replyCount=1, advanced)
+  assert.equal(countLog(f.curlLog, 'status '), 2);
   assert.equal(fs.existsSync(artifactPath(f)), false);
 });
 
@@ -421,6 +477,100 @@ test('boot-inject performs max one successful boot POST while waiting for slow c
   assert.match(res.stderr, /boot prompt confirmed landed/);
 });
 
+test('boot-inject confirms a fast-completing panel via active_empty_buffer_reply_seen', (t) => {
+  const f = setupFixture(t, {
+    status: 'active',
+    pollCount: 5,
+    replyCount: 0,
+    replyCountAdvanceAfter: 2,
+    replyCountAdvanced: 2,
+    inputBufferLength: 0,
+  });
+  const res = runScript('boot-inject.sh', [
+    '--child', 'child-1',
+    '--boot', f.bootFile,
+    '--parent', 'parent-1',
+    '--base', 'http://127.0.0.1:3200',
+    '--project', 'aetheria',
+    '--label', 'T1-builder',
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stderr, /confirmed_by=active_empty_buffer_reply_seen/);
+  // 1 pre-injection baseline capture (replyCount=0) + 1 loop iteration (replyCount=2, advanced)
+  assert.equal(countLog(f.curlLog, 'status '), 2);
+});
+
+test('boot-inject still fails closed for idle status with an empty buffer', (t) => {
+  const f = setupFixture(t, {
+    status: 'idle',
+    pollCount: 2,
+    replyCount: 3,
+    inputBufferLength: 0,
+  });
+  const res = runScript('boot-inject.sh', [
+    '--child', 'child-1',
+    '--boot', f.bootFile,
+    '--parent', 'parent-1',
+    '--base', 'http://127.0.0.1:3200',
+    '--project', 'aetheria',
+    '--label', 'T1-builder',
+  ], f.env);
+
+  assert.notEqual(res.status, 0);
+  const artifact = fs.readFileSync(artifactPath(f), 'utf8');
+  assert.match(artifact, /confirmed_by: none/);
+  assert.match(artifact, /last_status: idle/);
+});
+
+test('boot-inject still fails closed for active status with a non-empty input buffer', (t) => {
+  const f = setupFixture(t, {
+    status: 'active',
+    pollCount: 2,
+    replyCount: 0,
+    replyCountAdvanceAfter: 1,
+    replyCountAdvanced: 3,
+    inputBufferLength: 12,
+  });
+  const res = runScript('boot-inject.sh', [
+    '--child', 'child-1',
+    '--boot', f.bootFile,
+    '--parent', 'parent-1',
+    '--base', 'http://127.0.0.1:3200',
+    '--project', 'aetheria',
+    '--label', 'T1-builder',
+  ], f.env);
+
+  assert.notEqual(res.status, 0);
+  const artifact = fs.readFileSync(artifactPath(f), 'utf8');
+  assert.match(artifact, /confirmed_by: none/);
+  assert.match(artifact, /last_status: active/);
+  assert.match(artifact, /input_buffer_length: 12/);
+});
+
+test('boot-inject still fails closed for active status with no reply/activity evidence', (t) => {
+  const f = setupFixture(t, {
+    status: 'active',
+    pollCount: 2,
+    replyCount: 0,
+    inputBufferLength: 0,
+  });
+  const res = runScript('boot-inject.sh', [
+    '--child', 'child-1',
+    '--boot', f.bootFile,
+    '--parent', 'parent-1',
+    '--base', 'http://127.0.0.1:3200',
+    '--project', 'aetheria',
+    '--label', 'T1-builder',
+  ], f.env);
+
+  assert.notEqual(res.status, 0);
+  const artifact = fs.readFileSync(artifactPath(f), 'utf8');
+  assert.match(artifact, /confirmed_by: none/);
+  assert.match(artifact, /last_status: active/);
+  assert.match(artifact, /termdeck_reply_count: 0/);
+});
+
 test('boot-inject default post-success confirmation window preserves about 120 seconds', (t) => {
   const f = setupFixture(t, { status: 'idle', pollCount: null, defaultTiming: true });
   const res = runScript('boot-inject.sh', [
@@ -434,7 +584,8 @@ test('boot-inject default post-success confirmation window preserves about 120 s
 
   assert.notEqual(res.status, 0);
   assert.equal(countLog(f.curlLog, 'input '), 2);
-  assert.equal(countLog(f.curlLog, 'status '), 67);
+  // 1 pre-injection baseline-reply-count capture + 67 poll-loop iterations
+  assert.equal(countLog(f.curlLog, 'status '), 68);
   assert.equal(logLines(f.sleepLog).filter(line => line === 'sleep 20').length, 1);
   assert.equal(logLines(f.sleepLog).filter(line => line === 'sleep 1.5').length, 67);
 });
@@ -499,6 +650,159 @@ test('spawn-lane routes ORCH labels to the master :3100 instance by default', (t
 
   assert.equal(res.status, 0, res.stderr);
   assert.ok(logLines(f.curlLog).some(line => line.includes('http://127.0.0.1:3100/api/sessions')));
+});
+
+test('spawn-lane routes Claude ORCH command through Miser project-panel path', (t) => {
+  const f = setupFixture(t);
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'termdeck-updates',
+    '--label', 'termdeck-updates-ORCH',
+    '--cwd', f.cwd,
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stderr, /routing Claude command through Miser project 'termdeck-updates--orch'/);
+  const payload = logLines(f.curlLog).find(line => line.startsWith('payload '));
+  assert.ok(payload);
+  assert.match(payload, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:20128\/p\/termdeck-updates--orch/);
+  assert.match(payload, /ANTHROPIC_API_URL=http:\/\/127\.0\.0\.1:20128\/p\/termdeck-updates--orch/);
+  assert.equal(cwdClaudeSettings(f.cwd).env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:20128/p/termdeck-updates');
+  assert.equal(cwdClaudeSettings(f.cwd).env.ANTHROPIC_API_URL, 'http://127.0.0.1:20128/p/termdeck-updates');
+});
+
+test('spawn-lane does not treat task names containing lowercase orch as ORCH panels', (t) => {
+  const f = setupFixture(t);
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'miser',
+    '--label', 'miser-smart-orch-classifier-CLAUDE-AUDIT-20260907',
+    '--cwd', f.cwd,
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.ok(logLines(f.curlLog).some(line => line.includes('http://127.0.0.1:3200/api/sessions')));
+  assert.doesNotMatch(res.stderr, /targeting master instance/);
+  assert.match(res.stderr, /routing Claude command through Miser project 'miser'/);
+  const payload = logLines(f.curlLog).find(line => line.startsWith('payload '));
+  assert.ok(payload);
+  assert.match(payload, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:20128\/p\/miser/);
+  assert.doesNotMatch(payload, /\/p\/miser--orch/);
+  assert.equal(cwdClaudeSettings(f.cwd).env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:20128/p/miser');
+});
+
+test('spawn-lane treats ORCH canary labels as ORCH panels', (t) => {
+  const f = setupFixture(t);
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'termdeck-updates',
+    '--label', 'termdeck-updates-ORCH-CANARY-20260907',
+    '--cwd', f.cwd,
+    '--boot', f.orchBootFile,
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.ok(logLines(f.curlLog).some(line => line.includes('http://127.0.0.1:3100/api/sessions')));
+  const payload = logLines(f.curlLog).find(line => line.startsWith('payload '));
+  assert.ok(payload);
+  assert.match(payload, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:20128\/p\/termdeck-updates--orch/);
+  assert.equal(cwdClaudeSettings(f.cwd).env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:20128/p/termdeck-updates');
+});
+
+test('spawn-lane preserves Aetheria project slug while routing architect panel', (t) => {
+  const f = setupFixture(t);
+  const res = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'aetheria-concierge',
+    '--label', 'Aetheria-architect',
+    '--cwd', f.cwd,
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stderr, /routing Claude command through Miser project 'aetheria--architect'/);
+  const payload = logLines(f.curlLog).find(line => line.startsWith('payload '));
+  assert.ok(payload);
+  assert.match(payload, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:20128\/p\/aetheria--architect/);
+  assert.equal(cwdClaudeSettings(f.cwd).env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:20128/p/aetheria');
+});
+
+test('spawn-lane validates ORCH boot setup marker before spawning', (t) => {
+  const f = setupFixture(t);
+  const missingMarker = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'pkachu',
+    '--label', 'pkachu-ORCH',
+    '--cwd', f.cwd,
+    '--boot', f.bootFile,
+  ], f.env);
+
+  assert.notEqual(missingMarker.status, 0);
+  assert.match(missingMarker.stderr, /REFUSING ORCH boot without MISER_BOOT_SETUP\/PANEL_BOOT marker/);
+  assert.equal(countLog(f.curlLog, 'spawn '), 0);
+
+  const validMarker = runScript('spawn-lane.sh', [
+    '--parent', 'parent-1',
+    '--project', 'pkachu',
+    '--label', 'pkachu-ORCH',
+    '--cwd', f.cwd,
+    '--boot', f.orchBootFile,
+  ], f.env);
+
+  assert.equal(validMarker.status, 0, validMarker.stderr);
+  assert.equal(validMarker.stdout.trim(), 'child-1');
+  assert.equal(countLog(f.curlLog, 'spawn '), 1);
+});
+
+test('boot-inject validates ORCH boot setup marker before injecting', (t) => {
+  const f = setupFixture(t);
+  const missingMarker = runScript('boot-inject.sh', [
+    '--child', 'child-1',
+    '--boot', f.bootFile,
+    '--parent', 'parent-1',
+    '--base', 'http://127.0.0.1:3100',
+    '--project', 'pkachu',
+    '--label', 'pkachu-ORCH',
+  ], f.env);
+
+  assert.notEqual(missingMarker.status, 0);
+  assert.match(missingMarker.stderr, /REFUSING ORCH boot without MISER_BOOT_SETUP\/PANEL_BOOT marker/);
+  assert.equal(countLog(f.curlLog, 'input '), 0);
+
+  const validMarker = runScript('boot-inject.sh', [
+    '--child', 'child-1',
+    '--boot', f.orchBootFile,
+    '--parent', 'parent-1',
+    '--base', 'http://127.0.0.1:3100',
+    '--project', 'pkachu',
+    '--label', 'pkachu-ORCH',
+  ], f.env);
+
+  assert.equal(validMarker.status, 0, validMarker.stderr);
+  assert.equal(validMarker.stdout.trim(), 'child-1');
+  assert.equal(countLog(f.curlLog, 'input '), 2);
+});
+
+test('boot-inject does not treat lowercase task-name orch as ORCH context', (t) => {
+  const f = setupFixture(t, {
+    status: 'active',
+    pollCount: 5,
+    replyCount: 0,
+    replyCountAdvanceAfter: 2,
+    replyCountAdvanced: 2,
+    inputBufferLength: 0,
+  });
+  const res = runScript('boot-inject.sh', [
+    '--child', 'child-1',
+    '--boot', f.bootFile,
+    '--parent', 'parent-1',
+    '--base', 'http://127.0.0.1:3200',
+    '--project', 'miser',
+    '--label', 'miser-smart-orch-classifier-CLAUDE-AUDIT-20260907',
+  ], f.env);
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.doesNotMatch(res.stderr, /REFUSING ORCH boot/);
+  assert.equal(countLog(f.curlLog, 'input '), 2);
 });
 
 test('spawn-lane routes worker labels to the builder :3200 instance by default', (t) => {

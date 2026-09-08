@@ -13,6 +13,21 @@ LABEL=""
 CWD=""
 COMMAND=""
 
+label_has_orch_segment() {
+  [[ "$LABEL" =~ (^|[-_.[:space:]])ORCH($|[-_.[:space:]]) ]]
+}
+
+label_has_non_orch_segment() {
+  [[ "$LABEL" =~ (^|[-_.[:space:]])[Nn][Oo][Nn][-_.[:space:]]*ORCH($|[-_.[:space:]]) ]]
+}
+
+is_orch_context() {
+  case "${ROLE,,}" in
+    orch|orchestrator) return 0 ;;
+  esac
+  label_has_orch_segment && ! label_has_non_orch_segment
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --child)   CHILD="$2"; shift 2 ;;
@@ -41,8 +56,17 @@ for var in CHILD BOOT_FILE PARENT; do
 done
 [[ -r "$BOOT_FILE" ]] || { echo "boot-inject: boot file unreadable: $BOOT_FILE" >&2; exit 1; }
 
-if [[ -n "$LABEL" && "${LABEL^^}" != *-ORCH ]]; then
-  BOOT_TEXT_PRECHECK=$(<"$BOOT_FILE")
+BOOT_TEXT_PRECHECK=$(<"$BOOT_FILE")
+IS_ORCH_CONTEXT=0
+if is_orch_context; then
+  IS_ORCH_CONTEXT=1
+fi
+if [[ "$IS_ORCH_CONTEXT" == "1" ]]; then
+  if ! grep -Eiq '^[[:space:]]*(MISER_BOOT_SETUP|ORCH_BOOT|PANEL_BOOT)[[:space:]]*$' <<< "$BOOT_TEXT_PRECHECK"; then
+    echo "boot-inject: REFUSING ORCH boot without MISER_BOOT_SETUP/PANEL_BOOT marker: $BOOT_FILE" >&2
+    exit 1
+  fi
+elif [[ -n "$LABEL" ]]; then
   if ! grep -Eiq '(td-inject\.sh|notify[- ]?back|Do not wait to be polled|dispatcher-session-id)' <<< "$BOOT_TEXT_PRECHECK"; then
     echo "boot-inject: REFUSING task boot without notify-back instruction: $BOOT_FILE" >&2
     exit 1
@@ -61,6 +85,14 @@ fi
 
 finite_int() {
   [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+activity_after_injection() {
+  local activity="$1" epoch
+  [[ -n "$activity" && -n "$INJECTED_AT_EPOCH" ]] || return 1
+  epoch=$(date -d "$activity" +%s 2>/dev/null) || return 1
+  finite_int "$epoch" || return 1
+  (( epoch >= INJECTED_AT_EPOCH ))
 }
 
 MAX_ATTEMPTS="${MISER_BOOT_INJECT_MAX_ATTEMPTS:-2}"
@@ -96,6 +128,7 @@ LAST_INPUT_BUFFER_PREVIEW=""
 LAST_CODEX_TRANSCRIPT=""
 CODEX_SNAPSHOT_FILE=""
 CODEX_SNAPSHOT_EPOCH=""
+BASELINE_REPLY_COUNT=""
 
 is_codex_command() {
   local lower="${COMMAND,,}"
@@ -314,13 +347,14 @@ write_boot_failure_artifact() {
     echo "last_error: ${last_error:-unknown}"
     echo
     echo "observed_confirmation_signals:"
-    echo "  confirmation_rule: $(is_codex_command && echo codex_transcript_created || echo termdeck_status_thinking)"
+    echo "  confirmation_rule: $(is_codex_command && echo codex_transcript_created || echo "termdeck_status_thinking, active_empty_buffer_reply_seen")"
     echo "  confirmed_by: ${CONFIRMED_BY:-none}"
     echo "  termdeck_status: ${LAST_STATUS:-unknown}"
     echo "  termdeck_status_detail: ${LAST_STATUS_DETAIL:-unknown}"
     echo "  termdeck_last_activity: ${LAST_ACTIVITY:-unknown}"
     echo "  termdeck_request_count: ${LAST_REQUEST_COUNT:-unknown}"
     echo "  termdeck_reply_count: ${LAST_REPLY_COUNT:-unknown}"
+    echo "  baseline_reply_count: ${BASELINE_REPLY_COUNT:-unknown}"
     echo "  buffer_status: ${LAST_BUFFER_STATUS:-unknown}"
     echo "  buffer_status_detail: ${LAST_BUFFER_DETAIL:-unknown}"
     echo "  input_buffer_length: ${LAST_INPUT_BUFFER_LENGTH:-unknown}"
@@ -389,6 +423,11 @@ ATTEMPTS_USED=0
 LAST_ERROR=""
 LAST_STATUS=""
 
+if ! is_codex_command; then
+  capture_confirmation_signals
+  BASELINE_REPLY_COUNT="$LAST_REPLY_COUNT"
+fi
+
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
   ATTEMPTS_USED="$attempt"
   if [[ "$INJECT_SENT" == "0" ]]; then
@@ -426,6 +465,25 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
       LANDED=1
       CONFIRMED_BY="termdeck_status_thinking"
       break
+    fi
+    if ! is_codex_command && [[ "$LAST_STATUS" == "active" && "$LAST_INPUT_BUFFER_LENGTH" == "0" ]]; then
+      reply_confirmed=0
+      if finite_int "$LAST_REPLY_COUNT" && finite_int "$BASELINE_REPLY_COUNT"; then
+        # Strict growth over the pre-injection baseline is itself proof of
+        # fresh activity; no separate timestamp check is needed here.
+        (( LAST_REPLY_COUNT > BASELINE_REPLY_COUNT )) && reply_confirmed=1
+      elif finite_int "$LAST_REPLY_COUNT" && (( LAST_REPLY_COUNT > 0 )) \
+        && activity_after_injection "$LAST_ACTIVITY"; then
+        # No usable baseline (e.g. the pre-injection probe failed) - require
+        # lastActivity to have moved at/after injection so a stale panel with
+        # a leftover positive replyCount can't be accepted as freshly landed.
+        reply_confirmed=1
+      fi
+      if (( reply_confirmed == 1 )); then
+        LANDED=1
+        CONFIRMED_BY="active_empty_buffer_reply_seen"
+        break
+      fi
     fi
   done
 

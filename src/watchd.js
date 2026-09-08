@@ -13,6 +13,7 @@ const MAX_CAPTURE_BYTES = 1024 * 1024;
 const MAX_COMPACT_BYTES = 4096;
 const PROBE_ID_RE = /^[A-Za-z0-9._-]{1,80}$/;
 const DEFAULT_PROBE_IDS = Object.freeze([
+  'panel-review',
   'ci',
   'termdeck',
   'miser',
@@ -100,6 +101,13 @@ function parseProbeRegistry(raw) {
 function defaultProbeRegistry() {
   const repoRoot = path.resolve(__dirname, '..');
   return [
+    {
+      id: 'panel-review',
+      command: `node ${path.join(repoRoot, 'bin', 'miser-panel-review.js')}`,
+      cwd: repoRoot,
+      ttl_s: 300,
+      timeout_s: 120,
+    },
     {
       id: 'ci',
       command: 'gh run list --limit 10',

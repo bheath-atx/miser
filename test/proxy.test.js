@@ -109,6 +109,24 @@ class FakeRes extends Writable {
 
 function fakeRes() { return new FakeRes(); }
 
+function controlMessage(res) {
+  const payload = JSON.parse(res.body());
+  assert.equal(res.statusCode, 200);
+  assert.equal(payload.type, 'message');
+  assert.equal(payload.role, 'assistant');
+  assert.equal(payload.usage.input_tokens, 0);
+  const text = payload.content[0].text;
+  assert.match(text, /miser_control_plane_error/);
+  assert.match(text, /retryable=false/);
+  return { payload, text };
+}
+
+function sseText(body) {
+  return [...body.matchAll(/^event: content_block_delta\ndata: (.+)$/gm)]
+    .map(match => JSON.parse(match[1]).delta.text)
+    .join('');
+}
+
 function drive(createProxy, req, res) {
   const handler = createProxy();
   const done = res.whenDone();
@@ -537,27 +555,24 @@ test('enforcement canary warns before blocking repeated NACHO ORCH-control poll 
     };
     const first = fakeRes();
     await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', firstBody, {}), first);
-    assert.equal(first.statusCode, 429);
+    assert.match(controlMessage(first).text, /poll budget edge/);
     assert.equal(first.headers['x-miser-control-plane'], 'poll-budget-edge');
     assert.equal(first.headers['x-miser-enforcement'], 'poll-budget-edge');
     assert.equal(first.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
-    assert.match(first.body(), /poll budget edge/);
-    assert.equal(first.body().includes('"role":"assistant"'), false);
     assert.equal(echo.captured.length, 0);
 
     const second = fakeRes();
     await run(fakeReq('POST', '/p/nacho-orch--sprints/v1/messages', secondBody, {}), second);
-    assert.equal(second.statusCode, 429);
+    assert.match(controlMessage(second).text, /poll budget exceeded/);
     assert.equal(second.headers['x-miser-enforcement'], 'poll-budget');
     assert.equal(second.headers['x-miser-enforcement-mode'], 'throttle');
-    assert.match(second.body(), /poll budget exceeded/);
     assert.equal(echo.captured.length, 0);
   } finally {
     echo.server.close(); restoreEnv();
   }
 });
 
-test('enforcement warning on Anthropic streaming requests returns JSON control-plane error', async () => {
+test('enforcement warning on Anthropic streaming requests returns SSE control-plane message', async () => {
   const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok', usage: { input_tokens: 1 } } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {
     MISER_ENFORCEMENT: JSON.stringify({
@@ -584,15 +599,14 @@ test('enforcement warning on Anthropic streaming requests returns JSON control-p
     }, {}), res);
     await done;
 
-    assert.equal(res.statusCode, 429);
+    assert.equal(res.statusCode, 200);
     assert.equal(res.headers['x-miser-control-plane'], 'poll-budget-edge');
     assert.equal(res.headers['x-miser-enforcement'], 'poll-budget-edge');
     assert.equal(res.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
-    assert.equal(res.headers['content-type'], 'application/json');
-    assert.equal(JSON.parse(res.body()).error.type, 'miser_control_plane_error');
-    assert.match(res.body(), /poll budget edge/);
-    assert.equal(res.body().includes('event: message_start'), false);
-    assert.equal(res.body().includes('"role":"assistant"'), false);
+    assert.equal(res.headers['content-type'], 'text/event-stream');
+    assert.match(res.body(), /^event: message_start/m);
+    assert.match(sseText(res.body()), /poll budget edge/);
+    assert.match(sseText(res.body()), /Do not retry/);
     assert.equal(echo.captured.length, 0);
   } finally {
     echo.server.close(); restoreEnv();
@@ -733,7 +747,7 @@ test('redirect off passes poll/control turns through to upstream', async () => {
   }
 });
 
-test('redirect warn returns control-plane error instead of synthetic assistant guidance', async () => {
+test('redirect warn returns synthetic control-plane guidance without upstream', async () => {
   const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-warn-${process.pid}-`));
   try {
     fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nfrom watcher\n', 'utf8');
@@ -743,19 +757,17 @@ test('redirect warn returns control-plane error instead of synthetic assistant g
       body: redirectTurnBody('gh run view 123 --log'),
     });
     try {
-      const payload = JSON.parse(ctx.res.body());
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-control-plane'], 'zero-llm-redirect');
       assert.equal(ctx.res.headers['x-miser-redirect'], 'zero-llm-redirect');
       assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'warn');
       assert.equal(ctx.res.headers['x-miser-redirect-class'], 'POLL_CI');
       assert.equal(ctx.res.headers['x-miser-watch-artifact'], path.join(watchDir, 'ci.md'));
-      assert.equal(payload.error.type, 'miser_control_plane_error');
-      assert.equal(payload.error.reason, 'zero-llm-redirect');
-      assert.equal(payload.error.artifact.path, path.join(watchDir, 'ci.md'));
-      assert.equal(JSON.stringify(payload).includes('[MISER-SYNTHETIC]'), false);
-      assert.equal(JSON.stringify(payload).includes('"role":"assistant"'), false);
+      const { text } = controlMessage(ctx.res);
+      assert.match(text, /reason=zero-llm-redirect/);
+      assert.match(text, new RegExp(path.join(watchDir, 'ci.md').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.match(text, /Do not retry/);
+      assert.match(text, /Read .*ci\.md out-of-band/);
       assert.equal(ctx.guardDeps.enforcementState.snapshot().redirect.controlErrors, 1);
     } finally {
       ctx.cleanup();
@@ -777,15 +789,15 @@ test('redirect enforce returns control-plane artifact pointer and avoids upstrea
     try {
       const payload = JSON.parse(ctx.res.body());
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-enforcement'], 'zero-llm-redirect');
       assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
       assert.equal(ctx.res.headers['x-miser-watch-artifact-state'], 'unknown');
-      assert.equal(payload.error.command_class, 'POLL_CI');
-      assert.equal(payload.error.artifact.path, path.join(watchDir, 'ci.md'));
-      assert.equal(payload.error.operator_action, 'read_watcher_artifact_out_of_band');
-      assert.equal(JSON.stringify(payload).includes('VERDICT: OK'), false);
-      assert.equal(JSON.stringify(payload).includes('[MISER-SYNTHETIC]'), false);
+      const { text } = controlMessage(ctx.res);
+      assert.match(text, /command_class: POLL_CI/);
+      assert.match(text, new RegExp(path.join(watchDir, 'ci.md').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.match(text, /operator_action: read_watcher_artifact_out_of_band/);
+      assert.match(text, /Do not retry/);
+      assert.equal(text.includes('VERDICT: OK'), false);
       assert.equal(ctx.guardDeps.enforcementState.snapshot().recentEvents[0].decision, 'control_error');
     } finally {
       ctx.cleanup();
@@ -795,7 +807,7 @@ test('redirect enforce returns control-plane artifact pointer and avoids upstrea
   }
 });
 
-test('redirect enforce on streaming requests still returns JSON control-plane error', async () => {
+test('redirect enforce on streaming requests returns SSE control-plane guidance', async () => {
   const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-sse-${process.pid}-`));
   try {
     fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nstream artifact\n', 'utf8');
@@ -805,14 +817,13 @@ test('redirect enforce on streaming requests still returns JSON control-plane er
       body: redirectTurnBody('gh run view 123 --log', { stream: true }),
     });
     try {
-      const payload = JSON.parse(ctx.res.body());
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
-      assert.equal(ctx.res.headers['content-type'], 'application/json');
+      assert.equal(ctx.res.statusCode, 200);
+      assert.equal(ctx.res.headers['content-type'], 'text/event-stream');
       assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
-      assert.equal(payload.error.type, 'miser_control_plane_error');
-      assert.equal(ctx.res.body().includes('event: message_start'), false);
-      assert.equal(ctx.res.body().includes('[MISER-SYNTHETIC]'), false);
+      assert.match(ctx.res.body(), /^event: message_start/m);
+      assert.match(sseText(ctx.res.body()), /miser_control_plane_error/);
+      assert.match(sseText(ctx.res.body()), /Do not retry/);
     } finally {
       ctx.cleanup();
     }
@@ -830,15 +841,14 @@ test('redirect enforce with missing watcher artifact returns operator control er
       body: redirectTurnBody('curl http://127.0.0.1:20128/api/miser/stats'),
     });
     try {
-      const payload = JSON.parse(ctx.res.body());
       const artifact = path.join(watchDir, 'miser.md');
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-watch-artifact'], artifact);
       assert.equal(ctx.res.headers['x-miser-watch-artifact-state'], 'missing');
-      assert.match(payload.error.message, /watcher artifact missing/);
-      assert.equal(payload.error.operator_action, 'refresh_or_repair_watcher_out_of_band');
-      assert.equal(JSON.stringify(payload).includes('[MISER-SYNTHETIC]'), false);
+      const { text } = controlMessage(ctx.res);
+      assert.match(text, /watcher artifact missing/);
+      assert.match(text, /operator_action: refresh_or_repair_watcher_out_of_band/);
+      assert.match(text, /Refresh or repair/);
       assert.equal(ctx.guardDeps.enforcementState.snapshot().recentEvents[0].artifactMissing, true);
     } finally {
       ctx.cleanup();
@@ -863,14 +873,13 @@ test('redirect enforce with stale watcher artifact returns operator control erro
       body: redirectTurnBody('gh run view 123 --log'),
     });
     try {
-      const payload = JSON.parse(ctx.res.body());
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-watch-artifact-state'], 'stale');
-      assert.match(payload.error.message, /watcher artifact stale/);
-      assert.equal(payload.error.artifact.stale, true);
-      assert.equal(payload.error.operator_action, 'refresh_or_repair_watcher_out_of_band');
-      assert.equal(JSON.stringify(payload).includes('[MISER-SYNTHETIC]'), false);
+      const { text } = controlMessage(ctx.res);
+      assert.match(text, /watcher artifact stale/);
+      assert.match(text, /stale/);
+      assert.match(text, /operator_action: refresh_or_repair_watcher_out_of_band/);
+      assert.match(text, /Refresh or repair/);
     } finally {
       ctx.cleanup();
     }
@@ -879,7 +888,7 @@ test('redirect enforce with stale watcher artifact returns operator control erro
   }
 });
 
-test('repeated redirectable poll requests do not append synthetic assistant guidance', async () => {
+test('repeated redirectable poll requests return bounded synthetic control guidance', async () => {
   const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-redirect-repeat-${process.pid}-`));
   try {
     fs.writeFileSync(path.join(watchDir, 'ci.md'), 'VERDICT: OK\nfrom watcher\n', 'utf8');
@@ -895,11 +904,9 @@ test('repeated redirectable poll requests do not append synthetic assistant guid
         const done = res.whenDone();
         handler(fakeReq('POST', '/p/aetheria--orch/v1/messages', redirectTurnBody('gh run view 123 --log'), {}), res);
         await done;
-        const payload = JSON.parse(res.body());
-        assert.equal(res.statusCode, 429);
-        assert.equal(payload.error.type, 'miser_control_plane_error');
-        assert.equal(JSON.stringify(payload).includes('[MISER-SYNTHETIC]'), false);
-        assert.equal(JSON.stringify(payload).includes('"role":"assistant"'), false);
+        const { text } = controlMessage(res);
+        assert.match(text, /miser_control_plane_error/);
+        assert.match(text, /Do not retry/);
       }
       assert.equal(echo.captured.length, 0);
       assert.equal(guardDeps.enforcementState.snapshot().redirect.controlErrors, 2);
@@ -933,8 +940,7 @@ test('/v1/messages redirect path never refreshes or inspects the live watcher ob
       const done = res.whenDone();
       handler(fakeReq('POST', '/p/aetheria--orch/v1/messages', redirectTurnBody('gh run view 123 --log'), {}), res);
       await done;
-      assert.equal(res.statusCode, 429);
-      assert.equal(JSON.parse(res.body()).error.artifact.path, path.join(watchDir, 'ci.md'));
+      assert.match(controlMessage(res).text, new RegExp(path.join(watchDir, 'ci.md').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
       assert.equal(echo.captured.length, 0);
     } finally {
       echo.server.close();
@@ -991,9 +997,8 @@ test('redirect warn still returns control error when a project override is activ
     });
     try {
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'warn');
-      assert.equal(JSON.parse(ctx.res.body()).error.operator_action, 'read_watcher_artifact_out_of_band');
+      assert.match(controlMessage(ctx.res).text, /operator_action: read_watcher_artifact_out_of_band/);
     } finally {
       ctx.cleanup();
     }
@@ -1016,9 +1021,8 @@ test('redirect enforce still returns control error when a project override is ac
     });
     try {
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
-      assert.equal(JSON.parse(ctx.res.body()).error.artifact.path, path.join(watchDir, 'ci.md'));
+      assert.match(controlMessage(ctx.res).text, new RegExp(path.join(watchDir, 'ci.md').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     } finally {
       ctx.cleanup();
     }
@@ -1089,14 +1093,13 @@ test('redirect enforce exposes reason headers before generic poll-budget respons
       body: redirectTurnBody('curl http://127.0.0.1:20128/api/miser/stats'),
     });
     try {
-      const payload = JSON.parse(ctx.res.body());
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-redirect-mode'], 'enforce');
       assert.equal(ctx.res.headers['x-miser-enforcement'], 'zero-llm-redirect');
       assert.notEqual(ctx.res.headers['x-miser-enforcement-warning'], 'poll-budget-edge');
-      assert.equal(payload.error.reason, 'zero-llm-redirect');
-      assert.equal(payload.error.artifact.path, path.join(watchDir, 'miser.md'));
+      const { text } = controlMessage(ctx.res);
+      assert.match(text, /reason=zero-llm-redirect/);
+      assert.match(text, new RegExp(path.join(watchDir, 'miser.md').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     } finally {
       ctx.cleanup();
     }
@@ -1130,12 +1133,69 @@ test('hard non-redirect ORCH budget blocks still avoid upstream', async () => {
       },
     });
     try {
-      const payload = JSON.parse(ctx.res.body());
       assert.equal(ctx.echo.captured.length, 0);
-      assert.equal(ctx.res.statusCode, 429);
       assert.equal(ctx.res.headers['x-miser-enforcement'], 'orch-assignment-budget');
       assert.ok(!ctx.res.headers['x-miser-redirect']);
-      assert.match(payload.error.message, /ORCH assignment management budget exceeded/);
+      const { text } = controlMessage(ctx.res);
+      assert.match(text, /ORCH assignment management budget exceeded/);
+      assert.match(text, /retryable=false/);
+      assert.match(text, /Do not retry/);
+    } finally {
+      ctx.cleanup();
+    }
+  } finally {
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('fresh ORCH boot setup prompt is forwarded before assignment budget enforcement', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), `miser-orch-boot-setup-${process.pid}-`));
+  try {
+    const upstreamBody = {
+      id: 'msg_orch_boot_ok',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-5-test',
+      content: [{ type: 'text', text: '[TermDeck-ORCH-CANARY] online; waiting.' }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+    const ctx = await driveRedirectCase({
+      mode: 'enforce',
+      watchDir,
+      echoBody: upstreamBody,
+      projectPolicy: {
+        mode: 'throttle',
+        redirect: { mode: 'enforce' },
+        override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' },
+        orchControl: {
+          enabled: true,
+          panels: ['orch'],
+          maxManagementTurnsPerAssignment: 0,
+          warnManagementTurnsPerAssignment: 99,
+        },
+      },
+      body: {
+        model: 'claude-sonnet-5-test',
+        max_tokens: 50,
+        system: 'You are the ORCH controller.',
+        messages: [{
+          role: 'user',
+          content: [
+            'PANEL_BOOT',
+            '# TermDeck ORCH Canary - Boot Prompt',
+            'You are TermDeck-ORCH-CANARY.',
+            'Read the handoff, reply online, then wait. Do not run tools.',
+          ].join('\n'),
+        }],
+      },
+    });
+    try {
+      assert.equal(ctx.echo.captured.length, 1);
+      assert.equal(ctx.res.statusCode, 200);
+      assert.deepEqual(JSON.parse(ctx.res.body()), upstreamBody);
+      assert.ok(!ctx.res.headers['x-miser-enforcement']);
     } finally {
       ctx.cleanup();
     }
@@ -1596,6 +1656,29 @@ test('Sprint B: guardrails-OFF (empty guardDeps) leaves the proxy path byte-iden
     assert.equal(res.statusCode, 200);
     assert.equal(echo.captured.length, 1);
     assert.ok(res.headers['x-miser-compact-hint']);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('Claude Code quota probe is answered locally and does not poison Anthropic cooldown', async () => {
+  const echo = await startEcho(() => ({ status: 429, body: { error: { type: 'rate_limit_error' } } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url);
+  try {
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('POST', '/p/provenspec--orch/v1/messages', {
+      model: 'claude-sonnet-5',
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'quota' }],
+      metadata: { user_id: '{"session_id":"startup"}' },
+    }, {
+      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
+    }), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.headers['x-miser-provider'], 'local');
+    assert.equal(res.headers['x-miser-enforcement-reason'], 'claude-code-quota-probe');
+    assert.equal(echo.captured.length, 0);
   } finally {
     echo.server.close(); restoreEnv();
   }

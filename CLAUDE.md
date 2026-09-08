@@ -23,6 +23,19 @@ ORCH panel. If the prompt generator cannot express the needed lane, ask Brad/Cod
 template instead of improvising. ORCH prompts must keep implementation discovery in the builder or
 auditor lane, not in the ORCH panel.
 
+Fresh Claude ORCH/architect boot or handoff prompts should include an own-line `MISER_BOOT_SETUP` or
+`PANEL_BOOT` marker before role instructions; this is setup metadata, not task evidence. Miser also
+infers a narrow marker-less fresh manual ORCH setup Read of known launcher/setup files when the first
+prompt is clearly bounded boot/setup. The local ORCH intent classifier is staged as nonblocking
+prompt/JSON-validation scaffolding only; no local command or Ollama call runs from live enforcement.
+Explicit polling, repo/CI work, destructive git, sensitive reads, service mutations, PR writes, and
+direct `codex exec` remain deterministic.
+`spawn-lane.sh` routes Claude commands through Miser and stages the target cwd's
+`.claude/settings.local.json`; process env alone is not enough for Claude Code routing. Protected
+labels/roles containing `ORCH`, `architect`, or `sprints` must land on
+`/p/<project>--<panel>/v1/messages`; ORCH boot files without `MISER_BOOT_SETUP`, `ORCH_BOOT`, or
+`PANEL_BOOT` are refused before injection.
+
 ## Claude Usage Guardrails
 
 Miser-ORCH is not a lane watcher. Use Claude for policy judgment, architecture, routing, risk calls, and compact Brad-facing synthesis. Do not use Claude as the repeated poller for Codex lanes, GitHub/CI state, TermDeck panels, Miser health/stats, service logs, or its own context/turn count.
