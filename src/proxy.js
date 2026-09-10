@@ -13,7 +13,8 @@ const {
 } = require('./stats.js');
 const { pruneTools } = require('./toolprune.js');
 const { checkBudget } = require('./budgets.js');
-const { checkEnforcement, buildSyntheticSseResponse } = require('./enforcement.js');
+const { checkEnforcement, checkEnforcementAsync, buildSyntheticSseResponse } = require('./enforcement.js');
+const { createPairAdvisor } = require('./pair-advisor.js');
 const { checkModelDrift } = require('./policy-watchdog.js');
 const config = require('./config.js');
 const { classifyRoute } = require('./routing.js');
@@ -286,6 +287,7 @@ function watcherStatusPayload(watcher) {
 // test harness uses it to drive the full proxy→compress→routeRequest→failover
 // chain with zero sockets. Never populated on the production path.
 function createProxy(deps = {}) {
+  const pairAdvisor = deps.pairAdvisor || (config.pairAdvisor ? createPairAdvisor(config.pairAdvisor) : null);
   // Injectable breaker state seam — lets health tests verify states without
   // touching the module-level singletons in router.js.
   const getBreakersState = deps.getBreakersState || (() => {
@@ -330,6 +332,7 @@ function createProxy(deps = {}) {
         circuitBreakers: getBreakersState(),
         subscriptionCap: subCapStatus,
         enforcement: gd && gd.enforcementState ? gd.enforcementState.snapshot() : null,
+        pairAdvisor: (gd?.pairAdvisor || pairAdvisor)?.snapshot?.() || null,
         alertRouting,
       });
       return;
@@ -561,15 +564,24 @@ function createProxy(deps = {}) {
 
       if (guardDeps.enforcementConfig) {
         let block = null;
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        req.once?.('aborted', abort);
+        res.once?.('close', abort);
         try {
-          const check = guardDeps.checkEnforcement || checkEnforcement;
-          const enforcementGuardDeps = guardDeps.watcher || guardDeps.watchConfig
-            ? guardDeps
-            : { ...guardDeps, watchConfig: config.watch || {} };
-          block = check(project, panel, originalBody, compactHeaders, rawTokens, enforcementGuardDeps, req.headers);
+          const check = guardDeps.checkEnforcement || checkEnforcementAsync;
+          const enforcementGuardDeps = { ...guardDeps,
+            watchConfig: guardDeps.watchConfig || config.watch || {},
+            pairAdvisor: guardDeps.pairAdvisor || pairAdvisor, advisorSignal: controller.signal };
+          block = await check(project, panel, originalBody, compactHeaders, rawTokens, enforcementGuardDeps, req.headers);
         } catch (e) {
-          console.warn('[miser] enforcement check error (fail-open):', e.message);
+          console.warn('[miser] async enforcement error; using deterministic enforcement');
+          block = checkEnforcement(project, panel, originalBody, compactHeaders, rawTokens, guardDeps, req.headers);
+        } finally {
+          req.removeListener?.('aborted', abort);
+          res.removeListener?.('close', abort);
         }
+        if (controller.signal.aborted || req.aborted || res.destroyed) return;
         if (block) {
           if (panel && deps.stopgapWatchdog) {
             deps.stopgapWatchdog.recordProxyOutcome({

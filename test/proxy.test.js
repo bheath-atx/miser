@@ -696,7 +696,7 @@ function redirectEnv(mode, watchDir, opts = {}) {
   };
 }
 
-async function driveRedirectCase({ mode, body, watchDir, echoBody = null, overrideFile = null, projectPolicy = null }) {
+async function driveRedirectCase({ mode, body, watchDir, echoBody = null, overrideFile = null, projectPolicy = null, pairAdvisor = null }) {
   const upstreamBody = echoBody || {
     id: `msg_upstream_${mode}`,
     type: 'message',
@@ -713,7 +713,7 @@ async function driveRedirectCase({ mode, body, watchDir, echoBody = null, overri
     const config = require('../src/config.js');
     const { buildGuardDeps } = require('../src/budgets.js');
     const guardDeps = buildGuardDeps(config, { createLedger: () => ({ shouldSend: () => false, markSent: () => {} }) });
-    const handler = createProxy({ guardDeps });
+    const handler = createProxy({ guardDeps, pairAdvisor });
     const res = fakeRes();
     const done = res.whenDone();
     handler(fakeReq('POST', '/p/aetheria--orch/v1/messages', body, {}), res);
@@ -825,6 +825,157 @@ test('shadow-port canary lets non-ORCH roles reach upstream while a sibling ORCH
     restoreEnv();
     fs.rmSync(watchDir, { recursive: true, force: true });
   }
+});
+
+test('PAIR advisor is awaited in proxy: metadata reaches upstream only after allow; malformed verdict keeps no-retry redirect', async () => {
+  const command = 'for repo in rtk-ai/rtk juliusbrussee/caveman headroomlabs-ai/headroom; do gh repo view "$repo" --json description,licenseInfo,url; done';
+  const request = redirectTurnBody(command);
+  request.messages[0].content = 'Check the legitimacy of these three named external repositories once.';
+  for (const valid of [true, false]) {
+    const { createPairAdvisor } = require('../src/pair-advisor');
+    let calls = 0;
+    const advisor = createPairAdvisor({}, { infer: async () => {
+      calls++;
+      await new Promise(resolve => setTimeout(resolve, 20));
+      return { ok: true, text: valid ? JSON.stringify({ intent: 'external_verification', confidence: 0.9,
+        action: 'allow', should_count: false, operator_message: 'Bounded external metadata.', reason: 'named_metadata' }) : 'invalid' };
+    } });
+    const ctx = await driveRedirectCase({ mode: 'enforce', body: request, watchDir: '/tmp/miser-proxy-pair-watch', pairAdvisor: advisor });
+    try {
+      assert.equal(calls, 1);
+      assert.equal(ctx.echo.captured.length, valid ? 1 : 0);
+      if (valid) {
+        assert.deepEqual(JSON.parse(ctx.res.body()), ctx.upstreamBody);
+        assert.equal(ctx.res.headers['x-miser-redirect'], undefined);
+      } else {
+        assert.equal(ctx.res.headers['x-miser-enforcement'], 'zero-llm-redirect');
+        assert.match(ctx.res.body(), /retryable=false/);
+        assert.equal(ctx.res.headers['retry-after'], undefined);
+      }
+    } finally { ctx.cleanup(); }
+  }
+});
+
+test('R1 B1: every tool result gets hard safety before role exemptions or advisor calls', async t => {
+  const echo = await startEcho(() => ({ status: 200, body: { ok: true } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    MISER_PAIR_ADVISOR: '',
+    MISER_ENFORCEMENT: JSON.stringify({ '*': {
+      mode: 'block', redirect: { mode: 'enforce' },
+      override: { overrideFile: '/tmp/miser-proxy-test-overrides-never.json' },
+      toolResults: { mode: 'block' },
+      orchControl: { enabled: true, panels: ['orch', 'architect', 'ux', 'builder'] },
+    } }),
+  });
+  try {
+    const { buildGuardDeps } = require('../src/budgets');
+    const { classifyRequest } = require('../src/enforcement');
+    const guardDeps = buildGuardDeps(require('../src/config'), {
+      createLedger: () => ({ shouldSend: () => false, markSent: () => {} }),
+    });
+    let advisorCalls = 0;
+    const advisor = { classify: async () => {
+      advisorCalls++;
+      return { ok: true, advisor: { intent: 'external_verification', confidence: 0.95,
+        action: 'allow', should_count: false, operator_message: 'Allow.', reason: 'metadata' } };
+    } };
+    // Commands and paths are inert request data; only the loopback echo can receive a request.
+    const hazards = [
+      ['service-mutation', 'Bash', { command: 'systemctl --user restart miser' }],
+      ['sensitive-file-read', 'Read', { file_path: '/home/nacho/.ssh/id_rsa' }],
+      ['git-write-operation', 'Bash', { command: 'git commit -m example' }],
+      ['git-write-operation', 'Bash', { command: 'git push origin example' }],
+      ['pr-write-operation', 'Bash', { command: 'gh pr create --title example' }],
+    ];
+    for (const enabled of [false, true]) {
+      const handler = createProxy({ guardDeps, pairAdvisor: enabled ? advisor : null });
+      for (const role of ['architect', 'ux', 'builder', 'ORCH']) {
+        for (const [reason, name, input] of hazards) {
+          for (const hardFirst of [false, true]) {
+            const label = `${role}/${input.command || input.file_path}/hard-first=${hardFirst}/advisor=${enabled}`;
+            await t.test(label, async () => {
+              const before = { advisor: advisorCalls, upstream: echo.captured.length };
+              const benign = { type: 'tool_use', id: 'benign', name: 'Read', input: { file_path: '/repo/src/index.js' } };
+              const hard = { type: 'tool_use', id: 'hard', name, input };
+              const request = redirectTurnBody('', { system: `You are the ${role}.` });
+              request.messages[0].content = 'Continue the assigned work.';
+              request.messages[1].content = [benign, hard];
+              // Reverse result order independently of tool-use order to exercise ID matching.
+              request.messages[2].content = (hardFirst ? [hard, benign] : [benign, hard]).map(tool => ({
+                type: 'tool_result', tool_use_id: tool.id, content: 'fixture output',
+              }));
+              assert.equal(classifyRequest('pair-canary', 'orch', request).role, role === 'ORCH' ? 'ORCH' : 'worker');
+              const res = fakeRes(); const done = res.whenDone();
+              handler(fakeReq('POST', '/p/pair-canary--orch/v1/messages', request), res);
+              await done;
+              assert.equal(res.headers['x-miser-enforcement'], 'orch-hard-safety');
+              assert.ok(controlMessage(res).text.includes(`(${reason})`));
+              assert.equal(advisorCalls - before.advisor, 0);
+              assert.equal(echo.captured.length - before.upstream, 0);
+            });
+          }
+        }
+      }
+    }
+  } finally { echo.server.close(); restoreEnv(); }
+});
+
+test('configured PAIR advisor is reached through production guard wiring and fails closed without trust', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { ok: true } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, {
+    ...redirectEnv('enforce', '/tmp/miser-pair-config-watch'),
+    MISER_PAIR_ADVISOR: JSON.stringify({ enabled: true, configDir: `/tmp/miser-pair-missing-identity-${process.pid}` }),
+  });
+  try {
+    const { buildGuardDeps } = require('../src/budgets');
+    const guardDeps = buildGuardDeps(require('../src/config'), { createLedger: () => ({ shouldSend: () => false, markSent: () => {} }) });
+    const handler = createProxy({ guardDeps });
+    const res = fakeRes(); const done = res.whenDone();
+    handler(fakeReq('POST', '/p/aetheria--orch/v1/messages', redirectTurnBody('for repo in rtk-ai/rtk; do gh repo view "$repo" --json url; done')), res);
+    await done;
+    assert.equal(echo.captured.length, 0);
+    assert.equal(res.headers['x-miser-redirect'], 'zero-llm-redirect');
+    const events = guardDeps.enforcementState.snapshot().recentEvents;
+    assert.ok(events.some(e => e.decision === 'advisor_fallback' && e.reason === 'peer_trust_unavailable'));
+    const health = fakeRes(); const healthy = health.whenDone();
+    handler(fakeReq('GET', '/api/miser/health', null), health);
+    await healthy;
+    const snapshot = JSON.parse(health.body()).pairAdvisor;
+    assert.equal(snapshot.targets.precision.state, 'error');
+    assert.equal(snapshot.targets.per730, undefined);
+    assert.equal(snapshot.cachedDecisions, 1);
+  } finally { echo.server.close(); restoreEnv(); }
+});
+
+test('pending PAIR inference does not delay unrelated worker requests; disconnected waiters never forward', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { content: [{ type: 'text', text: 'upstream' }], usage: {} } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, redirectEnv('enforce', '/tmp/miser-pair-proxy-watch'));
+  const { buildGuardDeps } = require('../src/budgets');
+  const { createPairAdvisor } = require('../src/pair-advisor');
+  let release; const wait = new Promise(resolve => { release = resolve; });
+  let started; const ready = new Promise(resolve => { started = resolve; });
+  const advisor = createPairAdvisor({}, { infer: async () => { started(); await wait; return { ok: true, text: JSON.stringify({
+    intent: 'external_verification', confidence: 0.9, action: 'allow', should_count: false, operator_message: 'Verified.', reason: 'metadata' }) }; } });
+  const guardDeps = buildGuardDeps(require('../src/config'), { createLedger: () => ({ shouldSend: () => false, markSent: () => {} }) });
+  const handler = createProxy({ guardDeps, pairAdvisor: advisor });
+  try {
+    const pending = fakeRes();
+    handler(fakeReq('POST', '/p/aetheria--orch/v1/messages', redirectTurnBody('for repo in rtk-ai/rtk; do gh repo view "$repo" --json url; done')), pending);
+    await Promise.race([ready, new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('advisor did not start')), 1000);
+      timer.unref();
+    })]);
+    assert.equal(echo.captured.length, 0);
+    const worker = fakeRes(); const done = worker.whenDone();
+    handler(fakeReq('POST', '/p/aetheria--builder/v1/messages', redirectTurnBody('npm test', { system: 'You are the builder.' })), worker);
+    await done;
+    assert.equal(echo.captured.length, 1, 'worker forwards while advisor is unresolved');
+    assert.equal(pending.headersSent, false);
+    pending.emit('close');
+    release();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(echo.captured.length, 1, 'disconnected advisor waiter never forwards');
+  } finally { release(); echo.server.close(); restoreEnv(); }
 });
 
 test('redirect off passes poll/control turns through to upstream', async () => {

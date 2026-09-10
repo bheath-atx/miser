@@ -6,6 +6,7 @@ const { parsePolicy } = require('./policy-watchdog.js');
 const { parseAlertRoutes, parseOpsRoute } = require('./alert-routes.js');
 const { parseStopgapWatchdogEnv } = require('./stopgap-watchdog.js');
 const { parseEnforcement } = require('./enforcement.js');
+const { parsePairAdvisor } = require('./pair-advisor.js');
 const { parseWatchConfig } = require('./watchd.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
@@ -88,6 +89,7 @@ module.exports = {
   budgetGrace: parseBudgetGrace(process.env.MISER_BUDGET_GRACE || ''),
   policy: parsePolicy(process.env.MISER_POLICY || ''),
   enforcement: parseEnforcement(process.env.MISER_ENFORCEMENT || ''),
+  pairAdvisor: parsePairAdvisor(process.env.MISER_PAIR_ADVISOR || ''),
   weightedTokenWeights: {
     input: parseFloat(process.env.MISER_WEIGHT_INPUT ?? '1.0'),
     cacheRead: parseFloat(process.env.MISER_WEIGHT_CACHE_READ ?? '0.1'),

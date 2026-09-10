@@ -9,6 +9,13 @@ const path = require('node:path');
 const guard = global.__miserLiveFileGuard;
 assert.ok(guard, 'live file guard must be preloaded by npm test');
 
+test('PAIR tests cannot read the live client key or peer membership', async () => {
+  const root = path.join(require('node:os').homedir(), '.config', 'Nvidia Corporation', 'Personal AI Router');
+  for (const name of ['cluster/node.key', 'cluster/identity.json']) {
+    await assert.rejects(fs.promises.readFile(path.join(root, name)), /miser-live-file-guard/);
+  }
+});
+
 function runGuarded(script) {
   return spawnSync(process.execPath, [
     '--require',

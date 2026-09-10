@@ -201,10 +201,14 @@ hit the normal ORCH caps.
 Miser also infers one narrow marker-less fresh manual setup shape: a low-turn protected ORCH Read of
 a known launcher/setup file, such as `/home/nacho/bin/spawn-lane.sh`, when the first user prompt is
 clearly a bounded ORCH boot/setup prompt. That prevents launcher source text containing `curl`, `git`,
-`gh`, or `npm test` examples from consuming ORCH self-work budget. The local ORCH intent classifier
-module is currently staged as nonblocking prompt/JSON-validation scaffolding only; it does not run a
-local command or Ollama from the live request path. Invalid or absent advisory JSON has no live effect
-and deterministic enforcement remains authoritative.
+`gh`, or `npm test` examples from consuming ORCH self-work budget. An explicitly marked fresh boot
+can also use `head -n N <known-setup-file>` with at most 200 lines and no other shell action.
+The ORCH advisor is opt-in through `MISER_PAIR_ADVISOR='{"enabled":true}'`. It asynchronously
+classifies only literal, bounded GitHub metadata loops that would otherwise receive a watcher
+redirect. A validated `external_verification` allow with confidence at least 0.75 exempts that
+read; all other verdicts and failures keep deterministic enforcement. Precision PAIR is preferred
+over pinned mTLS; confirmed unavailability permits Per730 failover. See the
+[PAIR advisor runbook](PAIR-ADVISOR-RUNBOOK.md) for bounds, probes, enablement and rollback.
 Deterministic hard safety blocks for sensitive reads, destructive git, service mutations, PR writes,
 direct `codex exec`, polling, and obvious ORCH self-work are evaluated before any staged advisory
 state.

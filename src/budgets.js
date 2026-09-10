@@ -235,7 +235,7 @@ function buildGuardDeps(config, seams = {}) {
     const enforcementMod = require('./enforcement.js');
     guardDeps.enforcementConfig = enforcement;
     guardDeps.enforcementState = (seams.createEnforcementState || enforcementMod.createEnforcementState)();
-    guardDeps.checkEnforcement = enforcementMod.checkEnforcement;
+    guardDeps.checkEnforcement = enforcementMod.checkEnforcementAsync;
     guardDeps.recordEnforcementUsage = enforcementMod.recordEnforcementUsage;
     guardDeps.recordEnforcementEvent = require('./stats.js').recordEnforcementEvent;
   }
