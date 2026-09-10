@@ -326,11 +326,52 @@ function promptTextFromContent(content) {
   }).filter(Boolean).join('\n');
 }
 
-function stripClaudeCodeInjectedContext(text) {
-  return String(text || '')
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
-    .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/gi, '')
-    .trim();
+const INJECTED_CONTEXT_WRAPPERS = new Set(['system-reminder', 'local-command-caveat']);
+const ROLE_CONTEXT_WRAPPERS = new Set([
+  ...INJECTED_CONTEXT_WRAPPERS, 'task-notification', 'blockquote', 'pre', 'code',
+]);
+
+function topLevelContextText(text, wrappers) {
+  const input = String(text || '');
+  const chunks = [];
+  const stack = [];
+  const tags = /<\s*(\/?)\s*([a-z][a-z0-9:-]*)\b/gi;
+  let cursor = 0;
+  let tag;
+  while ((tag = tags.exec(input))) {
+    const name = tag[2].toLowerCase();
+    if (!wrappers.has(name)) continue;
+    // Find the tag boundary without treating > inside an attribute as a close.
+    let end = tags.lastIndex;
+    let quote = '';
+    for (; end < input.length; end++) {
+      const char = input[end];
+      if (quote) { if (char === quote) quote = ''; }
+      else if (char === '"' || char === "'") quote = char;
+      else if (char === '>' || char === '<') break;
+    }
+    const outside = stack.length === 0;
+    if (outside) chunks.push(input.slice(cursor, tag.index));
+    // An incomplete opening/tag is not a source of trusted trailing text.
+    if (input[end] !== '>') { cursor = input.length; break; }
+    if (tag[1]) {
+      // Crossed/unbalanced wrappers stay suppressed until properly closed.
+      if (stack[stack.length - 1] === name) stack.pop();
+    } else if (!input.slice(tag.index, end).trimEnd().endsWith('/')) {
+      stack.push(name);
+    }
+    // Never join two fragments across a wrapper into a new declaration.
+    if (outside || stack.length === 0) chunks.push('\n');
+    cursor = end + 1;
+    tags.lastIndex = cursor;
+  }
+  if (stack.length === 0) chunks.push(input.slice(cursor));
+  return chunks.join('');
+}
+
+function stripClaudeCodeInjectedContext(text, trim = true) {
+  const stripped = topLevelContextText(text, INJECTED_CONTEXT_WRAPPERS);
+  return trim ? stripped.trim() : stripped;
 }
 
 function latestUserPromptText(body) {
@@ -349,7 +390,7 @@ function systemPromptHead(body, maxBytes = 2048) {
   for (const msg of messages) {
     if (msg && msg.role === 'system') parts.push(promptTextFromContent(msg.content));
   }
-  return parts.filter(Boolean).join('\n').slice(0, maxBytes);
+  return stripClaudeCodeInjectedContext(parts.filter(Boolean).join('\n')).slice(0, maxBytes);
 }
 
 function firstUserPromptText(body, maxBytes = 4096) {
@@ -357,7 +398,7 @@ function firstUserPromptText(body, maxBytes = 4096) {
   const first = firstUserMessage(messages);
   if (!first) return '';
   const prompt = promptTextFromContent(first.content) || textFromContent(first.content);
-  return prompt.slice(0, maxBytes);
+  return stripClaudeCodeInjectedContext(prompt).slice(0, maxBytes);
 }
 
 function conversationFingerprint(body) {
@@ -433,6 +474,13 @@ function promptCommandCandidate(shape) {
   return text;
 }
 
+const NON_ORCH_ROLE = '(?:architect|ux|researcher|builder|evaluator|reviewer|auditor|audit|implementation[-_\\s]+lane)';
+const NON_ORCH_ROLE_LABEL = new RegExp(`(?:^|[^a-z0-9])${NON_ORCH_ROLE}(?=$|[^a-z0-9])`, 'i');
+const NON_ORCH_ROLE_DECLARATION = new RegExp(
+  `^\\s*(?:you are\\s+|role\\s*:\\s*)(?:(?:a|an|the|now|bounded|temporary|general|senior|lead|claude|codex|grok|architecture)\\s+)*${NON_ORCH_ROLE}(?=$|[^a-z0-9])`,
+  'i',
+);
+
 function textHasExplicitNonOrchRole(text) {
   const lower = String(text || '').toLowerCase();
   if (!lower) return false;
@@ -442,43 +490,69 @@ function textHasExplicitNonOrchRole(text) {
     || /\bdo\s+not\s+coordinate\s+other\s+panels\b/.test(lower);
 }
 
-function lineHasPositiveOrchRole(line) {
-  const lower = String(line || '').toLowerCase();
-  if (!lower || textHasExplicitNonOrchRole(lower)) return false;
-  return /\b(?:you are|role:|role_label:)\b[^\n]*(?:\borch\b|\borchestrator\b)/.test(lower)
-    || /\b(?:project|live|temporary)\s+orch\b/.test(lower)
-    || /\borch-control\b/.test(lower)
-    || /\bmiser_assignment=/.test(lower)
-    || /\barchitect lane\b/.test(lower);
+function unquotedRoleLines(text) {
+  const lines = [];
+  let fence = '';
+  let quoted = false;
+  for (const line of topLevelContextText(text, ROLE_CONTEXT_WRAPPERS).split(/\r?\n/)) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = '';
+      continue;
+    }
+    if (/^\s*>/.test(line)) { quoted = true; continue; }
+    if (!line.trim()) { quoted = false; continue; }
+    // Include Markdown's lazy blockquote continuation and indented code.
+    if (quoted || /^(?: {4}|\t)/.test(line)) continue;
+    if (marker) { fence = marker[1]; continue; }
+    lines.push(line.trim());
+  }
+  return lines;
 }
 
-function hasExplicitNonOrchRoleSignal(body) {
-  const text = [
-    systemPromptHead(body, 4096),
-    firstUserPromptText(body, 4096),
-    latestUserPromptText(body),
-  ].join('\n');
-  return textHasExplicitNonOrchRole(text);
+function declaredRole(line) {
+  const label = line.match(/^role_label\s*:\s*(\S+)/i);
+  if (label) {
+    if (NON_ORCH_ROLE_LABEL.test(label[1]) || textHasExplicitNonOrchRole(label[1])) return 'worker';
+    if (/(?:^|[^a-z0-9])(?:orch|orchestrator)(?=$|[^a-z0-9])/i.test(label[1])) return 'ORCH';
+  }
+  if (NON_ORCH_ROLE_DECLARATION.test(line)) return 'worker';
+  if (/^(?:you are\b|role\s*:)/i.test(line)) {
+    if (textHasExplicitNonOrchRole(line)) return 'worker';
+    if (/\b(?:orch|orchestrator)\b/i.test(line)) return 'ORCH';
+  }
+  if (/^(?:non[-_\s]?orch\b|not\s+(?:an?\s+)?orch\b|do\s+not\s+(?:use\s+orch\s+behavior|coordinate\s+other\s+panels)\b)/i.test(line)) return 'worker';
+  return '';
+}
+
+function roleAssignmentText(content) {
+  if (typeof content === 'string') return content;
+  // A tool continuation is never the initial role assignment, even if it
+  // carries adjacent text blocks. Only protocol text blocks are role sources.
+  if (!Array.isArray(content) || content.some(block => block && block.type === 'tool_result')) return '';
+  return content.filter(block => block && block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text).join('\n');
 }
 
 function deriveRole(body, project, panel) {
-  if (hasExplicitNonOrchRoleSignal(body)) return 'worker';
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const sources = [roleAssignmentText(body && body.system)];
+  for (const message of messages) {
+    if (!message || message.role !== 'system') break;
+    sources.push(roleAssignmentText(message.content));
+  }
+  const firstUser = firstUserMessage(messages);
+  if (firstUser) sources.push(roleAssignmentText(firstUser.content));
+  // Authority is limited to the initial system/first-user assignment. The
+  // latest declaration within that assignment wins; later dialogue cannot
+  // reassign identity, nor can notifications, tool results or task markers.
+  const lines = sources.flatMap(unquotedRoleLines);
+  let explicitRole = '';
+  for (const line of lines) explicitRole = declaredRole(line) || explicitRole;
+  if (explicitRole) return explicitRole;
+  if (NON_ORCH_ROLE_LABEL.test(String(panel || ''))) return 'worker';
   const panelLower = String(panel || '').toLowerCase();
-  if (['orch', 'architect', 'sprints'].includes(panelLower)) return 'ORCH';
-  const haystack = [
-    systemPromptHead(body, 4096),
-    firstUserPromptText(body, 4096),
-    latestUserPromptText(body),
-  ].join('\n');
-  if (haystack.split(/\r?\n/).some(lineHasPositiveOrchRole)) {
-    return 'ORCH';
-  }
-  const lower = haystack.toLowerCase();
-  if (lower.includes('miser_assignment=') || lower.includes('orch-control')) return 'ORCH';
-  if (lower.includes('builder') || lower.includes('codex builder') || lower.includes('implementation lane')
-      || lower.includes('auditor') || lower.includes('reviewer')) {
-    return 'builder';
-  }
+  if (['orch', 'sprints'].includes(panelLower)) return 'ORCH';
   return 'unknown';
 }
 
@@ -808,7 +882,7 @@ function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 
     commandClass: command.commandClass,
     terminalShape: command.terminalShape,
     redirectable: isRedirectableCommandClass(command.commandClass),
-    explicitNonOrchRole: hasExplicitNonOrchRoleSignal(body),
+    explicitNonOrchRole: role === 'worker',
     firstUserPromptText: firstUserPromptText(body),
     latestUserText: latestText,
     latestUserPromptText: latestPromptText,
@@ -1797,12 +1871,14 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   const protectedPanel = orchControlApplies(panel, policy) && classification.explicitNonOrchRole !== true;
   const redirectEligible = classification.explicitNonOrchRole !== true && classification.role === 'ORCH';
   if (redirectEligible) maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps);
-  const hardReason = protectedPanel ? hardSafetyReason(classification, body) : '';
+  // Hard safety is independent of ORCH membership and worker exemptions.
+  const hardReason = hardSafetyReason(classification, body);
   if (hardReason && !overrideActive) {
-    return maybeBlock(project, panel, policy, classification, state, guardDeps,
+    const hardBlock = maybeBlock(project, panel, policy, classification, state, guardDeps,
       'orch-hard-safety',
       `miser: deterministic ORCH hard safety block (${hardReason}); use an approved out-of-band lane or operator action`,
       600);
+    if (hardBlock) return hardBlock;
   }
   classification.bootSetupTurn = protectedPanel && isBootSetupTurn(policy, classification);
   if (protectedPanel && !classification.bootSetupTurn && isFreshBootSetupRead(policy, classification, body)) {
@@ -1858,6 +1934,10 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
       'miser: latest tool_result too large; write large output to an artifact and summarize the path',
       null);
   }
+
+  // null allows upstream processing. General tool-result limits still apply,
+  // but known worker roles never enter ORCH poll/assignment enforcement.
+  if (classification.explicitNonOrchRole) return null;
 
   if (classification.pollClass === 'likely' && protectedPanel && countedManagement && classification.pollingCommandLike) {
     const counts = pollCounts(st, now);
