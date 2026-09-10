@@ -132,6 +132,7 @@ test('artifact freshness reports missing, fresh, and stale states', async () => 
 test('enabled watcher lists and refreshes configured probes normally', async () => {
   let runs = 0;
   const watcher = createWatcher({
+    watchDir: tmpWatchDir('enabled'),
     probes: [{ id: 'ci', command: 'echo ok', ttl_s: 90, timeout_s: 5 }],
     runCommand: async () => {
       runs += 1;

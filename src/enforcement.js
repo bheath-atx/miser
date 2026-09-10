@@ -5,6 +5,11 @@ const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { isValidProjectName } = require('./routing.js');
+const { readonlyAction } = require('./orch-readonly-action.js');
+const { validateAdvisorJson } = require('./orch-intent-classifier.js');
+
+// Private capability: request headers, prompt text and tool output cannot set it.
+const ADVISOR_ALLOWANCE = Symbol('advisor-verified-readonly');
 
 const VALID_MODES = new Set(['observe', 'alert', 'throttle', 'block']);
 const VALID_REDIRECT_MODES = new Set(['off', 'shadow', 'warn', 'enforce']);
@@ -413,7 +418,7 @@ function normalizedText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function terminalMessageShape(body) {
+function terminalMessageShapes(body) {
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
   const latestIndex = (() => {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -421,30 +426,36 @@ function terminalMessageShape(body) {
     }
     return -1;
   })();
-  if (latestIndex < 0) return { kind: 'none', text: '', toolUse: null };
+  if (latestIndex < 0) return [{ kind: 'none', text: '', toolUse: null }];
   const latest = messages[latestIndex];
   const blocks = Array.isArray(latest.content) ? latest.content : [];
-  const toolResult = blocks.find(block => block && block.type === 'tool_result');
-  if (!toolResult) {
+  const toolResults = blocks.filter(block => block && block.type === 'tool_result');
+  if (!toolResults.length) {
     const text = stripClaudeCodeInjectedContext(promptTextFromContent(latest.content) || textFromContent(latest.content));
     const lower = text.toLowerCase();
     if (lower.includes('<task-notification>')
         || lower.includes('stop-hook')
         || lower.includes('stop_hook')
         || lower.includes('monitor callback')) {
-      return { kind: 'notification', text, toolUse: null };
+      return [{ kind: 'notification', text, toolUse: null }];
     }
-    return { kind: 'real_user_text', text, toolUse: null };
+    return [{ kind: 'real_user_text', text, toolUse: null }];
   }
 
-  const id = toolResult.tool_use_id || toolResult.id || '';
-  for (let i = latestIndex - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
-    const match = msg.content.find(block => block && block.type === 'tool_use' && (!id || block.id === id));
-    if (match) return { kind: 'tool_result', text: textFromContent(toolResult.content), toolUse: match };
-  }
-  return { kind: 'tool_result', text: textFromContent(toolResult.content), toolUse: null };
+  return toolResults.map(toolResult => {
+    const id = toolResult.tool_use_id || toolResult.id || '';
+    for (let i = latestIndex - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+      const match = msg.content.find(block => block && block.type === 'tool_use' && (!id || block.id === id));
+      if (match) return { kind: 'tool_result', text: textFromContent(toolResult.content), toolUse: match };
+    }
+    return { kind: 'tool_result', text: textFromContent(toolResult.content), toolUse: null };
+  });
+}
+
+function terminalMessageShape(body) {
+  return terminalMessageShapes(body)[0];
 }
 
 function extractToolCommand(toolUse) {
@@ -1325,29 +1336,42 @@ function isFreshBootSetupRead(policy, classification, body) {
   const shape = terminalMessageShape(body);
   const tool = extractToolCommand(shape.toolUse);
   if (shape.kind !== 'tool_result') return false;
-  if (String(tool.name || '').toLowerCase() !== 'read') return false;
-  if (!safeBootSetupReadPath(tool.filePath)) return false;
-  return firstPromptLooksManualBootSetup(classification);
+  const marked = isBootSetupMarkedTurn(policy, classification.firstUserPromptText)
+    || isBootSetupMarkedTurn(policy, classification.latestUserPromptText);
+  if (String(tool.name || '').toLowerCase() === 'read') {
+    return safeBootSetupReadPath(tool.filePath) && (marked || firstPromptLooksManualBootSetup(classification));
+  }
+  if (!marked || tool.name !== 'Bash') return false;
+  const messages = body.messages || [];
+  const results = messages.at(-1)?.content;
+  const uses = messages.at(-2)?.content;
+  if (!Array.isArray(results) || results.length !== 1 || !Array.isArray(uses)
+      || uses.filter(b => b?.type === 'tool_use').length !== 1) return false;
+  const boundedHead = tool.command.match(/^head -n ([1-9][0-9]{0,2}) ([A-Za-z0-9_~./-]+)$/);
+  return !!(boundedHead && Number(boundedHead[1]) <= 200 && safeBootSetupReadPath(boundedHead[2]));
 }
 
 function hardSafetyReason(classification, body = null) {
-  const shape = body ? terminalMessageShape(body) : null;
-  const tool = shape ? extractToolCommand(shape.toolUse) : { name: '', command: '', filePath: '' };
-  const prompt = shape ? promptCommandCandidate(shape) : (classification.latestUserPromptText || '');
-  const commandish = normalizedText(tool.command || prompt).toLowerCase();
-  const filePath = String(tool.filePath || '').toLowerCase();
-  if (filePath && /(?:^|\/)\.(?:ssh|termdeck)(?:\/|$)|(?:^|\/)\.claude\.json$|(?:^|\/)\.gitconfig$/.test(filePath)) {
-    return 'sensitive-file-read';
+  // Inspect the entire result batch before any role, boot or advisor exemption.
+  const shapes = body ? terminalMessageShapes(body) : [null];
+  for (const shape of shapes) {
+    const tool = shape ? extractToolCommand(shape.toolUse) : { name: '', command: '', filePath: '' };
+    const prompt = shape ? promptCommandCandidate(shape) : (classification.latestUserPromptText || '');
+    const commandish = normalizedText(tool.command || prompt).toLowerCase();
+    const filePath = String(tool.filePath || '').toLowerCase();
+    if (filePath && /(?:^|\/)\.(?:ssh|termdeck)(?:\/|$)|(?:^|\/)\.claude\.json$|(?:^|\/)\.gitconfig$/.test(filePath)) {
+      return 'sensitive-file-read';
+    }
+    if (/(^|\s)(env|printenv|export|set)(\s|$)/.test(commandish)
+        && /(secret|token|key|password|credential|anthropic|openai|termdeck)/.test(commandish)) return 'sensitive-env';
+    if (/\b(?:cat|head|tail|sed|nl|rg|grep|find|ls)\b[\s\S]*(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/.test(commandish)) return 'sensitive-file-read';
+    if (/\brg\b[\s\S]*(?:secret|token|password|credential)[\s\S]*\/home\/nacho\b/.test(commandish)) return 'broad-secret-search';
+    if (/\bgit\s+branch\b[\s\S]*(?:-d|-D|--delete)\b/.test(commandish)) return 'destructive-git-branch';
+    if (/\bgit\s+(?:commit|push|merge)\b/.test(commandish)) return 'git-write-operation';
+    if (/\bgh\s+pr\s+(?:create|merge)\b/.test(commandish)) return 'pr-write-operation';
+    if (/\bsystemctl\b[\s\S]*(?:restart|stop|start|reload)\b/.test(commandish)) return 'service-mutation';
+    if (/\bcodex\s+exec\b/.test(commandish)) return 'direct-codex-exec';
   }
-  if (/(^|\s)(env|printenv|export|set)(\s|$)/.test(commandish)
-      && /(secret|token|key|password|credential|anthropic|openai|termdeck)/.test(commandish)) return 'sensitive-env';
-  if (/\b(?:cat|sed|nl|rg|grep|find|ls)\b[\s\S]*(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/.test(commandish)) return 'sensitive-file-read';
-  if (/\brg\b[\s\S]*(?:secret|token|password|credential)[\s\S]*\/home\/nacho\b/.test(commandish)) return 'broad-secret-search';
-  if (/\bgit\s+branch\b[\s\S]*(?:-d|-D|--delete)\b/.test(commandish)) return 'destructive-git-branch';
-  if (/\bgit\s+(?:commit|push|merge)\b/.test(commandish)) return 'git-write-operation';
-  if (/\bgh\s+pr\s+(?:create|merge)\b/.test(commandish)) return 'pr-write-operation';
-  if (/\bsystemctl\b[\s\S]*(?:restart|stop|start|reload)\b/.test(commandish)) return 'service-mutation';
-  if (/\bcodex\s+exec\b/.test(commandish)) return 'direct-codex-exec';
   return '';
 }
 
@@ -1870,7 +1894,6 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   classification.handoffMarked = isHandoffMarkedTurn(policy, promptText, requestHeaders);
   const protectedPanel = orchControlApplies(panel, policy) && classification.explicitNonOrchRole !== true;
   const redirectEligible = classification.explicitNonOrchRole !== true && classification.role === 'ORCH';
-  if (redirectEligible) maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps);
   // Hard safety is independent of ORCH membership and worker exemptions.
   const hardReason = hardSafetyReason(classification, body);
   if (hardReason && !overrideActive) {
@@ -1880,6 +1903,23 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
       600);
     if (hardBlock) return hardBlock;
   }
+  const advisorAllowance = guardDeps[ADVISOR_ALLOWANCE];
+  if (advisorAllowance && advisorCandidate(policy, classification, body, requestHeaders)) {
+    classification.commandClass = 'EXTERNAL_VERIFICATION';
+    classification.redirectable = false;
+    classification.selfWorkCommandLike = false;
+    classification.managementLike = false;
+    classification.pollingCommandLike = false;
+    classification.isControl = false;
+    classification.controlClasses = [];
+    classification.advisorExempt = true;
+    const event = { decision: 'advisor_allow', reason: 'bounded-external-verification',
+      commandClass: classification.commandClass, role: classification.role,
+      target: advisorAllowance.target, confidence: advisorAllowance.confidence };
+    state.recordDecision(project, panel, event);
+    if (guardDeps.recordEnforcementEvent) guardDeps.recordEnforcementEvent(project, event, guardDeps.nowFn);
+  }
+  if (redirectEligible) maybeRecordRedirectShadow(project, panel, policy, classification, state, guardDeps);
   classification.bootSetupTurn = protectedPanel && isBootSetupTurn(policy, classification);
   if (protectedPanel && !classification.bootSetupTurn && isFreshBootSetupRead(policy, classification, body)) {
     classification.bootSetupTurn = true;
@@ -1889,7 +1929,7 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
     classification.isControl = false;
     classification.controlClasses = [];
   }
-  const countedManagement = protectedPanel && !classification.bootSetupTurn && isCountedOrchManagementTurn(policy, classification);
+  const countedManagement = protectedPanel && !classification.bootSetupTurn && !classification.advisorExempt && isCountedOrchManagementTurn(policy, classification);
   const assignmentId = protectedPanel ? extractAssignmentId(policy, promptText, requestHeaders) : '';
   const resetAssignment = protectedPanel && (
     overrideActive
@@ -2035,6 +2075,70 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   return null;
 }
 
+function advisorCandidate(policy, classification, body, requestHeaders) {
+  if (!policy || classification.role !== 'ORCH' || classification.explicitNonOrchRole
+      || classification.commandClass !== 'SWEEP_REPO' || hardSafetyReason(classification, body)
+      || !['warn', 'enforce'].includes(policy.redirect?.mode)
+      || !safeForSyntheticRedirect(body, classification) || hasOverride(classification.project, policy, requestHeaders)) return null;
+  // The advisor cannot override the independent tool-output size cap.
+  if (policy.mode === 'block' && policy.toolResults?.mode === 'block'
+      && classification.maxLatestToolResultBytes > policy.toolResults.maxToolResultBytes) return null;
+  return readonlyAction(body);
+}
+
+async function checkEnforcementAsync(project, panel, body, compactHeaders = {}, rawTokens = 0, guardDeps = {}, requestHeaders = {}) {
+  const advisor = guardDeps.pairAdvisor;
+  let allowance = null;
+  let fallbackReason = '';
+  if (advisor && guardDeps.enforcementConfig && !guardDeps.advisorSignal?.aborted) {
+    const policy = resolvePolicy(guardDeps.enforcementConfig, project);
+    const classification = classifyRequest(project, panel, body, compactHeaders, rawTokens);
+    const candidate = advisorCandidate(policy, classification, body, requestHeaders);
+    if (candidate) {
+      // Only bounded user context and validated command scope leave Miser.
+      // Raw tool output, provider headers and process environment are omitted.
+      const firstUser = firstUserMessage(body.messages || []);
+      const input = { project, panel, tool: candidate.tool,
+        readonlyScope: { kind: candidate.kind, repos: candidate.repos, fields: candidate.fields },
+        classification: { ...classification,
+          firstUserPromptText: stripClaudeCodeInjectedContext(promptTextFromContent(firstUser?.content)).slice(0, 768),
+          latestUserPromptText: classification.latestUserPromptText.slice(0, 768), latestUserText: '' } };
+      let timer;
+      let abort;
+      try {
+        const deadline = new Promise(resolve => {
+          timer = setTimeout(() => resolve(null), Math.min(advisor.timeoutMs || 12000, 20000) + 25);
+          abort = () => resolve(null);
+          guardDeps.advisorSignal?.addEventListener('abort', abort, { once: true });
+        });
+        const result = await Promise.race([Promise.resolve().then(() => advisor.classify(input)), deadline]);
+        // Validate again at the application boundary, even for injected callers.
+        const validated = result?.ok ? validateAdvisorJson(JSON.stringify(result.advisor)) : null;
+        if (validated?.ok && validated.value.intent === 'external_verification'
+            && validated.value.action === 'allow' && validated.value.should_count === false) {
+          allowance = { target: result.target, confidence: validated.value.confidence };
+        } else {
+          fallbackReason = validated?.reason || result?.reason || (result ? 'non_softening_verdict' : 'deadline');
+        }
+      } catch (_) { fallbackReason = 'advisor_error'; }
+      finally {
+        clearTimeout(timer);
+        if (abort) guardDeps.advisorSignal?.removeEventListener('abort', abort);
+      }
+    }
+  }
+  if (guardDeps.advisorSignal?.aborted) return null;
+  if (fallbackReason) {
+    const event = { decision: 'advisor_fallback', reason: /^[a-z0-9_-]{1,60}$/.test(fallbackReason) ? fallbackReason : 'advisor_error' };
+    (guardDeps.enforcementState || defaultState).recordDecision(project, panel, event);
+    if (guardDeps.recordEnforcementEvent) guardDeps.recordEnforcementEvent(project, event, guardDeps.nowFn);
+  }
+  // State is recorded exactly once, after the wait, against current policy.
+  // Existing assignment budgets are preserved; only this proven read is exempt.
+  return checkEnforcement(project, panel, body, compactHeaders, rawTokens,
+    allowance ? { ...guardDeps, [ADVISOR_ALLOWANCE]: allowance } : guardDeps, requestHeaders);
+}
+
 function recordEnforcementUsage(project, panel, usage, weights, guardDeps = {}) {
   const state = guardDeps.enforcementState || defaultState;
   return state.recordUsage(project, panel, usage || {}, weights || {});
@@ -2050,6 +2154,7 @@ module.exports = {
   buildSyntheticSseResponse,
   createEnforcementState,
   checkEnforcement,
+  checkEnforcementAsync,
   recordEnforcementUsage,
   __test: {
     textFromContent,

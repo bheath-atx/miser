@@ -145,6 +145,8 @@ function isHomeMiserPath(p) {
 function isProtectedDefaultPath(p) {
   const resolved = normalize(p);
   if (!resolved) return false;
+  const pairRoot = path.join(home, '.config', 'Nvidia Corporation', 'Personal AI Router');
+  if (resolved === pairRoot || resolved.startsWith(`${pairRoot}${path.sep}`)) return true;
   for (const defaultPath of homeDefaults.values()) {
     if (resolved === path.resolve(defaultPath)) return true;
   }

@@ -1,5 +1,12 @@
 # Miser failover cutover — rollback / quick-fix runbook
 
+**2026-09-10 PAIR advisor:** the current isolated patch has its own
+[enablement, diagnostics and rollback procedure](PAIR-ADVISOR-RUNBOOK.md).
+It remains offline pending Codex inversion-QA → voice-pass → Grok builder-audit;
+Brad owns cutover. Disabling `MISER_PAIR_ADVISOR` restores deterministic decisions.
+The commit IDs and checkout commands below are the historical July failover procedure,
+not the rollback target for the PAIR advisor change.
+
 Branch: `fix/miser-brick-failover` (commits 6581af0 → a0fa20e → cd109cc → 3b7e1d7).
 Live baseline (frozen, known-good): **`3d5f0f1`** at `/home/nacho/miser`, run by
 systemd user unit `miser` (`ExecStart=node /home/nacho/miser/src/index.js`,
