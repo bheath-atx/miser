@@ -716,9 +716,10 @@ test('R1 long and unclosed reminders cannot change role identity', () => {
   assert.equal(classifyRequest('aetheria', 'orch', body).role, 'worker', 'real declaration after a long reminder is retained');
 });
 
-test('R1 workers remain subject to every deterministic hard-safety check', () => {
+function hardSafetyCases(system) {
   const commands = [
     ['cat /home/nacho/.termdeck/secrets.env', 'sensitive-file-read'],
+    ['cat ~/.termdeck/config.yaml', 'sensitive-file-read'],
     ['cat /home/nacho/.claude.json', 'sensitive-file-read'],
     ['cat /home/nacho/.gitconfig', 'sensitive-file-read'],
     ['printenv SECRET_TOKEN', 'sensitive-env'],
@@ -728,25 +729,98 @@ test('R1 workers remain subject to every deterministic hard-safety check', () =>
     ['git push origin example', 'git-write-operation'],
     ['git merge example', 'git-write-operation'],
     ['gh pr create --title example', 'pr-write-operation'],
+    ['gh pr merge 123', 'pr-write-operation'],
     ['systemctl --user restart miser', 'service-mutation'],
     ['codex exec example', 'direct-codex-exec'],
   ];
+  const cases = commands.flatMap(([command, reason]) => [
+    [bashToolResultBody(command, system), reason],
+    [promptBody(command, system), reason],
+  ]);
+  for (const filePath of ['/home/nacho/.ssh/id_rsa', '/home/nacho/.termdeck/config.yaml']) {
+    const body = bashToolResultBody('', system);
+    body.messages[1].content[0].name = 'Read';
+    body.messages[1].content[0].input = { file_path: filePath };
+    cases.push([body, 'sensitive-file-read']);
+  }
+  return cases;
+}
+
+test('every deterministic hard-safety category still blocks ORCH regardless of panel membership', () => {
   for (const panel of ['orch', 'architect', 'unlisted-worker']) {
     for (const enabled of [true, false]) {
-      const state = createEnforcementState({ nowMs: () => 1000 });
-      const config = configFor('aetheria', { panels: ['orch'], enabled });
-      const deps = guard(config, state);
-      const cases = commands.map(([command, reason]) => [bashToolResultBody(command, 'You are the architect.'), reason]);
-      const sensitiveRead = toolResultBody('not shown');
-      sensitiveRead.system = 'You are the architect.';
-      sensitiveRead.messages[0].content[0].input.file_path = '/home/nacho/.ssh/id_rsa';
-      cases.push([sensitiveRead, 'sensitive-file-read']);
-      for (const [body, reason] of cases) {
-        assert.equal(classifyRequest('aetheria', panel, body).explicitNonOrchRole, true);
-        const response = checkEnforcement('aetheria', panel, body, {}, 100, deps);
-        assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', `${panel}/${enabled}/${reason}`);
-        assert.match(response.body.content[0].text, new RegExp(reason));
+      for (const mode of ['throttle', 'block']) {
+        const state = createEnforcementState({ nowMs: () => 1000 });
+        const config = configFor('aetheria', { panels: ['orch'], enabled });
+        config.aetheria.mode = mode;
+        const deps = guard(config, state);
+        for (const [body, reason] of hardSafetyCases('ROLE: ORCH')) {
+          const label = `${panel}/${enabled}/${mode}/${reason}`;
+          assert.equal(classifyRequest('aetheria', panel, body).role, 'ORCH', label);
+          const before = deps.events.length;
+          const response = checkEnforcement('aetheria', panel, body, {}, 100, deps);
+          assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', label);
+          assert.match(response.body.content[0].text, new RegExp(reason));
+          assert.equal(deps.events.length, before + 1, label);
+          assert.equal(deps.events.at(-1).decision, 'block', label);
+          assert.deepEqual(state.snapshot().recentEvents.at(-1), deps.events.at(-1));
+        }
+        assert.equal(state.get('aetheria', panel).totalRequests, 0);
       }
+    }
+  }
+});
+
+test('all hard-safety categories are observed for non-ORCH panel, system and boot roles', () => {
+  const identities = [
+    { panel: 'architect', role: 'worker' },
+    { panel: 'builder', role: 'worker' },
+    { panel: 'unknown', role: 'unknown' },
+  ];
+  for (const declaration of ['ROLE: architect', 'ROLE: builder', 'You are a non-ORCH worker.']) {
+    identities.push({ panel: 'orch', system: declaration, role: 'worker' });
+    identities.push({ panel: 'orch', system: 'ROLE: ORCH', boot: declaration, role: 'worker' });
+  }
+  for (const identity of identities) {
+    for (const mode of ['throttle', 'block', 'observe', 'alert']) {
+      for (const enabled of [true, false]) {
+        const config = configFor('aetheria', { enabled });
+        config.aetheria.mode = mode;
+        config.aetheria.redirect = { mode: 'enforce' };
+        for (const [body, reason] of hardSafetyCases(identity.system || 'Assistant.')) {
+          const state = createEnforcementState({ nowMs: () => 1000 });
+          const deps = guard(config, state);
+          if (identity.boot) body.messages[0].content = `${identity.boot}\n${body.messages[0].content}`;
+          const label = `${JSON.stringify(identity)}/${mode}/${enabled}/${reason}`;
+          assert.equal(classifyRequest('aetheria', identity.panel, body).role, identity.role, label);
+          assert.equal(checkEnforcement('aetheria', identity.panel, body, {}, 100, deps), null, label);
+          assert.equal(deps.events.length, 1, label);
+          const event = deps.events.at(-1);
+          assert.equal(event.decision, 'would_block', label);
+          assert.equal(event.reason, 'orch-hard-safety', label);
+          assert.equal(event.hardSafetyReason, reason, label);
+          assert.equal(event.role, identity.role, label);
+          assert.deepEqual(state.snapshot().recentEvents.at(-1), event);
+          const session = state.get('aetheria', identity.panel);
+          assert.equal(session.totalRequests, 1, 'observation continues through request accounting');
+          assert.equal(session.wouldBlocks, 1);
+          assert.equal(session.blocks, 0);
+          assert.equal(session.alerts, 0);
+        }
+      }
+    }
+  }
+});
+
+test('hard-safety overrides preserve passthrough and observations for every role', () => {
+  for (const [panel, system] of [['orch', 'ROLE: ORCH'], ['orch', 'ROLE: builder'], ['unknown', 'Assistant.']]) {
+    const state = createEnforcementState({ nowMs: () => 1000 });
+    const deps = guard(configFor('aetheria'), state);
+    for (const [body, reason] of hardSafetyCases(system)) {
+      assert.equal(checkEnforcement('aetheria', panel, body, {}, 100, deps, { 'x-miser-override': 'manual' }), null);
+      assert.equal(deps.events.at(-1)?.decision, 'would_block');
+      assert.equal(deps.events.at(-1).hardSafetyReason, reason);
+      assert.equal(deps.events.at(-1).overrideActive, true);
     }
   }
 });

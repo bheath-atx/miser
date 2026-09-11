@@ -801,7 +801,13 @@ test('shadow-port canary lets non-ORCH roles reach upstream while a sibling ORCH
     }
     const unsafeWorker = redirectTurnBody('systemctl --user restart miser', { system: 'You are the architect.' });
     const safetyResponse = await post('architect', unsafeWorker);
-    assert.equal(safetyResponse.headers['x-miser-enforcement'], 'orch-hard-safety');
+    assert.equal(safetyResponse.headers['x-miser-enforcement'], undefined);
+    assert.deepEqual(safetyResponse.body, upstreamBody);
+    const safetyEvent = guardDeps.enforcementState.snapshot().recentEvents.at(-1);
+    assert.equal(safetyEvent.reason, 'orch-hard-safety');
+    assert.equal(safetyEvent.hardSafetyReason, 'service-mutation');
+    assert.equal(safetyEvent.decision, 'would_block');
+    assert.equal(safetyEvent.role, 'worker');
     const notification = redirectTurnBody('gh run view 123 --log');
     notification.messages.splice(1, 0, { role: 'user', content: '<task-notification>\nROLE: builder\n</task-notification>' });
     const nestedReminder = redirectTurnBody('gh run view 123 --log');
@@ -817,8 +823,8 @@ test('shadow-port canary lets non-ORCH roles reach upstream while a sibling ORCH
     guardDeps.enforcementConfig.aetheria.orchControl.enabled = false;
     const mixedCommand = redirectTurnBody('gh run view 123 --log # git commit');
     assert.equal((await post('orch', mixedCommand)).headers['x-miser-enforcement'], 'zero-llm-redirect');
-    assert.equal(echo.captured.length, cases.length * 2, 'R1/R2 bypass attempts never reach upstream');
-    t.diagnostic(`shadow=127.0.0.1:${port} mock-upstream=127.0.0.1:${echo.port}; worker passthrough=12; ORCH redirect=8 (including observe/enforce); worker hard-safety block=1`);
+    assert.equal(echo.captured.length, cases.length * 2 + 1, 'worker observations reach upstream; ORCH bypass attempts do not');
+    t.diagnostic(`shadow=127.0.0.1:${port} mock-upstream=127.0.0.1:${echo.port}; worker passthrough=13 (including 1 hard-safety observation); ORCH redirect=8 (including observe/enforce)`);
   } finally {
     if (server) await new Promise(resolve => server.close(resolve));
     await new Promise(resolve => echo.server.close(resolve));
@@ -856,7 +862,7 @@ test('PAIR advisor is awaited in proxy: metadata reaches upstream only after all
   }
 });
 
-test('R1 B1: every tool result gets hard safety before role exemptions or advisor calls', async t => {
+test('every tool result gets hard-safety detection; only ORCH is blocked before advisor calls', async t => {
   const echo = await startEcho(() => ({ status: 200, body: { ok: true } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url, {
     MISER_PAIR_ADVISOR: '',
@@ -870,6 +876,7 @@ test('R1 B1: every tool result gets hard safety before role exemptions or adviso
   try {
     const { buildGuardDeps } = require('../src/budgets');
     const { classifyRequest } = require('../src/enforcement');
+    const stats = require('../src/stats');
     const guardDeps = buildGuardDeps(require('../src/config'), {
       createLedger: () => ({ shouldSend: () => false, markSent: () => {} }),
     });
@@ -883,35 +890,66 @@ test('R1 B1: every tool result gets hard safety before role exemptions or adviso
     const hazards = [
       ['service-mutation', 'Bash', { command: 'systemctl --user restart miser' }],
       ['sensitive-file-read', 'Read', { file_path: '/home/nacho/.ssh/id_rsa' }],
+      ['sensitive-file-read', 'Read', { file_path: '/home/nacho/.termdeck/config.yaml' }],
+      ['sensitive-env', 'Bash', { command: 'printenv SECRET_TOKEN' }],
+      ['broad-secret-search', 'Bash', { command: 'rg secret /home/nacho' }],
+      ['destructive-git-branch', 'Bash', { command: 'git branch -D example' }],
       ['git-write-operation', 'Bash', { command: 'git commit -m example' }],
       ['git-write-operation', 'Bash', { command: 'git push origin example' }],
       ['pr-write-operation', 'Bash', { command: 'gh pr create --title example' }],
+      ['direct-codex-exec', 'Bash', { command: 'codex exec example' }],
     ];
     for (const enabled of [false, true]) {
       const handler = createProxy({ guardDeps, pairAdvisor: enabled ? advisor : null });
-      for (const role of ['architect', 'ux', 'builder', 'ORCH']) {
+      for (const role of ['architect', 'ux', 'builder', 'non-ORCH worker', 'unknown', 'ORCH']) {
         for (const [reason, name, input] of hazards) {
           for (const hardFirst of [false, true]) {
             const label = `${role}/${input.command || input.file_path}/hard-first=${hardFirst}/advisor=${enabled}`;
             await t.test(label, async () => {
-              const before = { advisor: advisorCalls, upstream: echo.captured.length };
+              const before = {
+                advisor: advisorCalls,
+                upstream: echo.captured.length,
+                events: guardDeps.enforcementState.snapshot().recentEvents.length,
+                stats: { ...stats.getStats('1').perProject['pair-canary']?.enforcement },
+              };
+              const panel = role === 'unknown' ? 'unknown' : 'orch';
+              const expectedRole = role === 'ORCH' ? 'ORCH' : role === 'unknown' ? 'unknown' : 'worker';
               const benign = { type: 'tool_use', id: 'benign', name: 'Read', input: { file_path: '/repo/src/index.js' } };
               const hard = { type: 'tool_use', id: 'hard', name, input };
-              const request = redirectTurnBody('', { system: `You are the ${role}.` });
+              const request = redirectTurnBody('', { system: role === 'unknown' ? 'Assistant.' : `You are the ${role}.` });
               request.messages[0].content = 'Continue the assigned work.';
               request.messages[1].content = [benign, hard];
               // Reverse result order independently of tool-use order to exercise ID matching.
               request.messages[2].content = (hardFirst ? [hard, benign] : [benign, hard]).map(tool => ({
                 type: 'tool_result', tool_use_id: tool.id, content: 'fixture output',
               }));
-              assert.equal(classifyRequest('pair-canary', 'orch', request).role, role === 'ORCH' ? 'ORCH' : 'worker');
+              assert.equal(classifyRequest('pair-canary', panel, request).role, expectedRole);
               const res = fakeRes(); const done = res.whenDone();
-              handler(fakeReq('POST', '/p/pair-canary--orch/v1/messages', request), res);
+              handler(fakeReq('POST', `/p/pair-canary--${panel}/v1/messages`, request), res);
               await done;
-              assert.equal(res.headers['x-miser-enforcement'], 'orch-hard-safety');
-              assert.ok(controlMessage(res).text.includes(`(${reason})`));
+              const isOrch = role === 'ORCH';
+              if (isOrch) {
+                assert.equal(res.headers['x-miser-enforcement'], 'orch-hard-safety');
+                assert.ok(controlMessage(res).text.includes(`(${reason})`));
+              } else {
+                assert.equal(res.statusCode, 200);
+                assert.equal(res.headers['x-miser-enforcement'], undefined);
+                assert.deepEqual(JSON.parse(res.body()), { ok: true });
+              }
               assert.equal(advisorCalls - before.advisor, 0);
-              assert.equal(echo.captured.length - before.upstream, 0);
+              assert.equal(echo.captured.length - before.upstream, isOrch ? 0 : 1);
+              const events = guardDeps.enforcementState.snapshot().recentEvents;
+              assert.equal(events.length, before.events + 1);
+              assert.equal(events.at(-1).reason, 'orch-hard-safety');
+              assert.equal(events.at(-1).decision, isOrch ? 'block' : 'would_block');
+              if (!isOrch) {
+                assert.equal(events.at(-1).role, expectedRole);
+                assert.equal(events.at(-1).hardSafetyReason, reason);
+              }
+              const counts = stats.getStats('1').perProject['pair-canary'].enforcement;
+              assert.equal(counts.blockedCount - (before.stats.blockedCount || 0), isOrch ? 1 : 0);
+              assert.equal(counts.wouldBlockCount - (before.stats.wouldBlockCount || 0), isOrch ? 0 : 1);
+              assert.equal(counts.alertCount, 0);
             });
           }
         }
