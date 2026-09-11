@@ -1894,14 +1894,30 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   classification.handoffMarked = isHandoffMarkedTurn(policy, promptText, requestHeaders);
   const protectedPanel = orchControlApplies(panel, policy) && classification.explicitNonOrchRole !== true;
   const redirectEligible = classification.explicitNonOrchRole !== true && classification.role === 'ORCH';
-  // Hard safety is independent of ORCH membership and worker exemptions.
+  // Detect hard-safety findings for every role; only ORCH can be blocked.
   const hardReason = hardSafetyReason(classification, body);
-  if (hardReason && !overrideActive) {
+  if (hardReason && classification.role === 'ORCH' && !overrideActive) {
     const hardBlock = maybeBlock(project, panel, policy, classification, state, guardDeps,
       'orch-hard-safety',
       `miser: deterministic ORCH hard safety block (${hardReason}); use an approved out-of-band lane or operator action`,
       600);
     if (hardBlock) return hardBlock;
+  } else if (hardReason) {
+    // Reuse the observation decision so stats retain findings without blocks or alerts.
+    const event = state.recordDecision(project, panel, {
+      decision: 'would_block',
+      reason: 'orch-hard-safety',
+      hardSafetyReason: hardReason,
+      role: classification.role,
+      mode: policy.mode || 'observe',
+      overrideActive,
+      controlClasses: classification.controlClasses,
+      pollClass: classification.pollClass,
+      assistantTurns: classification.assistantTurns,
+    });
+    if (guardDeps.recordEnforcementEvent) {
+      guardDeps.recordEnforcementEvent(project, event, guardDeps.nowFn || (() => new Date()));
+    }
   }
   const advisorAllowance = guardDeps[ADVISOR_ALLOWANCE];
   if (advisorAllowance && advisorCandidate(policy, classification, body, requestHeaders)) {
