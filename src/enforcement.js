@@ -418,8 +418,45 @@ function normalizedText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function terminalOpenAIToolShapes(messages) {
+  const latest = messages.at(-1);
+  if (latest?.role === 'assistant' && Array.isArray(latest.tool_calls) && latest.tool_calls.length) {
+    return latest.tool_calls.map(toolCall => ({ kind: 'tool_use', text: '', toolUse: null, toolCall }));
+  }
+  if (latest?.role !== 'tool') return null;
+
+  // Chat Completions returns a batch as separate role:tool messages. Pair only
+  // with the nearest assistant tool-call turn, never with stale conversation IDs.
+  let firstResult = messages.length - 1;
+  while (firstResult > 0 && messages[firstResult - 1]?.role === 'tool') firstResult--;
+  let toolCalls = [];
+  for (let i = firstResult - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role === 'user') break;
+    if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      toolCalls = msg.tool_calls;
+      break;
+    }
+  }
+  return messages.slice(firstResult).map(result => {
+    const id = result.tool_call_id;
+    const toolCall = typeof id === 'string' && id
+      ? toolCalls.find(call => call && call.id === id) || null
+      : null;
+    // An orphan result is still tool traffic; its output is not a user command.
+    return { kind: 'tool_result', text: textFromContent(result.content), toolUse: null, toolCall };
+  });
+}
+
 function terminalMessageShapes(body) {
   const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const openAIShapes = terminalOpenAIToolShapes(messages);
+  if (openAIShapes) return openAIShapes;
+  const terminal = messages.at(-1);
+  if (terminal?.role === 'assistant' && Array.isArray(terminal.content)) {
+    const toolUses = terminal.content.filter(block => block && block.type === 'tool_use');
+    if (toolUses.length) return toolUses.map(toolUse => ({ kind: 'tool_use', text: '', toolUse }));
+  }
   const latestIndex = (() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i] && messages[i].role === 'user') return i;
@@ -475,11 +512,258 @@ function extractToolCommand(toolUse) {
   return { name, command, filePath };
 }
 
-function promptCommandCandidate(shape) {
+function rawToolArgumentsText(value) {
+  if (typeof value === 'string') return value;
+  // Invalid non-string arguments still carry text. Walk iteratively so deep or
+  // cyclic values cannot overflow JSON.stringify or hide nested command text.
+  const chunks = [];
+  const pending = [value];
+  const seen = new Set();
+  while (pending.length) {
+    const current = pending.pop();
+    if (current && typeof current === 'object') {
+      if (seen.has(current)) continue;
+      seen.add(current);
+      for (const [key, entry] of Object.entries(current)) {
+        chunks.push(key);
+        pending.push(entry);
+      }
+    } else if (current != null) {
+      chunks.push(String(current));
+    }
+  }
+  return chunks.join(' ');
+}
+
+function extractOpenAIToolCommand(toolCall) {
+  const fn = toolCall && toolCall.function;
+  const name = typeof fn?.name === 'string' ? fn.name : '';
+  const args = fn?.arguments;
+  let tool = { name, command: '', filePath: '' };
+  if (typeof args === 'string') {
+    try {
+      const input = JSON.parse(args);
+      if (isPlainObject(input)) {
+        // Every supplied safety field must be usable, including aliases that
+        // extraction precedence would otherwise hide. Absent aliases are fine.
+        const fields = ['command', 'cmd', 'file_path', 'path'].filter(key => Object.hasOwn(input, key));
+        const usable = fields.filter(key => typeof input[key] === 'string' && input[key].trim());
+        // An empty primary alias must not discard a decoded, usable sibling.
+        tool = extractToolCommand({ name, input: Object.fromEntries(usable.map(key => [key, input[key]])) });
+        if (fields.length && usable.length === fields.length) return tool;
+      }
+    } catch { /* Scan malformed JSON below, without truncating or interpreting it. */ }
+  }
+  // Scan all raw text if any supplied field is unusable (or all are absent).
+  // Keep decoded commands and paths too: JSON escapes can hide their syntax
+  // from a raw scan, and paths still need the structural file-safety checks.
+  return { ...tool, rawArguments: rawToolArgumentsText(args) };
+}
+
+function toolCommandForShape(shape) {
+  return shape?.toolCall ? extractOpenAIToolCommand(shape.toolCall) : extractToolCommand(shape?.toolUse);
+}
+
+function promptCommandCandidate(shape, commandRequestOnly = false) {
   if (!shape || (shape.kind !== 'real_user_text' && shape.kind !== 'notification')) return '';
   const text = normalizedText(shape.text);
-  const lower = text.toLowerCase();
   if (!text) return '';
+  if (commandRequestOnly) {
+    // Collect requests independently: prose must neither shield a later command
+    // nor add example text to an earlier command's hard-safety scan.
+    const executionPrefix = /^(?:(?:can|could|would|will) you )?(?:please )?(?:run|execute)(?:\s*:\s*|\s+|$)/i;
+    const commandHead = /^(?:bash|sh|zsh|sudo|env|printenv|export|set|cat|head|tail|sed|nl|rg|grep|find|ls|git|gh|systemctl|codex)(?:\s|$)/i;
+    const followingPrefix = /^(?:(?:the )?following\b|(?:the )?(?:shell )?commands?\b)/i;
+    const examplePrefix = /^(?:(?:can|could|would|will) you )?(?:please )?(?:explain|describe)\b.*\b(?:examples?|commands?)\b.*:$/i;
+    const explanationPrefix = /^(?:(?:can|could|would|will) you )?(?:please )?(?:explain|describe)\b/i;
+    const negatedPrefix = /\b(?:do\s+not|don['’]t|never|won['’]t)\s+(?:ever\s+)?(?:poll|run|execute|check)\b/i;
+    function negatedRequest(line) {
+      // A negation in an actual shell command, quoted argument or explanation
+      // is not a prohibition introducing the next command block.
+      if (executionPrefix.test(line) || commandHead.test(line) || explanationPrefix.test(line)) return null;
+      const match = line.match(negatedPrefix);
+      if (!match) return null;
+      let quote = '';
+      for (let i = 0; i < match.index; i++) {
+        const char = line[i];
+        if (char === '\\' && quote) { i++; continue; }
+        if (quote) { if (char === quote) quote = ''; }
+        else if (char === '`' || char === '"'
+            || (char === "'" && !/[a-z0-9]/i.test(line[i - 1] || ''))) quote = char;
+      }
+      return quote ? null : match;
+    }
+    const commands = [];
+    let blockIntent = '';
+    let blockStarted = false;
+    let fence = '';
+    let executionIntent = false;
+    let fenceIntent = false;
+    let negatedBlock = false;
+    let clauseIntent = false;
+    let quoted = false;
+
+    // Read lazily so HTML presentation follows the current execution context.
+    // Injected context remains suppressed; decorative wrappers are inert until
+    // an outside instruction requests their contents. Quotes keep shell
+    // semicolons inside one clause, including explicitly prohibited commands.
+    function* commandClauses() {
+      const input = topLevelContextText(shape.text, INJECTED_CONTEXT_WRAPPERS);
+      const wrappers = [];
+      let includeWrapper = false;
+      let negatedWrapper = false;
+      let line = '';
+      let quote = '';
+      let afterSemicolon = false;
+      for (let i = 0; i < input.length; i++) {
+        const char = input[i];
+        const tag = char === '<' && input.slice(i).match(/^<\s*(\/?)\s*([a-z][a-z0-9:-]*)\b/i);
+        if (tag && ROLE_CONTEXT_WRAPPERS.has(tag[2].toLowerCase())) {
+          let end = i + tag[0].length;
+          let attributeQuote = '';
+          for (; end < input.length; end++) {
+            const next = input[end];
+            if (attributeQuote) { if (next === attributeQuote) attributeQuote = ''; }
+            else if (next === '"' || next === "'") attributeQuote = next;
+            else if (next === '>' || next === '<') break;
+          }
+          if (input[end] !== '>') break;
+          if (!wrappers.length) {
+            const prefix = normalizedText(line);
+            negatedWrapper = negatedBlock || !!negatedRequest(prefix);
+            includeWrapper = (executionPrefix.test(prefix) || executionIntent || clauseIntent)
+              && !explanationPrefix.test(prefix) && !negatedWrapper;
+          }
+          const name = tag[2].toLowerCase();
+          if (tag[1]) {
+            if (wrappers.at(-1) === name) wrappers.pop();
+          } else if (!input.slice(i, end).trimEnd().endsWith('/')) {
+            wrappers.push(name);
+          }
+          // Treat every removed tag as a clause separator, preserving both
+          // word boundaries and independent negation in adjacent wrappers.
+          yield line;
+          line = '';
+          quote = '';
+          if (!wrappers.length && negatedWrapper) {
+            negatedBlock = false;
+            blockIntent = '';
+            blockStarted = false;
+            negatedWrapper = false;
+          }
+          i = end;
+          continue;
+        }
+        if (wrappers.length && !includeWrapper) continue;
+        if (char === '\n' || (char === ';' && !quote)) {
+          yield line;
+          if (char === '\n') clauseIntent = false;
+          line = '';
+          quote = '';
+          afterSemicolon = char === ';';
+          continue;
+        }
+        if (afterSemicolon && !line && (char === ' ' || char === '\t')) continue;
+        line += char;
+        if (char === '\\' && quote && i + 1 < input.length) { line += input[++i]; continue; }
+        if (quote) { if (char === quote) quote = ''; }
+        else if (char === '`' || char === '"'
+            || (char === "'" && !/[a-z0-9]/i.test(input[i - 1] || ''))) quote = char;
+      }
+      yield line;
+    }
+
+    for (const rawLine of commandClauses()) {
+      const line = normalizedText(rawLine);
+      const marker = rawLine.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (fence) {
+        if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) {
+          fence = '';
+          blockIntent = '';
+          blockStarted = false;
+        } else if (fenceIntent) commands.push(line);
+        continue;
+      }
+      const negation = negatedRequest(line);
+      if (negation) {
+        const command = line.slice(negation.index + negation[0].length).trim()
+          .replace(/^:\s*/, '').replace(/^[`'"]/, '');
+        // An inline command consumes its own negation. Otherwise bind it to
+        // the upcoming block, independently of how that block is described.
+        negatedBlock = !commandHead.test(command);
+        if (negatedBlock) {
+          blockIntent = 'example';
+          blockStarted = false;
+        }
+        continue;
+      }
+      if (explanationPrefix.test(line)) {
+        executionIntent = false;
+        clauseIntent = false;
+        negatedBlock = false;
+      }
+      if (/^\s*>/.test(rawLine)) {
+        quoted = true;
+        blockStarted = true;
+        if (blockIntent === 'run') commands.push(line.replace(/^(?:>\s*)+/, ''));
+        continue;
+      }
+      if (!line) {
+        quoted = false;
+        if (blockStarted) blockIntent = '';
+        blockStarted = false;
+        continue;
+      }
+      const executionRequest = executionPrefix.test(line);
+      const command = executionRequest ? line.replace(executionPrefix, '').replace(/^[`'"]/, '') : line;
+      const followingCommands = executionRequest && followingPrefix.test(command);
+      const explicitCommand = executionRequest && (commandHead.test(command) || followingCommands);
+      // An unmarked execution request starts its own instruction, even directly
+      // after a quoted example. Other lazy blockquote continuation stays quoted.
+      if (quoted && !explicitCommand) {
+        if (blockIntent === 'run') commands.push(line);
+        continue;
+      }
+      quoted = false;
+      if (marker) {
+        fence = marker[1];
+        fenceIntent = executionIntent && !negatedBlock;
+        negatedBlock = false;
+        blockStarted = true;
+        continue;
+      }
+      if (negatedBlock) {
+        negatedBlock = false;
+        blockIntent = '';
+        blockStarted = false;
+        if (!explicitCommand) continue;
+      }
+      if (/^(?: {4}|\t)/.test(rawLine)) {
+        blockStarted = true;
+        if (blockIntent === 'run') commands.push(line);
+        continue;
+      }
+      if (declaredRole(line)) continue;
+      if (explicitCommand || clauseIntent) {
+        commands.push(command);
+        blockIntent = followingCommands ? 'run' : '';
+        executionIntent = followingCommands || executionIntent;
+        clauseIntent = true;
+        blockStarted = false;
+      } else if (examplePrefix.test(line)) {
+        blockIntent = 'example';
+        blockStarted = false;
+      } else if (commandHead.test(command)) {
+        blockStarted = true;
+        if (blockIntent !== 'example') { commands.push(command); clauseIntent = true; }
+      } else {
+        blockIntent = '';
+        blockStarted = false;
+      }
+    }
+    return commands.join('\n');
+  }
+  const lower = text.toLowerCase();
   if (/\bdo\s+not\s+(?:poll|run|execute|check)\b/.test(lower)) return '';
   if (/\bdon't\s+(?:poll|run|execute|check)\b/.test(lower)) return '';
   return text;
@@ -650,9 +934,9 @@ function isCodeOrTestPath(filePath) {
 
 function classifyCommandClass(body, project, panel, role) {
   const shape = terminalMessageShape(body);
-  const tool = extractToolCommand(shape.toolUse);
+  const tool = toolCommandForShape(shape);
   const name = tool.name.toLowerCase();
-  const command = normalizedText(tool.command || promptCommandCandidate(shape));
+  const command = normalizedText(tool.command || tool.rawArguments || promptCommandCandidate(shape));
   const filePath = tool.filePath;
 
   if (command && commandMatches(command, DISPATCH_OK_PATTERNS)) return { commandClass: 'DISPATCH_OK', terminalShape: shape.kind };
@@ -1334,7 +1618,7 @@ function isFreshBootSetupRead(policy, classification, body) {
   if (classification.assistantTurns > maxAssistantTurns) return false;
   if (classification.messageCount > maxMessages) return false;
   const shape = terminalMessageShape(body);
-  const tool = extractToolCommand(shape.toolUse);
+  const tool = toolCommandForShape(shape);
   if (shape.kind !== 'tool_result') return false;
   const marked = isBootSetupMarkedTurn(policy, classification.firstUserPromptText)
     || isBootSetupMarkedTurn(policy, classification.latestUserPromptText);
@@ -1351,26 +1635,41 @@ function isFreshBootSetupRead(policy, classification, body) {
   return !!(boundedHead && Number(boundedHead[1]) <= 200 && safeBootSetupReadPath(boundedHead[2]));
 }
 
+function hardSafetyCommandReason(command, rawArgumentsFallback = false) {
+  const commandish = normalizedText(command).toLowerCase();
+  if (!commandish) return '';
+  // JSON delimiters are command boundaries only in the raw-argument scan;
+  // quotes inside a normal shell command can introduce harmless literal text.
+  const envCommandBoundary = rawArgumentsFallback
+    ? /(^|[\s"[{])(env|printenv|export|set)(\s|$)/
+    : /(^|\s)(env|printenv|export|set)(\s|$)/;
+  if (envCommandBoundary.test(commandish)
+      && /(secret|token|key|password|credential|anthropic|openai|termdeck)/.test(commandish)) return 'sensitive-env';
+  if (/\b(?:cat|head|tail|sed|nl|rg|grep|find|ls)\b[\s\S]*(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/.test(commandish)) return 'sensitive-file-read';
+  if (/\brg\b[\s\S]*(?:secret|token|password|credential)[\s\S]*\/home\/nacho\b/.test(commandish)) return 'broad-secret-search';
+  if (/\bgit\s+branch\b[\s\S]*(?:-d|-D|--delete)\b/.test(commandish)) return 'destructive-git-branch';
+  if (/\bgit\s+(?:commit|push|merge)\b/.test(commandish)) return 'git-write-operation';
+  if (/\bgh\s+pr\s+(?:create|merge)\b/.test(commandish)) return 'pr-write-operation';
+  if (/\bsystemctl\b[\s\S]*(?:restart|stop|start|reload)\b/.test(commandish)) return 'service-mutation';
+  if (/\bcodex\s+exec\b/.test(commandish)) return 'direct-codex-exec';
+  return '';
+}
+
 function hardSafetyReason(classification, body = null) {
   // Inspect the entire result batch before any role, boot or advisor exemption.
   const shapes = body ? terminalMessageShapes(body) : [null];
   for (const shape of shapes) {
-    const tool = shape ? extractToolCommand(shape.toolUse) : { name: '', command: '', filePath: '' };
-    const prompt = shape ? promptCommandCandidate(shape) : (classification.latestUserPromptText || '');
-    const commandish = normalizedText(tool.command || prompt).toLowerCase();
+    const tool = toolCommandForShape(shape);
+    const prompt = !shape || ['real_user_text', 'notification'].includes(shape.kind)
+      ? promptCommandCandidate(shape || { kind: 'real_user_text', text: classification.latestUserPromptText }, true)
+      : '';
     const filePath = String(tool.filePath || '').toLowerCase();
     if (filePath && /(?:^|\/)\.(?:ssh|termdeck)(?:\/|$)|(?:^|\/)\.claude\.json$|(?:^|\/)\.gitconfig$/.test(filePath)) {
       return 'sensitive-file-read';
     }
-    if (/(^|\s)(env|printenv|export|set)(\s|$)/.test(commandish)
-        && /(secret|token|key|password|credential|anthropic|openai|termdeck)/.test(commandish)) return 'sensitive-env';
-    if (/\b(?:cat|head|tail|sed|nl|rg|grep|find|ls)\b[\s\S]*(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/.test(commandish)) return 'sensitive-file-read';
-    if (/\brg\b[\s\S]*(?:secret|token|password|credential)[\s\S]*\/home\/nacho\b/.test(commandish)) return 'broad-secret-search';
-    if (/\bgit\s+branch\b[\s\S]*(?:-d|-D|--delete)\b/.test(commandish)) return 'destructive-git-branch';
-    if (/\bgit\s+(?:commit|push|merge)\b/.test(commandish)) return 'git-write-operation';
-    if (/\bgh\s+pr\s+(?:create|merge)\b/.test(commandish)) return 'pr-write-operation';
-    if (/\bsystemctl\b[\s\S]*(?:restart|stop|start|reload)\b/.test(commandish)) return 'service-mutation';
-    if (/\bcodex\s+exec\b/.test(commandish)) return 'direct-codex-exec';
+    const commandReason = hardSafetyCommandReason(tool.command || prompt)
+      || hardSafetyCommandReason(tool.rawArguments, true);
+    if (commandReason) return commandReason;
   }
   return '';
 }

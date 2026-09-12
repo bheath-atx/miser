@@ -14,7 +14,7 @@ function metadataCommand(command) {
   if (typeof command !== 'string' || Buffer.byteLength(command) > 2048) return null;
   // No substitutions, redirections, pipelines, extra statements, or flags.
   const loop = command.trim().match(new RegExp(
-    `^for ([a-z_][a-z0-9_]*) in ((?:${REPO})(?:[ \\t]+${REPO}){0,4});\\s*do\\s+gh repo view "\\$\\1" --json ([A-Za-z,]+);\\s*done$`,
+    `^for ([a-z_][a-z0-9_]*) in ((?:${REPO})(?:[ \\t]+${REPO}){0,4});\\s*do\\s+gh repo view "\\$\\1" --json ([A-Za-z,]+)[ \\t]*;\\s*done$`,
   ));
   if (!loop) return null;
   const repos = loop[2].split(/[ \t]+/);
