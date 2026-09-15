@@ -45,7 +45,7 @@ function startEcho(handler) {
 // their pricing dep) must be re-required in the same sweep as stats.
 function freshProxy(anthropicUrl, extraEnv = {}) {
   for (const k of Object.keys(require.cache)) {
-    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage|budgets|policy-watchdog|pricing|daily-rollup|alert-ledger|enforcement|watchd)\.js$/.test(k.replace(/\\/g, '/'))) {
+    if (/\/src\/(proxy|router|config|compress|stats|toolprune|routing|context-management|usage|budgets|policy-watchdog|pricing|daily-rollup|alert-ledger|enforcement|watchd|outputfilter)\.js$/.test(k.replace(/\\/g, '/'))) {
       delete require.cache[k];
     }
   }
@@ -162,7 +162,7 @@ test('AC8: hoisted top-level system reaches the Anthropic leg (loopback echo)', 
   }
 });
 
-test('AC10: middle duplicate tool_result forwards as a STUB (loopback echo canary)', async () => {
+test('AC10: middle duplicate tool_result forwards INTACT after the §7 retirement (loopback echo canary)', async () => {
   const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
   const { createProxy, restoreEnv } = freshProxy(echo.url);
   try {
@@ -185,8 +185,10 @@ test('AC10: middle duplicate tool_result forwards as a STUB (loopback echo canar
     const res = fakeRes();
     await drive(createProxy, fakeReq('POST', '/v1/messages', { model: 'claude', max_tokens: 50, messages }, {}), res);
     const fwd = echo.captured[0].body;
-    // The stub reached the wire; the newest copy is intact.
-    assert.match(fwd.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+    // §7: the Anthropic middle dedup is retired, so BOTH copies reach the wire
+    // whole. What this canary still proves is the deploy-reaches-prod shape —
+    // the forwarded body really is what miser built, and miser rejects nothing.
+    assert.equal(fwd.messages[2].content[0].content, dup);
     assert.equal(fwd.messages[10].content[0].content, dup);
     // No miser-side size rejection: upstream 200 passed through.
     assert.equal(res.statusCode, 200);
@@ -1990,6 +1992,218 @@ test('v4 C1: breaker does not trip when 400s are reset by 2xx', async () => {
     }
     assert.equal(echo.captured.length, 6);
     assert.ok(echo.captured.every(c => c.body.context_management));
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// RTK pre-context output filter — proxy integration (PROPOSAL-RTK-ONLY.md §2).
+//
+// These drive the REAL createProxy with the filter injected through the `deps`
+// seam, so the ordering guarantee (§2.1), the forwardBody/messages
+// synchronization (§5 of CODEX-IQA-RTK-ONLY.md), and the fail-open contract are
+// asserted end-to-end rather than at the module boundary.
+// ---------------------------------------------------------------------------
+
+const RTK_ENV = { MISER_RTK_FILTER: '1', MISER_TIER_B_OUTPUT_TRIM: '1' };
+
+function rtkPytestOutput(n = 120, tag = 'a') {
+  const lines = [
+    '============================= test session starts ==============================',
+    'platform linux -- Python 3.11.2, pytest-7.4.0, pluggy-1.2.0',
+    `collected ${n} items`,
+    '',
+  ];
+  for (let i = 0; i < n; i++) {
+    lines.push(`tests/test_${tag}_${i}.py::test_case_${i} PASSED                    [ ${i % 100}%]`);
+  }
+  lines.push(`============================== ${n} passed in 1.23s ==============================`);
+  return lines.join('\n');
+}
+
+function rtkTranscript(output, command = 'pytest tests/') {
+  return [
+    { role: 'user', content: 'FIRST TASK' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'tu0', name: 'Bash', input: { command } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu0', content: output }] },
+  ];
+}
+
+// Build a real output filter over an injected runner, with the module's
+// process-wide latch reset so tests cannot leak state into one another.
+function makeRtkFilter(runFilter, over = {}) {
+  const of = require('../src/outputfilter.js');
+  of.__test.resetProcessState();
+  const cfg = { ...of.parseRtkConfig(RTK_ENV), ...over };
+  return of.createOutputFilter(cfg, {
+    runFilter,
+    runVersion: async () => ({ code: 0, stdout: 'rtk 0.48.0\n', stderr: '', timedOut: false }),
+  });
+}
+
+function driveWith(createProxy, deps, req, res) {
+  const handler = createProxy(deps);
+  const done = res.whenDone();
+  handler(req, res);
+  return done;
+}
+
+test('RTK: filtered tool_result reaches the Anthropic leg (loopback echo)', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, RTK_ENV);
+  try {
+    const raw = rtkPytestOutput();
+    const outputFilter = makeRtkFilter(async (id, input) => ({
+      code: 0, stdout: `[rtk] summarized ${input.split('\n').length} lines`, stderr: '', timedOut: false,
+    }));
+    const res = fakeRes();
+    await driveWith(createProxy, { outputFilter }, fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: rtkTranscript(raw),
+    }, {}), res);
+
+    const fwd = echo.captured[0].body;
+    assert.match(fwd.messages[2].content[0].content, /^\[rtk\] summarized \d+ lines$/);
+    assert.notEqual(fwd.messages[2].content[0].content, raw);
+    assert.equal(res.statusCode, 200);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('RTK: routeRequest messages and forwardBody.messages stay synchronized', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, RTK_ENV);
+  try {
+    const captured = [];
+    // router.js:544/729 translate from the `messages` ARGUMENT for the Ollama
+    // leg while the Anthropic leg serializes the BODY. If the filter updated
+    // only one of them, the two legs would send different transcripts.
+    const transports = {
+      anthropic: (messages, originalBody, headers, res) => {
+        captured.push({ messages, bodyMessages: originalBody.messages });
+        res.writeHead(200, {});
+        res.end(JSON.stringify({ ok: true }));
+        return Promise.resolve({ statusCode: 200 });
+      },
+    };
+    const outputFilter = makeRtkFilter(async (id, input) => ({
+      code: 0, stdout: `[rtk] ${input.length} bytes summarized into a much shorter form`, stderr: '', timedOut: false,
+    }));
+    const res = fakeRes();
+    await driveWith(createProxy, { outputFilter, transports }, fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: rtkTranscript(rtkPytestOutput()),
+    }, {}), res);
+
+    assert.equal(captured.length, 1);
+    const { messages, bodyMessages } = captured[0];
+    assert.equal(messages, bodyMessages, 'messages arg and body.messages must be the same array');
+    assert.match(messages[2].content[0].content, /^\[rtk\]/, 'the sync must be of the FILTERED set');
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('RTK: (18) originalBody is deep-frozen for the whole request', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, RTK_ENV);
+  try {
+    let seen = null;
+    // A filter that tries to write through to the frozen original. In strict
+    // mode (every src/ module is 'use strict') the assignment THROWS, which is
+    // the whole point: enforcement already judged these bytes.
+    const outputFilter = makeRtkFilter(async (id, input) => ({
+      code: 0, stdout: `[rtk] ${input.length} bytes summarized into a much shorter form`, stderr: '', timedOut: false,
+    }));
+    const guardDeps = {
+      enforcementConfig: {},
+      checkEnforcement: async (project, panel, originalBody) => {
+        seen = originalBody;
+        return null;
+      },
+    };
+    const res = fakeRes();
+    await driveWith(createProxy, { outputFilter, guardDeps }, fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: rtkTranscript(rtkPytestOutput()),
+    }, {}), res);
+
+    assert.ok(seen, 'enforcement must have been handed the original body');
+    assert.equal(Object.isFrozen(seen), true);
+    assert.equal(Object.isFrozen(seen.messages), true);
+    assert.equal(Object.isFrozen(seen.messages[2].content[0]), true);
+    assert.throws(() => { seen.messages[2].content[0].content = 'REWRITTEN'; }, TypeError);
+    assert.throws(() => { seen.model = 'other'; }, TypeError);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('RTK: (19) enforcement sees RAW text even when the filter would erase the match', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, RTK_ENV);
+  try {
+    const MARKER = 'RAW-ONLY-CLASSIFIER-SUBSTRING';
+    const raw = rtkPytestOutput() + '\n' + MARKER;
+    // The filter deliberately DESTROYS the substring a classifier keys on. If
+    // ordering ever regressed to filter-before-enforcement, `sawMarker` flips
+    // false and this test fails — which is the safety regression §2.1 forbids.
+    const outputFilter = makeRtkFilter(async () => ({
+      code: 0, stdout: '[rtk] summary with no marker at all, but long enough to gain bytes'.padEnd(400, '.'),
+      stderr: '', timedOut: false,
+    }));
+    let sawMarker = null;
+    const guardDeps = {
+      enforcementConfig: {},
+      checkEnforcement: async (project, panel, originalBody) => {
+        sawMarker = JSON.stringify(originalBody).includes(MARKER);
+        return null;
+      },
+    };
+    const res = fakeRes();
+    await driveWith(createProxy, { outputFilter, guardDeps }, fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: rtkTranscript(raw),
+    }, {}), res);
+
+    assert.equal(sawMarker, true, 'enforcement must classify the RAW, unfiltered text');
+    // ...and the filter still applied downstream, so this is not a vacuous pass.
+    assert.match(echo.captured[0].body.messages[2].content[0].content, /^\[rtk\] summary/);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('RTK: (23) a filter fault still returns 2xx with the unmodified body', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, RTK_ENV);
+  try {
+    const raw = rtkPytestOutput();
+    const outputFilter = makeRtkFilter(async () => { throw new Error('rtk exploded'); });
+    const res = fakeRes();
+    await driveWith(createProxy, { outputFilter }, fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: rtkTranscript(raw),
+    }, {}), res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(echo.captured[0].body.messages[2].content[0].content, raw);
+  } finally {
+    echo.server.close(); restoreEnv();
+  }
+});
+
+test('RTK: (30) with the feature OFF the body is forwarded unchanged and nothing spawns', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { role: 'assistant', content: 'ok' } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url); // no RTK env at all
+  try {
+    const raw = rtkPytestOutput();
+    const res = fakeRes();
+    await drive(createProxy, fakeReq('POST', '/v1/messages', {
+      model: 'claude', max_tokens: 50, messages: rtkTranscript(raw),
+    }, {}), res);
+    assert.equal(echo.captured[0].body.messages[2].content[0].content, raw);
+    assert.equal(res.statusCode, 200);
+    // With the feature off the original body is NOT frozen — the deep walk is
+    // skipped because no new writer exists to guard against.
+    assert.equal(require('../src/config.js').rtk.enabled, false);
   } finally {
     echo.server.close(); restoreEnv();
   }

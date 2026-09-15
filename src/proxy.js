@@ -23,6 +23,7 @@ const { buildMetricsText } = require('./metrics.js');
 const { getPanelStats, getPersistenceStatus, getRecordRejectionStatus: getPanelRecordRejectionStatus } = require('./panel-stats.js');
 const { alertRoutingHealth } = require('./alert-routes.js');
 const { createWatcher } = require('./watchd.js');
+const { createOutputFilter } = require('./outputfilter.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -189,6 +190,21 @@ function suppressCompactHeadersOnErrors(res) {
   };
 }
 
+// §2.1 / §10.6(18). Enforcement's eight hard-safety categories match on RAW
+// command and output text, and the RTK filter runs DOWNSTREAM of that match on
+// a clone. Freezing `originalBody` for the whole request turns "the filter must
+// not mutate what enforcement already judged" from a convention into a throw.
+// Applied only when the filter is enabled: with the feature off there is no new
+// writer to guard against, and a deep walk of a multi-megabyte body on every
+// request is not free.
+function deepFreeze(value, seen = new WeakSet()) {
+  if (value == null || typeof value !== 'object') return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Object.keys(value)) deepFreeze(value[key], seen);
+  return Object.freeze(value);
+}
+
 function headerProject(headers) {
   const raw = headers['x-termdeck-project'];
   if (Array.isArray(raw)) return raw[0] || 'default';
@@ -297,6 +313,11 @@ function createProxy(deps = {}) {
     for (const [name, b] of Object.entries(bs)) out[name] = b.getState();
     return out;
   });
+  // RTK pre-context output filter (PROPOSAL-RTK-ONLY.md). `deps.outputFilter`
+  // is the offline test seam; production builds it from config. Null ⇔ OFF, and
+  // OFF means no spawn, no memo allocation, and no freeze cost.
+  const outputFilter = deps.outputFilter
+    || (config.rtk && config.rtk.enabled ? createOutputFilter(config.rtk, deps.rtkDeps || {}) : null);
   let watcher = deps.watcher || null;
   const getWatcher = () => {
     if (!watcher) watcher = createWatcher(config.watch || {});
@@ -482,6 +503,7 @@ function createProxy(deps = {}) {
     try {
       const raw = await readBody(req);
       originalBody = JSON.parse(raw);
+      if (outputFilter) deepFreeze(originalBody);
       project = route.project || headerProject(req.headers);
       const panel = route.panel || null;
       const format = route.format;
@@ -598,21 +620,59 @@ function createProxy(deps = {}) {
         }
       }
 
+      // --- RTK pre-context output filter (§2.1) ----------------------------
+      // Ordering is NOT negotiable: this runs AFTER enforcement classification
+      // (which read the raw, now-frozen `originalBody` above) and AFTER
+      // compress(), immediately before upstream dispatch, on a clone. Filtering
+      // first would let a summary silently drop the substring a hard-safety
+      // classifier keys on — a safety regression disguised as a compression
+      // feature. Anthropic-format only: the filter's pairing model is
+      // tool_use/tool_result adjacency.
+      let rtkMessages = messages;
+      let rtkBody = prunedBody;
+      let rtkStats = null;
+      if (outputFilter && format === 'anthropic') {
+        try {
+          const filtered = await outputFilter.applyToMessages(prunedBody.messages);
+          rtkStats = filtered.stats;
+          if (filtered.changed) {
+            rtkMessages = filtered.messages;
+            // routeRequest's `messages` argument and forwardBody.messages must
+            // stay synchronized (router.js:544,729 translate from `messages`
+            // for the Ollama leg while the Anthropic leg serializes the body).
+            rtkBody = { ...prunedBody, messages: filtered.messages };
+          }
+        } catch (e) {
+          // Fail-open by construction: an adapter throw forwards the
+          // unmodified body rather than failing the client's request.
+          console.warn('[miser] rtk filter error (fail-open):', e.message);
+        }
+      }
+
       const legacyStats = {
         inputTokensRemoved: savedTokens,
         toolsRemoved,
         pollClass: compactHeaders['x-miser-poll-class'],
+        rtk: rtkStats,
         techniques: {
           dedup: savedTokens > 0,
           cacheHint: cacheHintApplied,
           toolPrune: toolsRemoved > 0,
+          // §8: RTK savings get their OWN bucket and are never folded into
+          // dedup. Recorded whenever the filter did ANYTHING observable —
+          // filtered, pinned a block raw, or latched. Counting the raw-pinned
+          // case matters: §8's commitment is to turn the feature off if the
+          // first week shows no real delta, and "eligible blocks kept losing
+          // the accept margin" is exactly the evidence that decision needs.
+          rtk: !!(rtkStats && (rtkStats.blocksFiltered > 0
+            || rtkStats.blocksRawPinned > 0 || rtkStats.latchTrips > 0)),
         },
       };
 
-      let forwardBody = prunedBody;
+      let forwardBody = rtkBody;
       let forwardHeaders = req.headers;
       if (format === 'anthropic') {
-        const injected = injectContextManagement(prunedBody, req.headers, project, contextProjectConfig());
+        const injected = injectContextManagement(rtkBody, req.headers, project, contextProjectConfig());
         forwardBody = injected.body;
         forwardHeaders = injected.headers;
         c1Injected = injected.injected;
@@ -623,7 +683,7 @@ function createProxy(deps = {}) {
 
       // Forward the REDUCED body (I6) — every leg serializes THIS body, so the
       // hoisted top-level `system` and any cache hint reach the wire on all legs.
-      await routeRequest(messages, forwardBody, forwardHeaders, res, project, savedTokens, format,
+      await routeRequest(rtkMessages, forwardBody, forwardHeaders, res, project, savedTokens, format,
         { ...deps, panel });
       if (panel && deps.stopgapWatchdog) {
         deps.stopgapWatchdog.recordProxyOutcome({

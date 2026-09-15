@@ -11,6 +11,26 @@ const { readWeeklyCapsFile, MISER_METHOD_ID } = require('./weekly-caps.js');
 // Atomic write (temp+rename) so process restarts do not corrupt the file.
 const STATS_FILE = process.env.MISER_STATS_FILE
   || path.join(os.homedir(), '.miser-stats.json');
+// Technique buckets, named explicitly rather than swept. `rtk` (the RTK
+// pre-context output filter) is a DISTINCT bucket and is never folded into
+// `dedup` — the two measure different transforms and conflating them would make
+// the first week's "did this actually save anything" question unanswerable.
+// No schemaVersion exists, so every reader below must tolerate a bucket being
+// ABSENT from an older snapshot (test/fixtures-pre-v4-stats-snapshot.json is
+// the precedent). Declared HERE, above every consumer, because the retention /
+// migration pass runs during module load and would otherwise hit the TDZ.
+const TECHNIQUE_NAMES = Object.freeze(['dedup', 'cacheHint', 'toolPrune', 'rtk']);
+const TECHNIQUE_EXTRA_FIELDS = Object.freeze({
+  toolPrune: ['toolsRemovedCount'],
+  rtk: ['blocksFiltered', 'blocksRawPinned', 'memoHits', 'latchTrips'],
+});
+
+function addTechniqueExtras(target, src, tech) {
+  for (const field of (TECHNIQUE_EXTRA_FIELDS[tech] || [])) {
+    target[field] = (target[field] || 0) + (src[field] || 0);
+  }
+}
+
 const WEEKLY_KEY = '__weekly';
 const WEEKLY_META_KEY = '__meta';
 const STATS_META_KEY = '__meta';
@@ -801,18 +821,18 @@ function pruneWeeklyRetention(statsObj, now) {
 }
 
 function addOptimizerFields(target, source) {
-  const hasOptimizer = !!(source && (source.dedup || source.cacheHint || source.toolPrune
+  const hasOptimizer = !!(source && (source.dedup || source.cacheHint || source.toolPrune || source.rtk
     || Number.isFinite(source.likelyPollCount) || Number.isFinite(source.workTurnCount)));
   if (!hasOptimizer) return;
   ensureOptimizerFields(target);
-  for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
+  for (const tech of TECHNIQUE_NAMES) {
     const src = source[tech];
     if (!src || typeof src !== 'object') continue;
     target[tech].estRemovedTokens += src.estRemovedTokens || 0;
     target[tech].inputTokensRemoved += src.inputTokensRemoved || 0;
     target[tech].cacheBillingDelta += src.cacheBillingDelta || 0;
     target[tech].appliedCount += src.appliedCount || 0;
-    if (tech === 'toolPrune') target[tech].toolsRemovedCount += src.toolsRemovedCount || 0;
+    addTechniqueExtras(target[tech], src, tech);
   }
   target.likelyPollCount += source.likelyPollCount || 0;
   target.workTurnCount += source.workTurnCount || 0;
@@ -1067,10 +1087,31 @@ function emptyUsageBucket() {
   return { requests: 0 };
 }
 
+function emptyToolPruneBucket() {
+  return { ...emptyTechniqueBucket(), toolsRemovedCount: 0 };
+}
+
+function emptyRtkBucket() {
+  return {
+    ...emptyTechniqueBucket(),
+    blocksFiltered: 0,
+    blocksRawPinned: 0,
+    memoHits: 0,
+    latchTrips: 0,
+  };
+}
+
+function emptyBucketFor(tech) {
+  if (tech === 'toolPrune') return emptyToolPruneBucket();
+  if (tech === 'rtk') return emptyRtkBucket();
+  return emptyTechniqueBucket();
+}
+
 function ensureOptimizerFields(bucket) {
   if (!bucket.dedup) bucket.dedup = emptyTechniqueBucket();
   if (!bucket.cacheHint) bucket.cacheHint = emptyTechniqueBucket();
-  if (!bucket.toolPrune) bucket.toolPrune = { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
+  if (!bucket.toolPrune) bucket.toolPrune = emptyToolPruneBucket();
+  if (!bucket.rtk) bucket.rtk = emptyRtkBucket();
   if (!Number.isFinite(bucket.likelyPollCount)) bucket.likelyPollCount = 0;
   if (!Number.isFinite(bucket.workTurnCount)) bucket.workTurnCount = 0;
   return bucket;
@@ -1297,6 +1338,7 @@ function applyOptimizerStats(bucket, opts = {}) {
     cacheBillingDelta = 0,
     toolsRemoved = 0,
     pollClass,
+    rtk = null,
     techniques = {},
   } = opts;
 
@@ -1312,6 +1354,17 @@ function applyOptimizerStats(bucket, opts = {}) {
   if (techniques.toolPrune && toolsRemoved > 0) {
     bucket.toolPrune.toolsRemovedCount += toolsRemoved;
     bucket.toolPrune.appliedCount += 1;
+  }
+  // §8 RTK bucket. Recorded whenever the filter acted OR latched, so a latch
+  // trip is visible in stats even on a request that filtered nothing.
+  if (techniques.rtk && rtk && typeof rtk === 'object') {
+    bucket.rtk.estRemovedTokens += rtk.estRemovedTokens || 0;
+    bucket.rtk.inputTokensRemoved += rtk.estRemovedTokens || 0;
+    bucket.rtk.blocksFiltered += rtk.blocksFiltered || 0;
+    bucket.rtk.blocksRawPinned += rtk.blocksRawPinned || 0;
+    bucket.rtk.memoHits += rtk.memoHits || 0;
+    bucket.rtk.latchTrips += rtk.latchTrips || 0;
+    bucket.rtk.appliedCount += 1;
   }
   if (pollClass === 'likely') {
     bucket.likelyPollCount += 1;
@@ -1487,7 +1540,7 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
   // preserved). Projects with EXCLUSIVELY guardrail keys (budget/policy)
   // must not appear with fabricated zeroed legacy buckets.
   const hasLegacy = !!(projData.usage || projData.contextManagement
-    || projData.dedup || projData.cacheHint || projData.toolPrune);
+    || projData.dedup || projData.cacheHint || projData.toolPrune || projData.rtk);
   // Guardrail activity only counts when counts are positive (sparse contract §2.3).
   const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
     || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0))
@@ -1499,21 +1552,20 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
   if (!perProject[proj]) perProject[proj] = {};
   const target = perProject[proj];
   if (hasLegacy && !target.dedup) {
-    target.dedup = emptyTechniqueBucket();
-    target.cacheHint = emptyTechniqueBucket();
-    target.toolPrune = { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 };
+    for (const tech of TECHNIQUE_NAMES) target[tech] = emptyBucketFor(tech);
     target.pollClass = { likely: 0, work: 0 };
   }
   if (target.dedup) {
-    for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
+    // An older snapshot has no `rtk` key at all; `continue` is what tolerates
+    // its absence, and emptyBucketFor above is what keeps the shape uniform.
+    if (!target.rtk) target.rtk = emptyRtkBucket();
+    for (const tech of TECHNIQUE_NAMES) {
       if (!projData[tech]) continue;
       target[tech].estRemovedTokens += projData[tech].estRemovedTokens || projData[tech].inputTokensRemoved || 0;
       target[tech].inputTokensRemoved += projData[tech].inputTokensRemoved || 0;
       target[tech].cacheBillingDelta += projData[tech].cacheBillingDelta || 0;
       target[tech].appliedCount += projData[tech].appliedCount || 0;
-      if (tech === 'toolPrune') {
-        target[tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
-      }
+      addTechniqueExtras(target[tech], projData[tech], tech);
     }
     target.pollClass.likely += projData.likelyPollCount || 0;
     target.pollClass.work += projData.workTurnCount || 0;
@@ -1588,21 +1640,18 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
 }
 
 function finalizeAggregate(perProject, weights = DEFAULT_WEIGHTS) {
-  const perTechnique = {
-    dedup: emptyTechniqueBucket(),
-    cacheHint: emptyTechniqueBucket(),
-    toolPrune: { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, toolsRemovedCount: 0 },
-  };
+  const perTechnique = {};
+  for (const tech of TECHNIQUE_NAMES) perTechnique[tech] = emptyBucketFor(tech);
   for (const projData of Object.values(perProject)) {
     if (!projData.dedup) continue; // guardrail-only project — no legacy buckets to roll up
-    for (const tech of ['dedup', 'cacheHint', 'toolPrune']) {
-      perTechnique[tech].inputTokensRemoved += projData[tech].inputTokensRemoved;
-      perTechnique[tech].estRemovedTokens += projData[tech].estRemovedTokens;
-      perTechnique[tech].cacheBillingDelta += projData[tech].cacheBillingDelta;
-      perTechnique[tech].appliedCount += projData[tech].appliedCount;
-      if (tech === 'toolPrune') {
-        perTechnique[tech].toolsRemovedCount += projData[tech].toolsRemovedCount || 0;
-      }
+    for (const tech of TECHNIQUE_NAMES) {
+      const src = projData[tech];
+      if (!src) continue; // bucket absent from an older snapshot
+      perTechnique[tech].inputTokensRemoved += src.inputTokensRemoved || 0;
+      perTechnique[tech].estRemovedTokens += src.estRemovedTokens || 0;
+      perTechnique[tech].cacheBillingDelta += src.cacheBillingDelta || 0;
+      perTechnique[tech].appliedCount += src.appliedCount || 0;
+      addTechniqueExtras(perTechnique[tech], src, tech);
     }
   }
 
@@ -1615,11 +1664,18 @@ function finalizeAggregate(perProject, weights = DEFAULT_WEIGHTS) {
   }
   anthropicEstCostUSD = Math.round(anthropicEstCostUSD * 1e6) / 1e6;
 
+  // §8: totals name their contributing buckets EXPLICITLY. An Object.values()
+  // sweep silently changes meaning the moment a bucket is added — which is
+  // exactly what adding `rtk` would have done. Token-removal totals cover the
+  // buckets that actually remove input tokens (dedup, cacheHint, rtk);
+  // toolPrune removes tool definitions and is reported by its own field.
+  const sumOver = (names, field) => names.reduce((sum, t) => sum + (perTechnique[t][field] || 0), 0);
+  const TOKEN_REMOVING = ['dedup', 'cacheHint', 'rtk'];
   const totals = {
-    inputTokensRemoved: (perTechnique.dedup.inputTokensRemoved || 0) + (perTechnique.cacheHint.inputTokensRemoved || 0),
-    estRemovedTokens: (perTechnique.dedup.estRemovedTokens || 0) + (perTechnique.cacheHint.estRemovedTokens || 0),
-    cacheBillingDelta: Object.values(perTechnique).reduce((sum, t) => sum + t.cacheBillingDelta, 0),
-    appliedCount: Object.values(perTechnique).reduce((sum, t) => sum + t.appliedCount, 0),
+    inputTokensRemoved: sumOver(TOKEN_REMOVING, 'inputTokensRemoved'),
+    estRemovedTokens: sumOver(TOKEN_REMOVING, 'estRemovedTokens'),
+    cacheBillingDelta: sumOver(TECHNIQUE_NAMES, 'cacheBillingDelta'),
+    appliedCount: sumOver(TECHNIQUE_NAMES, 'appliedCount'),
     toolsRemovedCount: perTechnique.toolPrune.toolsRemovedCount || 0,
     anthropicEstCostUSD,
   };

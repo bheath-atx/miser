@@ -340,3 +340,46 @@ test('AC8: GET /api/miser/stats still returns JSON (no regression)', async () =>
 test('routing: classifyRoute GET /api/miser/metrics → metrics kind', () => {
   assert.deepEqual(classifyRoute('GET', '/api/miser/metrics'), { kind: 'metrics' });
 });
+
+// ---------------------------------------------------------------------------
+// §8 / §10.7(27) — RTK metrics families.
+//
+// metrics.js is a hand-rolled Prometheus text builder that emits NAMED
+// families from the stats payload; it exports no arbitrary fields. A new stats
+// bucket is therefore invisible to Prometheus until it gets its own HELP/TYPE
+// block and emit loop. "Metrics are not free" — these pin that they exist.
+// ---------------------------------------------------------------------------
+
+test('(27) miser_rtk_latch_trips_total is emitted with HELP and TYPE', () => {
+  const text = buildMetricsText({
+    usage: {},
+    perTechnique: {
+      rtk: { estRemovedTokens: 900, inputTokensRemoved: 900, cacheBillingDelta: 0, appliedCount: 4, blocksFiltered: 7, blocksRawPinned: 2, memoHits: 3, latchTrips: 1 },
+    },
+  });
+  assert.match(text, /^# HELP miser_rtk_latch_trips /m);
+  assert.match(text, /^# TYPE miser_rtk_latch_trips gauge$/m);
+  assert.match(text, /^miser_rtk_latch_trips 1$/m);
+  assert.match(text, /^# TYPE miser_rtk_blocks_filtered gauge$/m);
+  assert.match(text, /^miser_rtk_blocks_filtered 7$/m);
+  // These are rolling-window aggregates, so they must NOT carry the monotonic
+  // `_total` counter suffix — see the naming note in metrics.js.
+  assert.equal(text.includes('_total'), false);
+});
+
+test('(27b) a ZERO latch-trip count is still emitted (an alert needs a baseline)', () => {
+  const text = buildMetricsText({
+    usage: {},
+    perTechnique: {
+      rtk: { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 0, blocksFiltered: 0, blocksRawPinned: 0, memoHits: 0, latchTrips: 0 },
+    },
+  });
+  assert.match(text, /^miser_rtk_latch_trips 0$/m);
+  assert.match(text, /^miser_rtk_blocks_filtered 0$/m);
+});
+
+test('(27c) an old payload with no rtk bucket emits the HELP block and no sample', () => {
+  const text = buildMetricsText({ usage: {}, perTechnique: { dedup: {}, cacheHint: {}, toolPrune: {} } });
+  assert.match(text, /^# HELP miser_rtk_latch_trips /m);
+  assert.equal(/^miser_rtk_latch_trips \d/m.test(text), false);
+});

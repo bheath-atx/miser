@@ -544,3 +544,127 @@ test('v4 M2: real pre-v4 stats fixture preserves daily data and backfills weekly
     cleanup(file, prevEnv);
   }
 });
+
+// ---------------------------------------------------------------------------
+// §8 — the RTK output-filter stats bucket.
+//
+// stats.js hard-codes its technique bucket names, so a new `techniques.rtk`
+// would have been SILENTLY DROPPED without these changes. (25) pins that the
+// savings land in their own bucket and never in `dedup`; (26) pins that
+// aggregation stays correct whether the bucket is present or absent, because
+// there is no schemaVersion and old snapshots simply will not have it.
+// ---------------------------------------------------------------------------
+
+test('(25) RTK savings land in the rtk bucket, never folded into dedup', () => {
+  const file = tmpStatsFile('rtk-bucket');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordStats('alpha', {
+      techniques: { rtk: true },
+      rtk: { estRemovedTokens: 420, blocksFiltered: 3, blocksRawPinned: 1, memoHits: 2, latchTrips: 0 },
+    });
+    const result = stats.getStats('1');
+    const bucket = result.perProject.alpha.rtk;
+    assert.equal(bucket.estRemovedTokens, 420);
+    assert.equal(bucket.inputTokensRemoved, 420);
+    assert.equal(bucket.blocksFiltered, 3);
+    assert.equal(bucket.blocksRawPinned, 1);
+    assert.equal(bucket.memoHits, 2);
+    assert.equal(bucket.appliedCount, 1);
+    // The whole point of a distinct bucket: dedup is untouched.
+    assert.equal(result.perProject.alpha.dedup.appliedCount, 0);
+    assert.equal(result.perProject.alpha.dedup.inputTokensRemoved, 0);
+    assert.equal(result.perTechnique.rtk.estRemovedTokens, 420);
+    assert.equal(result.perTechnique.dedup.estRemovedTokens, 0);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('(25b) a latch trip is recorded even when the request filtered nothing', () => {
+  const file = tmpStatsFile('rtk-latch');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordStats('alpha', {
+      techniques: { rtk: true },
+      rtk: { estRemovedTokens: 0, blocksFiltered: 0, blocksRawPinned: 2, memoHits: 0, latchTrips: 1 },
+    });
+    const result = stats.getStats('1');
+    assert.equal(result.perProject.alpha.rtk.latchTrips, 1);
+    assert.equal(result.perProject.alpha.rtk.blocksFiltered, 0);
+    assert.equal(result.perTechnique.rtk.latchTrips, 1);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('(26) aggregation is correct with the rtk bucket ABSENT (old snapshot shape)', () => {
+  const file = tmpStatsFile('rtk-absent');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    // A snapshot written before the bucket existed: three legacy buckets only.
+    const day = dayKey(0);
+    fs.writeFileSync(file, JSON.stringify({
+      [day]: {
+        alpha: {
+          dedup: { estRemovedTokens: 10, inputTokensRemoved: 10, cacheBillingDelta: 0, appliedCount: 1 },
+          cacheHint: { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 5, appliedCount: 1 },
+          toolPrune: { estRemovedTokens: 0, inputTokensRemoved: 0, cacheBillingDelta: 0, appliedCount: 1, toolsRemovedCount: 2 },
+          likelyPollCount: 0,
+          workTurnCount: 0,
+        },
+      },
+    }));
+    const stats = freshStats(file);
+    const result = stats.getStats('1');
+    // Present-but-empty, not missing: readers get a uniform shape.
+    assert.equal(result.perTechnique.rtk.estRemovedTokens, 0);
+    assert.equal(result.perTechnique.rtk.latchTrips, 0);
+    // The legacy buckets aggregate exactly as before.
+    assert.equal(result.perTechnique.dedup.inputTokensRemoved, 10);
+    assert.equal(result.perTechnique.cacheHint.cacheBillingDelta, 5);
+    assert.equal(result.perTechnique.toolPrune.toolsRemovedCount, 2);
+    assert.equal(result.totals.appliedCount, 3);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('(26b) the pre-v4 fixture still loads with the rtk bucket added', () => {
+  const file = tmpStatsFile('rtk-prev4');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    fs.copyFileSync(preV4FixturePath, file);
+    const stats = freshStats(file);
+    const result = stats.getStats('30');
+    assert.ok(result.perTechnique.rtk, 'the rtk bucket must exist even for a pre-v4 snapshot');
+    assert.equal(result.perTechnique.rtk.appliedCount, 0);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
+
+test('(26c) totals name their contributing buckets explicitly, so rtk is counted once', () => {
+  const file = tmpStatsFile('rtk-totals');
+  const prevEnv = process.env.MISER_STATS_FILE;
+  try {
+    const stats = freshStats(file);
+    stats.recordStats('alpha', { inputTokensRemoved: 100, techniques: { dedup: true } });
+    stats.recordStats('alpha', {
+      techniques: { rtk: true },
+      rtk: { estRemovedTokens: 50, blocksFiltered: 1, blocksRawPinned: 0, memoHits: 0, latchTrips: 0 },
+    });
+    stats.recordStats('alpha', { toolsRemoved: 4, techniques: { toolPrune: true } });
+    const result = stats.getStats('1');
+    // dedup (100) + rtk (50); toolPrune removes tool definitions, not input
+    // tokens, and reports through toolsRemovedCount instead.
+    assert.equal(result.totals.inputTokensRemoved, 150);
+    assert.equal(result.totals.estRemovedTokens, 150);
+    assert.equal(result.totals.toolsRemovedCount, 4);
+    assert.equal(result.totals.appliedCount, 3);
+  } finally {
+    cleanup(file, prevEnv);
+  }
+});
