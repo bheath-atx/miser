@@ -24,6 +24,7 @@ const { getPanelStats, getPersistenceStatus, getRecordRejectionStatus: getPanelR
 const { alertRoutingHealth } = require('./alert-routes.js');
 const { createWatcher } = require('./watchd.js');
 const { createOutputFilter } = require('./outputfilter.js');
+const { createHeadroomFilter } = require('./headroom.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -318,6 +319,8 @@ function createProxy(deps = {}) {
   // OFF means no spawn, no memo allocation, and no freeze cost.
   const outputFilter = deps.outputFilter
     || (config.rtk && config.rtk.enabled ? createOutputFilter(config.rtk, deps.rtkDeps || {}) : null);
+  const headroomFilter = deps.headroomFilter
+    || (config.headroom && config.headroom.enabled ? createHeadroomFilter(config.headroom, deps.headroomDeps || {}) : null);
   let watcher = deps.watcher || null;
   const getWatcher = () => {
     if (!watcher) watcher = createWatcher(config.watch || {});
@@ -631,7 +634,7 @@ function createProxy(deps = {}) {
       let rtkMessages = messages;
       let rtkBody = prunedBody;
       let rtkStats = null;
-      if (outputFilter && format === 'anthropic') {
+      if (outputFilter && !headroomFilter && format === 'anthropic') {
         try {
           const filtered = await outputFilter.applyToMessages(prunedBody.messages);
           rtkStats = filtered.stats;
@@ -646,6 +649,18 @@ function createProxy(deps = {}) {
           // Fail-open by construction: an adapter throw forwards the
           // unmodified body rather than failing the client's request.
           console.warn('[miser] rtk filter error (fail-open):', e.message);
+        }
+      }
+
+      // Headroom uses the SAME dispatch-stage slot as RTK. Always start from
+      // raw pre-filter messages: stacking lossy passes could erase guard words.
+      if (headroomFilter && format === 'anthropic') {
+        try {
+          const filtered = await headroomFilter.applyToMessages(prunedBody.messages);
+          rtkMessages = filtered.messages;
+          rtkBody = { ...prunedBody, messages: filtered.messages };
+        } catch (e) {
+          console.warn('[miser] headroom filter error (fail-open):', e.message);
         }
       }
 

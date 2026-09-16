@@ -1,0 +1,2 @@
+# Optional sidecar only; Node/npm test does not depend on this environment.
+headroom-ai[ml]==0.37.0
