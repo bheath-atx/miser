@@ -182,6 +182,7 @@ test('parseEnforcement accepts wildcard default and project overrides, including
     terminalHandoffAllowed: false,
     terminalHandoffMaxTurns: 1,
     inboundBradReplyMaxTurns: 2,
+    boundedReadMaxAssistantTurns: 3,
   };
   const parsed = parseEnforcement(JSON.stringify({
     '*': { mode: 'observe', redirect: { mode: 'shadow' }, poll: { maxLikelyPollsPer10Min: 2 }, orchControl },
@@ -1214,14 +1215,11 @@ test('B1 R3 regression: malformed OpenAI arguments stay structural and scan thei
       assert.doesNotThrow(() => { response = checkEnforcement('miser', 'orch', body, {}, 100, deps); });
       assert.equal(classifyRequest('miser', 'orch', body).terminalShape, 'tool_result');
       const label = `${mode}/${JSON.stringify(args)}`;
-      if (blocked) {
+      {
         assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', label);
-        assert.match(controlText(response), /git-write-operation/);
+        assert.match(controlText(response), /unvalidated-tool-arguments/);
         assert.equal(deps.events.at(-1)?.reason, 'orch-hard-safety', label);
         assert.equal(deps.events.at(-1)?.decision, 'block', label);
-      } else {
-        assert.equal(response, null, label);
-        assert.ok(!deps.events.some(event => event.reason === 'orch-hard-safety'), label);
       }
     }
   }
@@ -1229,11 +1227,11 @@ test('B1 R3 regression: malformed OpenAI arguments stay structural and scan thei
 
 test('B1 R5 regression: malformed arguments use every existing hard-safety command rule', () => {
   const commands = [
-    ['printf ready; env | rg SECRET', 'sensitive-env'],
+    ['printf ready; env | rg SECRET', 'unvalidated-tool-arguments'],
     ['cat ~/.ssh/id_rsa', 'sensitive-file-read'],
     ['rg secret /home/nacho', 'broad-secret-search'],
     ['git branch -D example', 'destructive-git-branch'],
-    ['git push origin main', 'git-write-operation'],
+    ['git push origin main', 'unvalidated-tool-arguments'],
     ['gh pr create --title example', 'pr-write-operation'],
     ['systemctl --user restart miser', 'service-mutation'],
     ['codex exec example', 'direct-codex-exec'],
@@ -1248,7 +1246,7 @@ test('B1 R5 regression: malformed arguments use every existing hard-safety comma
         const deps = guard(config, createEnforcementState());
         const response = checkEnforcement('miser', 'orch', body, {}, 100, deps);
         assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', `${mode}/${args}`);
-        assert.ok(controlText(response).includes(reason), `${mode}/${args}: ${reason}`);
+        assert.ok(controlText(response).includes('unvalidated-tool-arguments'), `${mode}/${args}: ${reason}`);
       }
     }
   }
@@ -1277,7 +1275,7 @@ test('B1 R5 regression: deep and large malformed arguments never crash or trunca
       let response;
       assert.doesNotThrow(() => { response = checkEnforcement('miser', 'orch', body, {}, 100, deps); }, `${mode}/${label}`);
       assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', `${mode}/${label}`);
-      assert.match(controlText(response), /git-write-operation/);
+      assert.match(controlText(response), /unvalidated-tool-arguments/);
     }
   }
 });
@@ -1299,7 +1297,7 @@ test('B1 R6 regression: nested command and path values fall back to the raw JSON
           assert.doesNotThrow(() => { response = checkEnforcement('miser', 'orch', body, {}, 100, deps); }, label);
           assert.equal(classifyRequest('miser', 'orch', body).terminalShape, terminalShape, label);
           assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', label);
-          assert.match(controlText(response), /git-write-operation/, label);
+          assert.match(controlText(response), /unvalidated-tool-arguments/, label);
           assert.equal(deps.events.at(-1)?.decision, 'block', label);
         }
       }
@@ -1326,13 +1324,10 @@ test('B1 R6 regression: empty, scalar and missing fields scan other raw JSON con
         let response;
         assert.doesNotThrow(() => { response = checkEnforcement('miser', 'orch', body, {}, 100, deps); }, label);
         assert.equal(classifyRequest('miser', 'orch', body).terminalShape, 'tool_result', label);
-        if (forbidden) {
+        {
           assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', label);
-          assert.match(controlText(response), /git-write-operation/, label);
+          assert.match(controlText(response), /unvalidated-tool-arguments/, label);
           assert.equal(deps.events.at(-1)?.decision, 'block', label);
-        } else {
-          assert.equal(response, null, label);
-          assert.ok(!deps.events.some(event => event.reason === 'orch-hard-safety'), label);
         }
       }
     }
@@ -1341,14 +1336,14 @@ test('B1 R6 regression: empty, scalar and missing fields scan other raw JSON con
 
 test('B1 R6 regression: JSON command boundaries preserve every hard-safety command family', () => {
   const commands = [
-    ['printenv SECRET_TOKEN', 'sensitive-env'],
-    ['env | rg SECRET', 'sensitive-env'],
-    ['export SECRET_TOKEN', 'sensitive-env'],
-    ['set | rg SECRET', 'sensitive-env'],
+    ['printenv SECRET_TOKEN', 'unvalidated-tool-arguments'],
+    ['env | rg SECRET', 'unvalidated-tool-arguments'],
+    ['export SECRET_TOKEN', 'unvalidated-tool-arguments'],
+    ['set | rg SECRET', 'unvalidated-tool-arguments'],
     ['cat ~/.ssh/id_rsa', 'sensitive-file-read'],
     ['rg secret /home/nacho', 'broad-secret-search'],
     ['git branch -D example', 'destructive-git-branch'],
-    ['git commit -m example', 'git-write-operation'],
+    ['git commit -m example', 'unvalidated-tool-arguments'],
     ['gh pr merge 123', 'pr-write-operation'],
     ['systemctl --user restart miser', 'service-mutation'],
     ['codex exec example', 'direct-codex-exec'],
@@ -1368,7 +1363,7 @@ test('B1 R6 regression: JSON command boundaries preserve every hard-safety comma
         const label = `${mode}/${args}`;
         const response = checkEnforcement('miser', 'orch', body, {}, 100, deps);
         assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', label);
-        assert.ok(controlText(response).includes(reason), `${label}: ${reason}`);
+        assert.ok(controlText(response).includes('unvalidated-tool-arguments'), `${label}: ${reason}`);
         assert.equal(deps.events.at(-1)?.decision, 'block', label);
       }
     }
@@ -1396,7 +1391,7 @@ test('B1 R6 regression: deep and large valid JSON with unusable fields never hid
       let response;
       assert.doesNotThrow(() => { response = checkEnforcement('miser', 'orch', body, {}, 100, deps); }, `${mode}/${label}`);
       assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', `${mode}/${label}`);
-      assert.match(controlText(response), /git-write-operation/, `${mode}/${label}`);
+      assert.match(controlText(response), /unvalidated-tool-arguments/, `${mode}/${label}`);
       assert.equal(deps.events.at(-1)?.decision, 'block', `${mode}/${label}`);
     }
   }
@@ -1462,14 +1457,14 @@ function assertR7ToolSafety(input, expectedReason = '', format = 'openai') {
 test('B1 R7 regression: the exact nested command bypass blocks despite a benign file_path', () => {
   assertR7ToolSafety({
     command: { wrapper: { value: 'git push --force origin main' } }, file_path: '/tmp/out',
-  }, 'git-write-operation');
+  }, 'unvalidated-tool-arguments');
 });
 
 test('B1 R7 regression: every nested safety field triggers raw scanning beside three benign fields', () => {
   const benign = { command: 'git --version', cmd: 'printf ready', file_path: '/tmp/out', path: '/tmp/other' };
   for (const key of Object.keys(benign)) {
     for (const value of [{ wrapper: { value: 'git push --force origin main' } }, [['git push --force origin main']]]) {
-      assertR7ToolSafety({ ...benign, [key]: value }, 'git-write-operation');
+      assertR7ToolSafety({ ...benign, [key]: value }, 'unvalidated-tool-arguments');
     }
   }
 });
@@ -1482,7 +1477,7 @@ test('B1 R7 regression: empty and scalar siblings cannot shield raw metadata or 
         assertR7ToolSafety({
           ...benign, [key]: value,
           metadata: { note: forbidden ? 'git push --force origin main' : 'ready' },
-        }, forbidden ? 'git-write-operation' : '');
+        }, 'unvalidated-tool-arguments');
       }
     }
   }
@@ -1524,13 +1519,13 @@ test('B1 R7 regression: literal env examples keep strict boundaries in both comm
 });
 
 test('B1 R7 regression: raw fallback keeps JSON env boundaries for truncated arrays and mixed fields', () => {
-  assertR7ToolSafety('{"command":"printenv SECRET_TOKEN', 'sensitive-env');
-  assertR7ToolSafety('["printenv SECRET_TOKEN"]', 'sensitive-env');
+  assertR7ToolSafety('{"command":"printenv SECRET_TOKEN', 'unvalidated-tool-arguments');
+  assertR7ToolSafety('["printenv SECRET_TOKEN"]', 'unvalidated-tool-arguments');
   const benign = { command: 'git --version', cmd: 'printf ready', file_path: '/tmp/out', path: '/tmp/other' };
   for (const keyword of ['printenv', 'env', 'export', 'set']) {
-    for (const prefix of ['"', '[', '{']) assertR7ToolSafety(`${prefix}${keyword} SECRET_TOKEN`, 'sensitive-env');
+    for (const prefix of ['"', '[', '{']) assertR7ToolSafety(`${prefix}${keyword} SECRET_TOKEN`, 'unvalidated-tool-arguments');
     for (const key of Object.keys(benign)) {
-      assertR7ToolSafety({ ...benign, [key]: null, metadata: `${keyword} SECRET_TOKEN` }, 'sensitive-env');
+      assertR7ToolSafety({ ...benign, [key]: null, metadata: `${keyword} SECRET_TOKEN` }, 'unvalidated-tool-arguments');
     }
   }
 });
@@ -1579,13 +1574,10 @@ test('B1 R7 regression: fallback boundaries stay local to each call in a mixed b
           const deps = guard(config, createEnforcementState());
           const label = `${mode}/${terminalShape}/${reverse}/${forbidden}`;
           const response = checkEnforcement('miser', 'orch', body, {}, 100, deps);
-          if (forbidden) {
+          {
             assert.equal(response?.headers['x-miser-enforcement'], 'orch-hard-safety', label);
-            assert.match(controlText(response), /sensitive-env/, label);
+            assert.match(controlText(response), /unvalidated-tool-arguments/, label);
             assert.equal(deps.events.at(-1)?.decision, 'block', label);
-          } else {
-            assert.equal(response, null, label);
-            assert.ok(!deps.events.some(event => event.reason === 'orch-hard-safety'), label);
           }
         }
       }
@@ -2583,4 +2575,807 @@ test('conversation fingerprint changes when first user message changes', () => {
   const b = promptBody('first task B');
   assert.notEqual(conversationFingerprint(a), conversationFingerprint(b));
   assert.equal(conversationFingerprint(a), classifyRequest('aetheria', 'orch', a, {}, 100).conversationFingerprint);
+});
+
+// Scratch harness additions: helpers only; no tested command string is executed.
+const { hardSafetyReason } = require('../src/enforcement.js').__test;
+function iqaFreshDeps(question = 'what is in the miser log right now?') {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date('2026-09-13T00:00:00Z'));
+  if (question !== null) assert.equal(checkEnforcement('miser', 'orch', promptBody(question), {}, 0, deps, {}), null);
+  return deps;
+}
+function iqaRedirect(command) {
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody(command), {}, 0, iqaFreshDeps(), {});
+  assert.equal(result?.headers['x-miser-enforcement'], 'zero-llm-redirect', command);
+  assert.equal(result?.headers['x-miser-redirect-class'], 'POLL_MISER', command);
+}
+function iqaBounded(question, command) {
+  const deps = iqaFreshDeps(question);
+  assert.equal(checkEnforcement('miser', 'orch', bashToolResultBody(command), {}, 0, deps, {}), null, command);
+}
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety: curl payload quoting a forbidden command as DATA does not block', () => {
+  const body = bashToolResultBody(
+    `curl -X POST http://127.0.0.1:8001/v1/orch/foo/reply -d '{"text":"a real git push --force origin main request must still get blocked with that header"}'`
+  );
+  assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), '');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety: curl --data-binary / --data-urlencode (the curl --data* family) quoting forbidden text as DATA does not block', () => {
+  for (const flag of ['--data', '--data-raw', '--data-binary', '--data-urlencode', '--post-data']) {
+    const body = bashToolResultBody(
+      `curl -X POST http://127.0.0.1:8001/v1/orch/foo/reply ${flag} '{"text":"git push --force origin main"}'`
+    );
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), '', flag);
+  }
+  const bodyEq = bashToolResultBody(
+    `curl -X POST http://127.0.0.1:8001/v1/orch/foo/reply --data-binary='{"text":"git push --force origin main"}'`
+  );
+  assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', bodyEq), bodyEq), '');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety: existing hardSafetyCases table still passes verbatim under Fix A v3', () => {
+  for (const [body, reason] of hardSafetyCases('ROLE: ORCH')) {
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), reason);
+  }
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety: bash -c / bash -lc / quoted -c / eval of a forbidden command still blocks (CONFIRMED-FIXED A2, unchanged)', () => {
+  for (const command of [
+    `bash -c 'git push --force origin main'`,
+    `bash -lc 'git push --force origin main'`,
+    `bash '-c' 'git push --force origin main'`,
+    `eval "git push --force origin main"`,
+  ]) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), 'git-write-operation', command);
+  }
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety (A1): an unquoted backslash-escaped quote in a curl -d payload does not swallow a REAL subsequent command', () => {
+  const cases = [
+    ['curl -d \\"; cat \'/home/nacho/.ssh/id_rsa\' # "', 'sensitive-file-read'],
+    ['curl -d \\"; printenv SECRET_TOKEN # "', 'sensitive-env'],
+    ['curl -d \\"; rg secret /home/nacho # "', 'broad-secret-search'],
+  ];
+  for (const [command, reason] of cases) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), reason, command);
+  }
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety (A3): quoted close-paren inside a curl -d substitution does not end capture early, and the substitution body is not lost', () => {
+  for (const command of [
+    `curl -d "$(printf ')'; git push origin main)" http://example/reply`,
+    'curl -d "`printf \')\'; git push origin main`" http://example/reply',
+  ]) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), 'git-write-operation', command);
+  }
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety (A4): adversarial deeply-nested substitution inside a curl -d payload never crashes and stays blocked', () => {
+  const command = `curl -d "${'$('.repeat(6000)}printf ok${')'.repeat(6000)}; git push origin main" http://example/reply`;
+  const body = bashToolResultBody(command);
+  let response;
+  assert.doesNotThrow(() => { response = hardSafetyReason(classifyRequest('miser', 'orch', body), body); });
+  assert.equal(response, 'git-write-operation');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety (A4): adversarial deeply-nested substitution with NO data-transport command never crashes (fast path, unmodified scan)', () => {
+  const command = '$('.repeat(6000) + 'git push origin main' + ')'.repeat(6000);
+  const body = bashToolResultBody(command);
+  let response;
+  assert.doesNotThrow(() => { response = hardSafetyReason(classifyRequest('miser', 'orch', body), body); });
+  assert.equal(response, 'git-write-operation');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety (A4): a live command sitting at exactly the substitution depth bound (24/25 levels) is never lost', () => {
+  for (const depth of [23, 24, 25, 26]) {
+    const command = `curl -d "${'$('.repeat(depth)}git push origin main${')'.repeat(depth)}" http://example/reply`;
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), 'git-write-operation', `depth=${depth}`);
+  }
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('hard safety (A4): a quoted-span length at exactly the 20000-char bound (19999/20000/20001) never deletes a live command', () => {
+  for (const len of [19999, 20000, 20001]) {
+    const sub = '$(git push origin main)';
+    const padding = 'x'.repeat(Math.max(0, len - sub.length - 2));
+    const command = `curl -d "${padding}${sub}" http://example/reply`;
+    const quotedSpanLength = 1 + padding.length + sub.length + 1;
+    assert.equal(quotedSpanLength, len, `constructed span must measure exactly len=${len}`);
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), 'git-write-operation', `len=${len}`);
+  }
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('hard safety: OpenAI shape with malformed tool-call JSON on an exec tool fails closed honestly', () => {
+  const body = { model: 'gpt', messages: [
+    { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: '{"command": "curl -d \'{\\"text\\": not valid json' } }] },
+  ] };
+  assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), 'unvalidated-tool-arguments');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER: sprint-path substring collision with tail does not classify as a poll', () => {
+  const c = classifyRequest('miser', 'orch',
+    bashToolResultBody('grep -n "^## " /home/nacho/sprints/20260912-miser-classifier-content-match-investigation/STATUS.md | tail -30'));
+  assert.notEqual(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER: bare relative miser.log filename still classifies', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('tail -f miser.log'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER: env-wrapped tail still classifies', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('env tail -f ~/.miser/miser.log'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER: newline-joined second command still classifies', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('printf ready\ntail -f ~/.miser/miser.log'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER (B1 R8 regression): combined wrapper chains resolve through to the real head', () => {
+  for (const command of [
+    'sudo -u x nice tail -f ~/.miser/miser.log',
+    'timeout 5 tail -f ~/.miser/miser.log',
+    'nice -n 5 tail -f ~/.miser/miser.log',
+  ]) {
+    const c = classifyRequest('miser', 'orch', bashToolResultBody(command));
+    assert.equal(c.commandClass, 'POLL_MISER', command);
+  }
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER (B1 R8 regression): a Miser read later in a pipe chain still classifies', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('printf ready | tail -f ~/.miser/miser.log'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER (B1 R8 regression): the pipeline splitter recognizes || as a top-level separator', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('gh pr view 1 || tail -f ~/.miser/miser.log'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER: grep search pattern containing /.miser/ is not misread as a file path', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('grep -n "/.miser/" STATUS.md'));
+  assert.notEqual(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER (B2 R8 regression): multiple -e pattern flags are all excluded from the file-argument list', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody(`grep -e first -e '/.miser/' STATUS.md`));
+  assert.notEqual(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v3; verbatim final test
+test('POLL_MISER (B2 R8 regression): a long-form --regexp= pattern no longer causes a real file argument to be dropped', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('grep --regexp=pattern ~/.miser/miser.log STATUS.md'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B4 R8 regression): an unrelated "nginx logs" question does not reuse a Miser-read exemption', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {}); // consumes POLL_MISER
+  const unrelatedItself = checkEnforcement('miser', 'orch', promptBody('What do nginx logs show?'), {}, 0, deps, {});
+  assert.equal(unrelatedItself, null, 'the unrelated question itself must never be blocked');
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null, 'the unrelated nginx question must not re-arm the already-consumed Miser exemption');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('B5 R8 regression: a repeated identical direct operator question never trips a later, unrelated budget check', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  const question = 'What does /api/miser/stats show right now?';
+  function questionTurn(assistantCount) {
+    const messages = [];
+    for (let i = 0; i < assistantCount; i++) {
+      messages.push({ role: 'user', content: `u${i}` });
+      messages.push({ role: 'assistant', content: `a${i}` });
+    }
+    messages.push({ role: 'user', content: question });
+    return { model: 'claude-sonnet-5-test', max_tokens: 50, system: 'You are the ORCH controller for this sprint.', messages };
+  }
+  for (let turn = 0; turn < 4; turn++) {
+    const result = checkEnforcement('miser', 'orch', questionTurn(turn), {}, 100, deps);
+    assert.equal(result, null, `turn ${turn + 1} of the identical question must not be redirect/budget-blocked`);
+  }
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('hard safety (A1 R4 regression): a raw newline or a bare & between the curl invocation and a real subsequent command does not leave curl as the head', () => {
+  const cases = [
+    ['curl -d ok u\ncat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+    ['curl -d ok u & cat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+  ];
+  for (const [command, reason] of cases) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), reason, JSON.stringify(command));
+  }
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('hard safety (A3 R4 regression): an unquoted backslash-escaped close-paren inside a curl -d substitution does not end capture early', () => {
+  const command = 'curl -d "$(printf \\); git push origin main)" http://example/reply';
+  const body = bashToolResultBody(command);
+  assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), 'git-write-operation', command);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('POLL_MISER (B1 R4 regression): env with its own flag before the wrapped command still resolves through to the real head', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('env -u FOO tail -f ~/.miser/miser.log'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('POLL_MISER (B1 R4 regression): a fractional timeout duration with no leading integer digit still resolves through to the real head', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('timeout .5 tail -f ~/.miser/miser.log'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('POLL_MISER (B2 R4 regression): a glued short -e flag (no separator before the pattern) does not drop the real log file', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody('grep -epattern ~/.miser/miser.log STATUS.md'));
+  assert.equal(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('POLL_MISER (B2 R4 regression): a second glued -ne pattern flag is excluded from file args, not promoted to a file', () => {
+  const c = classifyRequest('miser', 'orch', bashToolResultBody(`grep -e first -ne /.miser/ STATUS.md`));
+  assert.notEqual(c.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B3 R4 regression): a quoted follow flag is never exempted, even immediately after a matching direct question', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody(`tail '-f' ~/.miser/miser.log`), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B3 R4 regression): a quoted --follow / journalctl invocation is never exempted', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody(`journalctl "--follow" -u miser`), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B4 R4 regression): an availability question mentioning this sprint\'s own hyphenated name does not replenish a consumed Miser-read exemption', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {}); // consumes POLL_MISER
+  const availability = checkEnforcement('miser', 'orch',
+    promptBody('Are you still there in the miser-classifier sprint?'), {}, 0, deps, {});
+  assert.equal(availability, null, 'the availability question itself must never be blocked');
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null, 'the sprint-name mention must not replenish the already-consumed Miser exemption');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: single bounded Miser-log read answering a direct operator question is not blocked', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.equal(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: the operator question turn itself is never blocked, even though its own text matches POLL_MISER', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  const result = checkEnforcement('miser', 'orch', promptBody('What does /api/miser/stats show right now?'), {}, 0, deps, {});
+  assert.equal(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: a SECOND Miser-log read in the same question-window still redirects', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {}); // consumes the allowance
+  const second = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(second, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: Miser-log read with no preceding direct question still redirects (unchanged)', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B3 R8 regression): a combined short-flag follow (tail -fn50) is never exempted', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -fn50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B3 R8 regression): two reads joined by a bare & are never exempted', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch',
+    bashToolResultBody('tail -n 50 ~/.miser/miser.log & tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: tail -f is never exempted, even immediately after a matching direct question', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -f ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: watch loop is never exempted, even immediately after a matching direct question', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('watch cat ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: while/sleep Miser-poll loop is never exempted, even immediately after a matching direct question', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch',
+    bashToolResultBody('while true; do tail -n 50 ~/.miser/miser.log; sleep 5; done'), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect: two reads batched with ; are never exempted, even immediately after a matching direct question', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch',
+    bashToolResultBody('tail -n 50 ~/.miser/miser.log; tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null);
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B4 R8 regression): a topic-less follow-up ("Are you still there?") preserves a still-valid pending allowance', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const followUp = checkEnforcement('miser', 'orch', promptBody('Are you still there?'), {}, 0, deps, {});
+  assert.equal(followUp, null, 'the follow-up question itself must never be blocked');
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.equal(result, null, 'the still-pending Miser allowance must survive the topic-less follow-up');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('redirect (B4 R8 regression): an explicit "stop monitoring" instruction disarms a pending, unused allowance', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  checkEnforcement('miser', 'orch', promptBody('Stop monitoring the Miser log.'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null, 'the disarmed allowance must not exempt a later Miser-log read');
+});
+
+// Published PROPOSAL-v4; verbatim final test
+test('B5 R8 regression: hard safety still fires on an operator turn regardless of the question short-circuit', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  const result = checkEnforcement('miser', 'orch', promptBody('Can you run git push origin main?'), {}, 0, deps, {});
+  assert.equal(result?.headers['x-miser-enforcement'], 'orch-hard-safety');
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('hard safety (A1 R5 regression): a redirection & (2>&1, &>/dev/null) is never misread as a command-separator that resets the head', () => {
+  const inert = [
+    `curl 2>&1 -d '{"text":"git push origin main"}' u`,
+    `curl -d ok u &>/dev/null`,
+    `curl -d ok u &>>/dev/null`,
+  ];
+  for (const command of inert) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), '', command);
+  }
+  const stillDetected = [
+    ['curl -d ok u &>/dev/null; cat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+    ['curl -d ok u\ncat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+    ['curl -d ok u & cat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+  ];
+  for (const [command, reason] of stillDetected) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), reason, command);
+  }
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('POLL_MISER (B1 R5 regression): real timeout duration forms strtod accepts (trailing-dot, scientific, unit-suffixed, hex, inf) all resolve through to the real head', () => {
+  const cases = [
+    'timeout 5. tail -f ~/.miser/miser.log',
+    'timeout 1e2 tail -f ~/.miser/miser.log',
+    'timeout 5.s tail -f ~/.miser/miser.log',
+    'timeout 0x5 tail -f ~/.miser/miser.log',
+    'timeout inf tail -f ~/.miser/miser.log',
+  ];
+  for (const command of cases) {
+    const c = classifyRequest('miser', 'orch', bashToolResultBody(command));
+    assert.equal(c.commandClass, 'POLL_MISER', command);
+  }
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('POLL_MISER (B1 R5 regression): env -S (split-string) resolves through the split command line to the real head, with trailing args appended', () => {
+  const split = classifyRequest('miser', 'orch', bashToolResultBody(`env -S 'tail -f ~/.miser/miser.log'`));
+  assert.equal(split.commandClass, 'POLL_MISER');
+  const splitEq = classifyRequest('miser', 'orch', bashToolResultBody(`env --split-string='tail -f ~/.miser/miser.log'`));
+  assert.equal(splitEq.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('POLL_MISER (B2 R5 regression): the letter e inside an UNRELATED glued flag value (rg -r/--replace, -g/--glob) is never misread as the pattern flag', () => {
+  const replaceCase = classifyRequest('miser', 'orch', bashToolResultBody('rg -nrreplacement /.miser/ STATUS.md'));
+  assert.notEqual(replaceCase.commandClass, 'POLL_MISER', 'rg -nrreplacement');
+  const globCase = classifyRequest('miser', 'orch', bashToolResultBody('rg -ng"*e*" /.miser/ file.txt'));
+  assert.notEqual(globCase.commandClass, 'POLL_MISER', 'rg -ng"*e*"');
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('POLL_MISER (B2 R5 regression): a genuine bundled -e still recognized when it follows only boolean flags, glued or needing the next token', () => {
+  const gluedValue = classifyRequest('miser', 'orch', bashToolResultBody('grep -nef ~/.miser/miser.log STATUS.md'));
+  assert.equal(gluedValue.commandClass, 'POLL_MISER', 'grep -nef (glued value f is the pattern; /.miser/ file stays a real file arg)');
+  const needsNextToken = classifyRequest('miser', 'orch', bashToolResultBody('grep -nHe /.miser/ STATUS.md'));
+  assert.notEqual(needsNextToken.commandClass, 'POLL_MISER', 'grep -nHe (e needs next token as pattern value, so /.miser/ is the pattern, not a file)');
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('redirect (B3 R5 regression): a -- end-of-options marker followed by a flag-shaped filename is bounded, not misread as an active follow flag', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody(`tail -n 50 -- "-f" ~/.miser/miser.log`), {}, 0, deps, {});
+  assert.equal(result, null, 'a filename that only LOOKS like -f after -- must not be treated as a follow flag');
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('redirect (B3 R5 regression): a -- end-of-options marker followed by a --follow-shaped filename is bounded, not misread as an active follow flag', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody(`tail -- "--follow" ~/.miser/miser.log`), {}, 0, deps, {});
+  assert.equal(result, null, 'a filename that only LOOKS like --follow after -- must not be treated as a follow flag');
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('redirect (B4 R5 regression): TWO hyphenated sprint-name mentions in the same sentence both get stripped, not just the first', () => {
+  const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+  checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {}); // consumes POLL_MISER
+  const availability = checkEnforcement('miser', 'orch',
+    promptBody('Are you still there in the miser-classifier and miser-routing sprints?'), {}, 0, deps, {});
+  assert.equal(availability, null, 'the availability question itself must never be blocked');
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.notEqual(result, null, 'naming two sprints in one sentence must not replenish the already-consumed Miser exemption');
+});
+
+// Published PROPOSAL-v5; verbatim final test
+test('redirect (B3 R8 regression, RETARGET R5 fix): until/for loops and an xargs pipeline are never exempted, via the actual redirect/POLL_MISER path', () => {
+  const config = configFor('miser', { panels: ['orch'] });
+  config.miser.redirect = { mode: 'enforce' };
+  for (const command of [
+    'until false; do curl -sS :20128/health; done',
+    'for i in 1 2 3; do curl -sS :20128/health; done',
+    'echo ready | xargs -I{} curl -sS :20128/health',
+  ]) {
+    const state = createEnforcementState({ nowMs: () => Date.parse('2026-09-13T00:00:00Z') });
+    const deps = guard(config, state, () => new Date(Date.parse('2026-09-13T00:00:00Z')));
+    checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps, {});
+    const result = checkEnforcement('miser', 'orch', bashToolResultBody(command), {}, 0, deps, {});
+    assert.notEqual(result, null, command);
+    assert.equal(result.headers['x-miser-enforcement'], 'zero-llm-redirect', command);
+    assert.equal(result.headers['x-miser-redirect-class'], 'POLL_MISER', command);
+  }
+});
+
+// Published PROPOSAL-v6; verbatim final test
+test('hard safety (A1 R6 regression): input-fd redirection (<&-, numbered-fd forms) is never misread as a separator, and an escaped > no longer hides a real command boundary', () => {
+  const inert = [
+    `curl <&- -d '{"text":"git push origin main"}' u`,
+    `curl 3<&- -d '{"text":"git push origin main"}' u`,
+    `curl <&2 -d '{"text":"git push origin main"}' u`,
+  ];
+  for (const command of inert) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), '', command);
+  }
+  // R5 REGRESSION GUARD: an escaped `>` must not make a subsequent `&` look
+  // like a redirection operator -- this exact shape was correctly detected
+  // in v4, then silently broken by round 5's own `&`-redirection fix.
+  const stillDetected = [
+    [`curl x\\>& cat -- -d /home/nacho/.ssh/id_rsa`, 'sensitive-file-read'],
+    ['curl -d ok u &>/dev/null; cat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+    ['curl -d ok u\ncat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+    ['curl -d ok u & cat -- -d /home/nacho/.ssh/id_rsa', 'sensitive-file-read'],
+  ];
+  for (const [command, reason] of stillDetected) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), reason, command);
+  }
+});
+
+// Published PROPOSAL-v6; verbatim final test
+test('POLL_MISER (B1 R6 regression): further real timeout duration forms strtod accepts (leading +, +inf, hex float with no leading digit) all resolve through to the real head', () => {
+  const cases = [
+    'timeout +5 tail -f ~/.miser/miser.log',
+    'timeout +inf tail -f ~/.miser/miser.log',
+    'timeout 0x.8p0 tail -f ~/.miser/miser.log',
+  ];
+  for (const command of cases) {
+    const c = classifyRequest('miser', 'orch', bashToolResultBody(command));
+    assert.equal(c.commandClass, 'POLL_MISER', command);
+  }
+});
+
+// Published PROPOSAL-v6; verbatim final test
+test('POLL_MISER (B2 R6 regression): -f/--file supplies the pattern from a FILE, not a literal -- its own value is a real file argument, not an implicit dropped pattern, for both grep and rg', () => {
+  const grepGlued = classifyRequest('miser', 'orch', bashToolResultBody('grep -nfrex ~/.miser/miser.log STATUS.md'));
+  assert.equal(grepGlued.commandClass, 'POLL_MISER', 'grep -nfrex (bundled -f, glued value "rex" is a pattern-file path)');
+  const rgGlued = classifyRequest('miser', 'orch', bashToolResultBody('rg -nfrex ~/.miser/miser.log STATUS.md'));
+  assert.equal(rgGlued.commandClass, 'POLL_MISER', 'rg -nfrex (same bundled shape)');
+});
+
+// Published PROPOSAL-v6; verbatim final test
+test('POLL_MISER (B2 R6 regression): -f/--file needing the next token, and the long --file=/-- file forms, all still resolve the real log file', () => {
+  const needsNextToken = classifyRequest('miser', 'orch', bashToolResultBody('grep -nf ~/.miser/miser.log STATUS.md'));
+  assert.equal(needsNextToken.commandClass, 'POLL_MISER', 'grep -nf (bundled, empty glued value, value is the NEXT token)');
+  const longEq = classifyRequest('miser', 'orch', bashToolResultBody('grep --file=rex ~/.miser/miser.log STATUS.md'));
+  assert.equal(longEq.commandClass, 'POLL_MISER', 'grep --file=rex');
+  const longSeparate = classifyRequest('miser', 'orch', bashToolResultBody('grep --file rex ~/.miser/miser.log STATUS.md'));
+  assert.equal(longSeparate.commandClass, 'POLL_MISER', 'grep --file rex (separate-token value)');
+});
+
+// Published PROPOSAL-v6; reviewer-expanded scaffold/body
+test('redirect (B3 R6 regression): a wrapper\'s OWN -- (env --) never neuters the REAL wrapped command\'s own, still-active follow flag', () => {
+  const deps = iqaFreshDeps();
+  // ... asks 'what is in the miser log right now?', then:
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody(`env -- tail -f ~/.miser/miser.log`), {}, 0, deps, {});
+  assert.notEqual(result, null);
+  assert.equal(result.headers['x-miser-enforcement'], 'zero-llm-redirect');
+  assert.equal(result.headers['x-miser-redirect-class'], 'POLL_MISER');
+});
+
+// Published PROPOSAL-v6; reviewer-expanded scaffold/body
+test('redirect (B3 R6 regression): a literal -- printed as inert DATA in one pipe stage never neuters a real follow flag in an unrelated LATER stage', () => {
+  const deps = iqaFreshDeps();
+  const result = checkEnforcement('miser', 'orch',
+    bashToolResultBody(`printf '%s' '--' | tail -f ~/.miser/miser.log`), {}, 0, deps, {});
+  assert.notEqual(result, null);
+  assert.equal(result.headers['x-miser-enforcement'], 'zero-llm-redirect');
+  assert.equal(result.headers['x-miser-redirect-class'], 'POLL_MISER');
+});
+
+// Published PROPOSAL-v6; reviewer-expanded scaffold/body
+test('redirect (B3 R6 regression): nested quoting inside an env -S split-string value gets the same quote-normalization as a directly-quoted flag', () => {
+  const deps = iqaFreshDeps();
+  const result = checkEnforcement('miser', 'orch',
+    bashToolResultBody(`env -S 'tail "-f"' ~/.miser/miser.log`), {}, 0, deps, {});
+  assert.notEqual(result, null);
+  assert.equal(result.headers['x-miser-enforcement'], 'zero-llm-redirect');
+  assert.equal(result.headers['x-miser-redirect-class'], 'POLL_MISER');
+});
+
+// Published PROPOSAL-v6; reviewer-expanded scaffold/body
+test('redirect (B3 R6 regression, R5 re-verify): a real, own -- still bounds its OWN command\'s subsequent flag-shaped positional args', () => {
+  const deps = iqaFreshDeps();
+  const deps2 = iqaFreshDeps();
+  const flagShaped = checkEnforcement('miser', 'orch', bashToolResultBody(`tail -n 50 -- "-f" ~/.miser/miser.log`), {}, 0, deps, {});
+  assert.equal(flagShaped, null);
+  const followShaped = checkEnforcement('miser', 'orch', bashToolResultBody(`tail -- "--follow" ~/.miser/miser.log`), {}, 0, deps2, {});
+  assert.equal(followShaped, null);
+});
+
+// Published PROPOSAL-v6; reviewer-expanded scaffold/body
+test('redirect (B4 R6 regression): a genuine hyphenated LOG FILENAME mention is preserved, not stripped as a sprint-name compound, so it still earns the bounded-read exemption', () => {
+  const deps = iqaFreshDeps(null);
+  const deps2 = iqaFreshDeps(null);
+  const deps3 = iqaFreshDeps(null);
+  const question = checkEnforcement('miser', 'orch', promptBody('What does miser-worker.log show?'), {}, 0, deps, {});
+  assert.equal(question, null);
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 miser-worker.log'), {}, 0, deps, {});
+  assert.equal(result, null, 'a genuinely-requested read of a real, hyphenated log filename must not be misclassified as an unprompted redirect');
+
+  // miser-prod.jsonl, fresh state:
+  const question2 = checkEnforcement('miser', 'orch', promptBody('What does miser-prod.jsonl show?'), {}, 0, deps2, {});
+  assert.equal(question2, null);
+  const result2 = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 miser-prod.jsonl'), {}, 0, deps2, {});
+  assert.equal(result2, null);
+
+  // R5 REGRESSION GUARD, explicit re-verify, fresh state:
+  checkEnforcement('miser', 'orch', promptBody('what is in the miser log right now?'), {}, 0, deps3, {});
+  checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps3, {}); // consumes POLL_MISER
+  const availability = checkEnforcement('miser', 'orch',
+    promptBody('Are you still there in the miser-classifier and miser-routing sprints?'), {}, 0, deps3, {});
+  assert.equal(availability, null);
+  const result3 = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps3, {});
+  assert.notEqual(result3, null, 'naming two sprints must still not replenish an already-consumed exemption');
+});
+
+// Published PROPOSAL-v7; verbatim final test
+test('hard safety (A1 R7 regression): a real bash line-continuation (backslash immediately followed by newline) is joined BEFORE redirection/separator classification runs', () => {
+  const inert = [
+    `curl 3<\\\n&0 -d '{"text":"git push origin main"}' u`,
+    `curl <\\\n&- -d '{"text":"git push origin main"}' u`,
+    `curl 2>\\\n&1 -d '{"text":"git push origin main"}' u`,
+  ];
+  for (const command of inert) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), '', command);
+  }
+  // A continued &> form must still detect a REAL, later command after it.
+  const stillDetected = [
+    [`curl -d ok u &\\\n>/dev/null; cat -- -d /home/nacho/.ssh/id_rsa`, 'sensitive-file-read'],
+  ];
+  for (const [command, reason] of stillDetected) {
+    const body = bashToolResultBody(command);
+    assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body), body), reason, command);
+  }
+  // An already-ESCAPED backslash (two backslashes) before a raw newline
+  // leaves that newline as a genuine, un-joined separator -- real bash
+  // parity rules, not a line continuation.
+  const escapedBackslash = `curl -d ok u\\\\\ncat -- -d /home/nacho/.ssh/id_rsa`;
+  const body2 = bashToolResultBody(escapedBackslash);
+  assert.equal(hardSafetyReason(classifyRequest('miser', 'orch', body2), body2), 'sensitive-file-read', escapedBackslash);
+});
+
+// Published PROPOSAL-v7; verbatim final test
+test('POLL_MISER (B1 R6 regression): env -S resolves through a no-space glued flag', () => {
+  const glued = classifyRequest('miser', 'orch', bashToolResultBody(`env -S'tail -f' ~/.miser/miser.log`));
+  assert.equal(glued.commandClass, 'POLL_MISER', `env -S'tail -f' ...`);
+});
+
+// Published PROPOSAL-v7; verbatim final test
+test('POLL_MISER (B1 R7 regression): env -S resolves the real backslash-UNDERSCORE (\\_) separator, not the fictional backslash-space round 6 guessed at', () => {
+  const single = classifyRequest('miser', 'orch', bashToolResultBody(`env -S 'tail\\_-f' ~/.miser/miser.log`));
+  assert.equal(single.commandClass, 'POLL_MISER', `env -S 'tail\\_-f' ...`);
+  const repeated = classifyRequest('miser', 'orch', bashToolResultBody(`env -S 'tail\\_\\_-f' ~/.miser/miser.log`));
+  assert.equal(repeated.commandClass, 'POLL_MISER', `env -S 'tail\\_\\_-f' ...`);
+  const wrongGuess = classifyRequest('miser', 'orch', bashToolResultBody(`env -S 'tail\\ -f' ~/.miser/miser.log`));
+  assert.notEqual(wrongGuess.commandClass, 'POLL_MISER', `env -S 'tail\\ -f' ... (real env rejects this outright)`);
+});
+
+// Published PROPOSAL-v7; verbatim final test
+test('POLL_MISER (B1 R7 regression): timeout accepts a real leading-whitespace-shaped quoted duration (strtod skips leading whitespace), leading tab included', () => {
+  const leadingSpace = classifyRequest('miser', 'orch', bashToolResultBody(`timeout ' 5' tail -f ~/.miser/miser.log`));
+  assert.equal(leadingSpace.commandClass, 'POLL_MISER');
+  const leadingTab = classifyRequest('miser', 'orch', bashToolResultBody(`timeout '\t5' tail -f ~/.miser/miser.log`));
+  assert.equal(leadingTab.commandClass, 'POLL_MISER');
+  const trailingSpace = classifyRequest('miser', 'orch', bashToolResultBody(`timeout '5 ' tail -f ~/.miser/miser.log`));
+  assert.notEqual(trailingSpace.commandClass, 'POLL_MISER', `timeout '5 ' ... (real timeout rejects trailing whitespace)`);
+});
+
+// Published PROPOSAL-v7; verbatim final test
+test('POLL_MISER (B2 R7 regression): a literal pattern beginning with -f AFTER a real -- end-of-options marker is positional text, not a re-read -f flag', () => {
+  const grepSlash = classifyRequest('miser', 'orch', bashToolResultBody(`grep -- '-f/.miser/' STATUS.md`));
+  assert.notEqual(grepSlash.commandClass, 'POLL_MISER');
+  const grepLog = classifyRequest('miser', 'orch', bashToolResultBody(`grep -- '-fmiser.log' STATUS.md`));
+  assert.notEqual(grepLog.commandClass, 'POLL_MISER');
+  const rgSlash = classifyRequest('miser', 'orch', bashToolResultBody(`rg -- '-f/.miser/' STATUS.md`));
+  assert.notEqual(rgSlash.commandClass, 'POLL_MISER');
+  // R6's own case must still pass: no -- present, -f's bundled/glued value still resolves.
+  const stillBundled = classifyRequest('miser', 'orch', bashToolResultBody('grep -nfrex ~/.miser/miser.log STATUS.md'));
+  assert.equal(stillBundled.commandClass, 'POLL_MISER');
+});
+
+// Published PROPOSAL-v7; reviewer-expanded scaffold/body
+test('redirect (B3 R7 regression): a quoted filename argument containing a literal pipe character is never mistaken for a real pipe separator', () => {
+  iqaRedirect(`tail 'a|b' -f ~/.miser/miser.log`);
+});
+
+// Published PROPOSAL-v7; reviewer-expanded scaffold/body
+test('redirect (B3 R7 regression): a single-quoted value ending in a literal backslash does not swallow a later, unrelated pipe stage boundary', () => {
+  iqaRedirect(`tail -n 50 ~/.miser/miser.log | printf '%s' '\\\\' '--' | tail -f file.txt`);
+});
+
+// Published PROPOSAL-v7; reviewer-expanded scaffold/body
+test('redirect (B3 R7 regression, R6 re-verify): the two round-6 wrapper/-- cases must keep passing alongside the quote-tracking and separator-byte fixes', () => {
+  iqaRedirect(`env -- tail -f ~/.miser/miser.log`);
+  iqaRedirect(`printf '%s' '--' | tail -f ~/.miser/miser.log`);
+});
+
+// Published PROPOSAL-v7; reviewer-expanded scaffold/body
+test('redirect (B4 R7 regression): a genuine MULTI-HYPHEN log filename is preserved whole, not truncated to an earlier hyphen boundary and stripped anyway', () => {
+  for (const ext of ['.log', '.log.1', '.log.gz', '.jsonl', '.json', '.txt']) {
+    const file = 'miser-access-log' + ext;
+    iqaBounded(`What does ${file} show?`, `tail -n 50 ${file}`);
+  }
+});
+
+// Published PROPOSAL-v7; reviewer-expanded scaffold/body
+test('redirect (B4 R7 regression): a bare, extensionless "...-log" basename is preserved as a real log reference, not stripped as a sprint-name compound', () => {
+  iqaBounded('What does miser-access-log show?', 'tail -n 50 ~/.miser/miser-access-log');
+  iqaBounded('What does miser-worker.log show?', 'tail -n 50 miser-worker.log');
+  const deps = iqaFreshDeps();
+  assert.equal(checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {}), null);
+  assert.equal(checkEnforcement('miser', 'orch', promptBody('Are you still there in the miser-classifier sprint?'), {}, 0, deps, {}), null);
+  const result = checkEnforcement('miser', 'orch', bashToolResultBody('tail -n 50 ~/.miser/miser.log'), {}, 0, deps, {});
+  assert.equal(result?.headers['x-miser-enforcement'], 'zero-llm-redirect');
 });

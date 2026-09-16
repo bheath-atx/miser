@@ -76,6 +76,7 @@ const DEFAULT_POLICY = Object.freeze({
     terminalHandoffAllowed: true,
     terminalHandoffMaxTurns: 2,
     inboundBradReplyMaxTurns: 1,
+    boundedReadMaxAssistantTurns: 2,
   }),
   session: Object.freeze({
     maxAssistantTurnsObserve: 100,
@@ -557,7 +558,12 @@ function extractOpenAIToolCommand(toolCall) {
   // Scan all raw text if any supplied field is unusable (or all are absent).
   // Keep decoded commands and paths too: JSON escapes can hide their syntax
   // from a raw scan, and paths still need the structural file-safety checks.
-  return { ...tool, rawArguments: rawToolArgumentsText(args) };
+  return { ...tool, rawArguments: rawToolArgumentsText(args), argumentsUnvalidated: true };
+}
+
+const EXEC_CAPABLE_TOOL_NAME = /bash|shell|exec|terminal|command|run[-_]?cmd/i;
+function looksExecCapableToolName(name) {
+  return EXEC_CAPABLE_TOOL_NAME.test(String(name || ''));
 }
 
 function toolCommandForShape(shape) {
@@ -865,6 +871,137 @@ const DISPATCH_OK_PATTERNS = [
   /^\s*date(?:\s+[^\n;&|]+)?\s*$/i,
 ];
 
+// R12: DISPATCH_OK is decided from command TEXT, so `echo "run spawn-lane.sh"`
+// classifies as DISPATCH_OK too. That is harmless for a class that is simply
+// never redirected, but it must NOT be able to arm the post-dispatch
+// confirmation allowance -- otherwise echoing a script name would buy a poll.
+// Arming therefore requires a segment whose resolved HEAD really is a dispatch
+// script, not a mention of one anywhere in the text.
+const DISPATCH_ACTION_HEADS = new Set([
+  'spawn-lane.sh', 'td-inject.sh', 'safe-reap.sh', 'spawn-codex-audit.sh', 'spawn-grok-audit.sh',
+]);
+// R13 BLOCKER 3a (CODEX-IQA-R12 enforcement.js:883): finding a dispatch head
+// in ANY parsed segment ignores shell short-circuit semantics, so
+// `false && ~/bin/spawn-lane.sh ...` and `true || ~/bin/spawn-lane.sh ...`
+// armed the post-dispatch allowance for a dispatch that never ran. Arming is a
+// permission grant, so it must reflect what actually EXECUTES. We only ever
+// claim a segment is unreachable when that is statically PROVABLE -- its
+// controlling predecessor is a literal `true`/`:`/`false` -- because treating
+// every unknown predecessor as unreachable would refuse to arm the ordinary,
+// legitimate `mkdir -p x && ~/bin/spawn-lane.sh ...`, reintroducing exactly the
+// false-positive class this sprint exists to remove.
+const SHELL_ALWAYS_TRUE_HEADS = new Set(['true', ':']);
+const SHELL_ALWAYS_FALSE_HEADS = new Set(['false']);
+function segmentStaticExit(segmentText) {
+  const stages = pipeStages(segmentText);
+  // In a pipeline the LAST stage supplies the exit status.
+  const { head, args } = parseCommandSegment(stages[stages.length - 1]);
+  if (args.length) return 'unknown'; // `true --help` etc: do not over-claim
+  if (SHELL_ALWAYS_TRUE_HEADS.has(head)) return 'success';
+  if (SHELL_ALWAYS_FALSE_HEADS.has(head)) return 'failure';
+  return 'unknown';
+}
+// Returns one entry per top-level segment: { text, runs } where `runs` is false
+// ONLY when non-execution is provable. `;`/newline/`&` segments are
+// independent; `&&` is skipped after a provable failure; `||` after a provable
+// success.
+function reachableTopLevelSegments(command) {
+  const parts = commandTopLevelSegmentsWithOps(command);
+  const out = [];
+  // Status of the AND-OR list accumulated so far. A skipped branch does not
+  // change it, which is what makes `false && A || B` run B and
+  // `true || A && B` run B -- both real shell behaviours a per-segment-only
+  // model gets wrong.
+  let listExit = 'unknown';
+  for (let i = 0; i < parts.length; i++) {
+    const { text, op } = parts[i];
+    let runs;
+    if (i === 0) runs = true;
+    else if (op === '&&') runs = listExit !== 'failure';
+    else if (op === '||') runs = listExit !== 'success';
+    else runs = true; // ';' newline '&' start a new, unconditional list
+    out.push({ text, runs });
+    if (op === ';' || op === '\n' || op === '&' || i === 0) listExit = runs ? segmentStaticExit(text) : 'unknown';
+    else if (runs) listExit = segmentStaticExit(text);
+  }
+  return out;
+}
+function commandRunsDispatchAction(commandText) {
+  const raw = String(commandText || '');
+  if (!raw.trim()) return false;
+  return reachableTopLevelSegments(raw)
+    .filter(segment => segment.runs)
+    .some(segment => pipeStages(segment.text)
+      .some(stage => DISPATCH_ACTION_HEADS.has(parseCommandSegment(stage).head)));
+}
+
+// R14 BLOCKER 6 (CODEX-IQA-R13 enforcement.js:941,945,1383): R13 answered the
+// laundering question one TOP-LEVEL SEGMENT at a time, but a pipeline is a
+// single top-level segment (`|` is deliberately not a boundary in
+// commandPipelineSegments). So `echo "spawn-lane.sh" | curl .../sessions/<id>`
+// put the echoed script name and the real poll in the SAME segment, the
+// whole-segment text match said "this segment is a dispatch", and the poll rode
+// in free -- every turn, forever, with no dispatch ever running. The unit of
+// the question is therefore the pipe STAGE: each stage is its own process, so
+// each one must answer for its own subject.
+//
+// Proof that a stage performs a dispatch is POSITIVE and anchored on the
+// stage's HEAD -- the program that actually executes -- never on text a stage
+// merely prints:
+//   (a) the head is a dispatch script. The inherited script patterns are
+//       re-applied to the HEAD TOKEN alone, so `~/bin/td-inject.sh` and bare
+//       `td-inject` both still qualify (R13 behaviour preserved) while
+//       `echo td-inject.sh` cannot, and
+//   (b) the head is the client that performs a non-script dispatch pattern:
+//       curl/wget for the pkachu reply POST, git for `git fetch`, date.
+// Anything else -- echo, printf, grep, xargs, jq -- proves nothing, whatever it
+// contains. This is deliberately NOT a denylist of text-emitting commands: an
+// unrecognized head fails closed (not a dispatch), which costs at most one
+// redirect, where failing open costs an unbounded poll.
+const DISPATCH_SCRIPT_HEAD_PATTERNS = [
+  /^spawn-lane\.sh$/,
+  /^safe-reap\.sh$/,
+  /^td-inject(?:\.sh)?$/,
+];
+const DISPATCH_CLIENT_ACTIONS = [
+  { heads: new Set(['curl', 'wget']), pattern: /\bpost\b.*:(?:8001)\/v1\/orch\/[^/\s]+\/reply\b/i },
+  { heads: new Set(['curl', 'wget']), pattern: /\bcurl\b.*(?:-x\s+)?post\b.*\/v1\/orch\/[^/\s]+\/reply\b/i },
+  { heads: new Set(['git']), pattern: /^\s*git\s+fetch(?:\s+--[^\s]+|\s+\S+){0,2}\s*$/i },
+  { heads: new Set(['date']), pattern: /^\s*date(?:\s+[^\n;&|]+)?\s*$/i },
+];
+function stageIsDispatchAction(stageText) {
+  const head = parseCommandSegment(stageText).head;
+  if (!head) return false;
+  if (DISPATCH_ACTION_HEADS.has(head)) return true;
+  if (DISPATCH_SCRIPT_HEAD_PATTERNS.some(pattern => pattern.test(head))) return true;
+  const text = normalizedText(stageText);
+  return DISPATCH_CLIENT_ACTIONS.some(({ heads, pattern }) => heads.has(head) && pattern.test(text));
+}
+function stageCarriesPollSubject(stageText) {
+  return Object.keys(REDIRECT_CLASS_SUBJECT_TESTS)
+    .some(cls => REDIRECT_CLASS_SUBJECT_TESTS[cls](stageText));
+}
+// True when some REACHABLE stage carries a protected poll subject and is not
+// itself a dispatch action -- i.e. the DISPATCH_OK text match would be
+// laundering an unrelated poll. See BLOCKER 3d (segments) and BLOCKER 6 (pipe
+// stages).
+function dispatchOkLaundersPoll(commandText) {
+  for (const segment of reachableTopLevelSegments(commandText)) {
+    if (!segment.runs) continue;
+    const stages = pipeStages(segment.text);
+    for (const stage of stages) {
+      if (stageCarriesPollSubject(stage) && !stageIsDispatchAction(stage)) return true;
+    }
+    // A subject whose text straddles a pipe boundary belongs to no single
+    // stage, so the loop above cannot see it. Splitting must never LOSE
+    // detection the segment-level R13 check had: if the segment as a whole
+    // carries a subject and no stage in it performs a dispatch, that is
+    // laundering too.
+    if (stageCarriesPollSubject(segment.text) && !stages.some(stageIsDispatchAction)) return true;
+  }
+  return false;
+}
+
 const POLL_CI_PATTERNS = [
   /\bgh\s+run\s+(?:view|watch|list)\b/i,
   /\bgh\s+pr\s+checks\b/i,
@@ -881,8 +1018,346 @@ const POLL_TERMDECK_PATTERNS = [
 const POLL_MISER_PATTERNS = [
   /\bcurl\b.*:20128\/(?:health|stats|events)\b/i,
   /\/api\/miser\b/i,
-  /\bmiser\b.*\b(?:logs?|tail)\b/i,
 ];
+
+// A real Miser log reference is a path SEGMENT (.miser/ dir, or a
+// miser*.log/.jsonl basename) -- not the substring "miser" occurring
+// anywhere in an unrelated path -- and it must be a FILE argument of an
+// actual log-reading command, not a grep/rg SEARCH PATTERN.
+const MISER_LOG_PATH_SEGMENT = /(?:^|\/)\.miser\//i;
+const MISER_LOG_BASENAME = /^miser(?:[-_.][\w-]*)?\.(?:log|jsonl|json|txt)\b/i;
+const LOG_READ_HEADS = new Set(['tail', 'cat', 'less', 'head', 'grep', 'rg', 'nl', 'sed']);
+const PATTERN_ARG_HEADS = new Set(['grep', 'rg']);
+// grep/rg's PATTERN can be supplied via a repeatable `-e`/`--regexp` flag
+// instead of the bare positional argument. CODEX-IQA-R2 B2: naively assuming
+// "the first bare argument is always the pattern" produced BOTH directions of
+// error -- a second `-e PATTERN` value was left uncounted and misread as a
+// file (`grep -e a -e '/.miser/' STATUS.md`), and a `--regexp=` glued form
+// already supplied the pattern, so dropping "the first bare argument" instead
+// discarded a REAL file argument (`grep --regexp=x ~/.miser/miser.log f`).
+const PATTERN_VALUE_FLAGS = new Set(['-e', '--regexp']);
+
+function segmentArgTokens(segment) {
+  const input = String(segment || '').trim();
+  const tokens = [];
+  let cur = '';
+  let quote = '';
+  let any = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote === "'") {
+      if (ch === "'") quote = '';
+      else cur += ch;
+      any = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < input.length) {
+      const next = input[i + 1];
+      if (!quote || '"\\$`\n'.includes(next)) {
+        if (next !== '\n') cur += next;
+        any = true;
+        i++;
+        continue;
+      }
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = '';
+      else cur += ch;
+      any = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; any = true; continue; }
+    if (/\s/.test(ch)) { if (any) { tokens.push(cur); cur = ''; any = false; } continue; }
+    cur += ch; any = true;
+  }
+  if (any) tokens.push(cur);
+  return tokens;
+}
+
+// Flags that consume a SEPARATE following argument for a given wrapper (not
+// bundled/`=`-joined). Needed so a wrapper's OWN option value (e.g. `sudo -u
+// brad`) is never mistaken for the next wrapper or the real command's head.
+// CODEX-IQA-R2 B1: `sudo -u x nice tail -f ...` resolved to head `x` (the
+// username) because the old skip loop only knew how to skip flag TOKENS
+// themselves, never a flag's separate value token.
+const WRAPPER_VALUE_FLAGS = {
+  sudo: new Set(['-u', '--user', '-g', '--group', '-p', '--prompt', '-r', '--role', '-t', '--type', '-h', '--host', '-C', '--close-from']),
+  nice: new Set(['-n', '--adjustment']),
+  timeout: new Set(['-k', '--kill-after', '-s', '--signal']),
+  env: new Set(['-u', '--unset', '-C', '--chdir', '-S', '--split-string']),   // <- NEW
+};
+// timeout's own leading positional argument is the duration, not a flag, and
+// must be skipped like one (`timeout 5 tail -f ...`).
+const BARE_DURATION = /^\s*[+]?(?:0[xX](?:[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)(?:[pP][-+]?\d+)?|(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|inf(?:inity)?|nan)[smhd]?$/i;
+// timeout accepts a negative zero as a disabled timer. Other negative durations
+// are rejected by coreutils; do not treat them as wrapper durations.
+function isTimeoutDuration(value) {
+  if (BARE_DURATION.test(value)) return true;
+  const text = String(value || '').replace(/^\s+/, '');
+  if (!text.startsWith('-')) return false;
+  const unsigned = text.slice(1);
+  if (!BARE_DURATION.test(unsigned)) return false;
+  const numeric = unsigned.replace(/[smhd]$/i, '');
+  const hex = /^0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?(?:[pP]([-+]?\d+))?$/.exec(numeric);
+  if (hex) {
+    const digits = (hex[1] + (hex[2] || '')).replace(/^0+/, '');
+    if (!digits) return true;
+    const first = parseInt(digits[0], 16);
+    const highestBit = (digits.length - 1) * 4 + Math.floor(Math.log2(first));
+    const exponent = Number(hex[3] || 0) - 4 * (hex[2] || '').length;
+    const highestPower = highestBit + exponent;
+    if (highestPower < -1075) return true;
+    if (highestPower > -1075) return false;
+    // Exactly halfway to the smallest subnormal rounds to signed zero.
+    return /^[1248]0*$/.test(digits);
+  }
+  const decimal = /^(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.exec(numeric);
+  return !!decimal && Number(numeric) === 0;
+}
+
+// Resolves the real head through COMMAND_WRAPPER_HEADS -- including chained
+// wrappers (`sudo -u x nice tail -f ...`) and each wrapper's own
+// value-consuming flags or (for timeout) leading positional duration -- and
+// returns the remaining args as plain, unquoted tokens.
+function envDashSEscapedLiteral(ch) {
+  switch (ch) {
+    case 'f': return '\f';
+    case 'n': return '\n';
+    case 'r': return '\r';
+    case 't': return '\t';
+    case 'v': return '\v';
+    case '#': return '#';
+    case '$': return '$';
+    case '"': return '"';
+    case "'": return "'";
+    case '\\': return '\\';
+    default: return null;
+  }
+}
+function splitEnvDashSValue(value) {
+  const input = String(value || '');
+  const n = input.length;
+  const tokens = [];
+  let cur = '';
+  let any = false;
+  let quote = '';
+  let i = 0;
+  while (i < n) {
+    const ch = input[i];
+    if (quote === "'") {
+      if (ch === '\\' && (input[i + 1] === "'" || input[i + 1] === '\\')) { cur += input[i + 1]; i += 2; any = true; continue; }
+      if (ch === "'") { quote = ''; i++; continue; }
+      cur += ch; any = true; i++; continue;
+    }
+    if (quote === '"') {
+      if (ch === '\\' && i + 1 < n) {
+        const next = input[i + 1];
+        if (next === '_') { cur += ' '; i += 2; any = true; continue; } // \_ inside "" -> literal space
+        const literal = envDashSEscapedLiteral(next);
+        if (literal !== null) { cur += literal; i += 2; any = true; continue; }
+        cur += ch; i++; any = true; continue; // unrecognized escape: leave the backslash itself literal
+      }
+      if (ch === '"') { quote = ''; i++; continue; }
+      cur += ch; any = true; i++; continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; any = true; i++; continue; }
+    if (ch === '\\' && i + 1 < n) {
+      const next = input[i + 1];
+      if (next === '_') { if (any) { tokens.push(cur); cur = ''; any = false; } i += 2; continue; } // \_ outside quotes -> separator
+      const literal = envDashSEscapedLiteral(next);
+      if (literal !== null) { cur += literal; i += 2; any = true; continue; }
+      cur += next; i += 2; any = true; continue; // unrecognized escape (e.g. \c, not implemented): literal next char
+    }
+    if (/\s/.test(ch)) { if (any) { tokens.push(cur); cur = ''; any = false; } i++; continue; }
+    cur += ch; any = true; i++;
+  }
+  if (any) tokens.push(cur);
+  return tokens;
+}
+
+function parseCommandSegment(segment) {
+  const tokens = segmentArgTokens(segment);
+  let i = 0;
+  while (i < tokens.length) {
+    const tok = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) { i++; continue; }
+    const base = path.basename(tok).toLowerCase();
+    if (COMMAND_WRAPPER_HEADS.has(base)) {
+      i++;
+      const valueFlags = WRAPPER_VALUE_FLAGS[base];
+      while (i < tokens.length && tokens[i].startsWith('-')) {
+        const flag = tokens[i];
+        if (base === 'env' && (flag === '-S' || flag === '--split-string')) {
+          i++;
+          if (i < tokens.length) tokens.splice(i, 1, ...splitEnvDashSValue(tokens[i]));
+          continue;
+        }
+        if (base === 'env' && flag.startsWith('--split-string=')) {
+          tokens.splice(i, 1, ...splitEnvDashSValue(flag.slice('--split-string='.length)));
+          continue;
+        }
+        // NEW: glued short form (env -S'value', no space at all).
+        if (base === 'env' && flag.length > 2 && flag.startsWith('-S') && !flag.startsWith('--')) {
+          tokens.splice(i, 1, ...splitEnvDashSValue(flag.slice(2)));
+          continue;
+        }
+        i++;
+        if (valueFlags && valueFlags.has(flag) && !flag.includes('=') && i < tokens.length) i++;
+      }
+      if (base === 'timeout' && i < tokens.length && isTimeoutDuration(tokens[i])) i++;
+      continue;
+    }
+    return { head: base, args: tokens.slice(i + 1) };
+  }
+  return { head: '', args: [] };
+}
+
+function commandHeadName(segment) {
+  return parseCommandSegment(segment).head;
+}
+
+// Splits on unquoted ; \n && || (top-level compound commands) AND a bare `&`
+// (background job) so a Miser reference in one segment can't be credited to
+// an unrelated command in another. CODEX-IQA-R2 B1: the round-2 splitter
+// omitted `||` entirely (only `;`, `\n`, `&&` were recognized).
+function closesQuoteHere(input, i, quote) {
+  if (quote === '"') return !isEscapedAt(input, i);
+  return true;
+}
+
+function commandPipelineSegments(command) {
+  const input = String(command || '');
+  const segments = [];
+  let current = '';
+  let quote = '';
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      current += ch;
+      if (ch === quote && closesQuoteHere(input, i, quote)) quote = '';
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; current += ch; continue; }
+    if (ch === ';' || ch === '\n' || ch === '&' || (ch === '|' && input[i + 1] === '|')) {
+      if ((ch === '&' && input[i + 1] === '&') || (ch === '|' && input[i + 1] === '|')) i++;
+      segments.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  segments.push(current);
+  return segments;
+}
+
+// Splits ONE top-level segment into its `|`-joined pipe STAGES so a Miser log
+// read appearing anywhere in a pipe chain is recognized (`printf ready | tail
+// -f ~/.miser/miser.log` still reads the Miser log; CODEX-IQA-R2 B1 -- round
+// 2's isMiserPoll only ever inspected the chain's FIRST head). Quote-aware so
+// a literal `|` inside a quoted argument is never mistaken for a pipe.
+function pipeStages(segment) {
+  const input = String(segment || '');
+  const stages = [];
+  let current = '';
+  let quote = '';
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      current += ch;
+      if (ch === quote && closesQuoteHere(input, i, quote)) quote = '';
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; current += ch; continue; }
+    if (ch === '|' && input[i + 1] !== '|') { stages.push(current); current = ''; continue; }
+    current += ch;
+  }
+  stages.push(current);
+  return stages;
+}
+
+// Excludes grep/rg's PATTERN argument(s) from the candidate file list --
+// EVERY pattern-supplying flag form, not just the common bare-positional
+// case (CODEX-IQA-R2 B2).
+// Once a bundle hits a short flag that is itself known to consume a value,
+// EVERYTHING after it is that flag's own glued value, not further flag
+// characters -- an `e` occurring past that point can never be the pattern
+// flag. Scan left-to-right and stop at the first such flag.
+const RG_VALUE_SHORT_FLAGS = new Set(['A', 'B', 'C', 'M', 'm', 'r', 'f', 'g', 't', 'T', 'j', 'E']);
+const GREP_VALUE_SHORT_FLAGS = new Set(['A', 'B', 'C', 'f', 'm', 'd', 'D']);
+function valueShortFlagsFor(head) {
+  return head === 'rg' ? RG_VALUE_SHORT_FLAGS : GREP_VALUE_SHORT_FLAGS;
+}
+
+const PATTERN_FILE_VALUE_FLAGS = new Set(['-f', '--file']);
+
+function shortClusterPatternFlag(arg, head) {
+  if (!arg.startsWith('-') || arg.startsWith('--')) return null;
+  const body = arg.slice(1);
+  if (!body.length) return null;
+  const valueFlags = valueShortFlagsFor(head);
+  for (let idx = 0; idx < body.length; idx++) {
+    const ch = body[idx];
+    if (ch === 'e') return { kind: 'pattern', needsNextToken: body.slice(idx + 1).length === 0 };
+    if (ch === 'f') return { kind: 'file', needsNextToken: body.slice(idx + 1).length === 0, glued: body.slice(idx + 1) };
+    if (valueFlags.has(ch)) return null;
+  }
+  return null;
+}
+
+function stripPatternArgs(args, head) {
+  const out = [];
+  let sawPatternFlag = false;
+  let optionsEnded = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!optionsEnded && arg === '--') { optionsEnded = true; continue; }
+    if (!optionsEnded && arg.startsWith('-')) {
+      const eq = arg.indexOf('=');
+      const flagName = eq === -1 ? arg : arg.slice(0, eq);
+      if (PATTERN_VALUE_FLAGS.has(flagName)) {
+        sawPatternFlag = true;
+        if (eq === -1 && i + 1 < args.length) i++;
+        continue;
+      }
+      if (PATTERN_FILE_VALUE_FLAGS.has(flagName)) {
+        sawPatternFlag = true;
+        if (eq !== -1) out.push(flagName === '-f' && head === 'grep' ? arg.slice(2) : arg.slice(eq + 1));
+        else if (i + 1 < args.length) { out.push(args[i + 1]); i++; }
+        continue;
+      }
+      const cluster = shortClusterPatternFlag(arg, head);
+      if (cluster) {
+        sawPatternFlag = true;
+        if (cluster.kind === 'file') {
+          if (cluster.needsNextToken) { if (i + 1 < args.length) { out.push(args[i + 1]); i++; } }
+          else out.push(cluster.glued);
+        } else if (cluster.needsNextToken && i + 1 < args.length) i++;
+      }
+      continue;
+    }
+    out.push(arg);
+  }
+  return sawPatternFlag ? out : out.slice(1);
+}
+
+function fileArgsFor(head, args) {
+  if (PATTERN_ARG_HEADS.has(head)) return stripPatternArgs(args, head);
+  return args.filter(a => !a.startsWith('-'));
+}
+
+function isMiserPoll(command) {
+  return commandPipelineSegments(command).some(segment => {
+    if (/\b(?:curl|wget|http)\b/i.test(segment)
+        && /:20128\/(?:health|stats|events)\b|\/api\/miser\b/i.test(segment)) return true;
+    if (/\bjournalctl\b/.test(segment) && /(?:-u|--unit(?:=|\s+))\s*miser\b/i.test(segment)) return true;
+    return pipeStages(segment).some(stage => {
+      const { head, args } = parseCommandSegment(stage);
+      if (!LOG_READ_HEADS.has(head)) return false;
+      const fileArgs = fileArgsFor(head, args);
+      return fileArgs.some(a => MISER_LOG_PATH_SEGMENT.test(a) || MISER_LOG_BASENAME.test(a));
+    });
+  });
+}
 
 const POLL_HEALTH_PATTERNS = [
   /\bsystemctl\s+(?:--user\s+)?status\b/i,
@@ -936,14 +1411,32 @@ function classifyCommandClass(body, project, panel, role) {
   const shape = terminalMessageShape(body);
   const tool = toolCommandForShape(shape);
   const name = tool.name.toLowerCase();
-  const command = normalizedText(tool.command || tool.rawArguments || promptCommandCandidate(shape));
+  // isMiserPoll needs the RAW text (embedded newlines intact) to correctly
+  // split a multi-line command into separate logical commands -- by the time
+  // `command` below is built, normalizedText has already collapsed every
+  // newline to a space, silently fusing e.g. `printf ready\ntail -f
+  // ~/.miser/miser.log` into one blob whose head is `printf`, hiding the
+  // real second command from classification entirely.
+  const rawCommandText = String(tool.command || tool.rawArguments || promptCommandCandidate(shape) || '');
+  const command = normalizedText(rawCommandText);
   const filePath = tool.filePath;
 
-  if (command && commandMatches(command, DISPATCH_OK_PATTERNS)) return { commandClass: 'DISPATCH_OK', terminalShape: shape.kind };
+  // R13 BLOCKER 3d (CODEX-IQA-R12 enforcement.js:864,1310): DISPATCH_OK is a
+  // TEXT match and it wins ahead of every poll class, so
+  // `echo "spawn-lane.sh"; curl .../api/sessions/<id>` was never classified as
+  // polling no matter how many times it repeated. A mention of a script name
+  // must not buy an exemption for an unrelated poll riding in another segment.
+  // A poll subject appearing INSIDE the dispatch command itself (a td-inject
+  // message body that says "replyCount", a POST to the reply endpoint) is still
+  // DISPATCH_OK -- only a poll in a segment that is not itself a dispatch
+  // demotes the call to its real poll class.
+  if (command && commandMatches(command, DISPATCH_OK_PATTERNS) && !dispatchOkLaundersPoll(rawCommandText)) {
+    return { commandClass: 'DISPATCH_OK', terminalShape: shape.kind, dispatchActionRan: commandRunsDispatchAction(rawCommandText) };
+  }
   if (filePath && isDispatchArtifactPath(filePath)) return { commandClass: 'DISPATCH_OK', terminalShape: shape.kind };
   if (command && commandMatches(command, POLL_CI_PATTERNS)) return { commandClass: 'POLL_CI', terminalShape: shape.kind };
   if (command && commandMatches(command, POLL_TERMDECK_PATTERNS)) return { commandClass: 'POLL_TERMDECK', terminalShape: shape.kind };
-  if (command && commandMatches(command, POLL_MISER_PATTERNS)) return { commandClass: 'POLL_MISER', terminalShape: shape.kind };
+  if (command && (commandMatches(command, POLL_MISER_PATTERNS) || isMiserPoll(rawCommandText))) return { commandClass: 'POLL_MISER', terminalShape: shape.kind };
   if (command && commandMatches(command, POLL_HEALTH_PATTERNS)) return { commandClass: 'POLL_HEALTH', terminalShape: shape.kind };
   if (command && commandMatches(command, SWEEP_REPO_PATTERNS)) return { commandClass: 'SWEEP_REPO', terminalShape: shape.kind };
   if (command && commandMatches(command, LOOP_SHELL_PATTERNS)) return { commandClass: 'LOOP_SHELL', terminalShape: shape.kind };
@@ -1026,6 +1519,471 @@ function lineIsNegatedSelfWorkInstruction(line) {
   const lower = String(line || '').toLowerCase();
   return /\b(do not|don't|no|never|must not)\b/.test(lower)
     && /\b(run|use|call|poll|inspect|check|read|write|edit|build|code|implement|fix|audit)\b/.test(lower);
+}
+
+// --- Fix B.2 (v3): bounded single-read exemption for an explicit operator question ---
+
+function textLooksLikeDirectQuestion(text) {
+  const t = normalizedText(text);
+  if (!t || t.length > 400) return false; // a long briefing/boot prompt is not "a quick question"
+  if (/[?]\s*$/.test(t)) return true;
+  return /^(?:what|when|where|why|how|who|which|is|are|can|could|did|does|do|should)\b/i.test(t);
+}
+
+// An explicit "stop watching/monitoring" style instruction should immediately
+// disarm a pending, still-unused bounded-read allowance rather than leaving
+// it armed until the turn-window naturally expires it (CODEX-IQA-R2 B4).
+function textLooksLikeStopInstruction(text) {
+  const lower = normalizedText(text).toLowerCase();
+  if (!lower) return false;
+  return /\b(?:stop|halt|cancel|never\s*mind)\b[\s\S]*\b(?:monitor(?:ing)?|poll(?:ing)?|watch(?:ing)?|check(?:ing)?|track(?:ing)?)\b/.test(lower);
+}
+
+// A question only earns an exemption for the class it is actually ABOUT.
+// "Are you still there?" must never arm a POLL_MISER read, no matter how
+// recently it was asked -- direct fix for CODEX-IQA-R2/R1 B4. Bare "logs"/
+// "stats" were dropped from the POLL_MISER hint entirely (CODEX-IQA-R2 B4):
+// they matched ANY log/stats question regardless of subject, so an unrelated
+// "What do nginx logs show?" re-triggered a Miser-read exemption armed by an
+// earlier, genuinely-Miser question. LOOP_SHELL is deliberately absent: a
+// loop construct is never a single bounded read regardless of what the
+// question asked.
+const REDIRECT_CLASS_TOPIC_HINTS = {
+  POLL_MISER: /\bmiser\b|\.miser\b|:20128\b/i,
+  POLL_CI: /\bci\b|\bcheck(?:s)?\b|\bpipeline\b|\bpr\b|\brun(?:s)?\b/i,
+  POLL_TERMDECK: /\btermdeck\b|\bsession(?:s)?\b|\bpanel(?:s)?\b|\breplycount\b/i,
+  POLL_HEALTH: /\bhealth\b|\bstatus\b|\bservice(?:s)?\b|\bsystemctl\b/i,
+  SWEEP_REPO: /\brepo(?:s)?\b|\bpr(?:s)?\b|\bsweep\b/i,
+};
+
+const MISER_COMPOUND_IDENTIFIER = /\bmiser-[\w-]+\b|\b[\w-]+-miser\b/gi;
+function isLogShapedMiserCompound(match, rest) {
+  if (/^\.(?:log|jsonl|json|txt)\b/i.test(rest)) return true; // ...-log.log, ...-log.jsonl, etc.
+  return /-log$/i.test(match); // a bare, extensionless "...-log" basename (e.g. miser-access-log)
+}
+function stripMiserCompoundIdentifiers(text) {
+  const input = String(text || '');
+  return input.replace(MISER_COMPOUND_IDENTIFIER, (match, offset, full) => {
+    const rest = full.slice(offset + match.length);
+    return isLogShapedMiserCompound(match, rest) ? match : ' ';
+  });
+}
+
+function questionMentionsTopic(questionText, commandClass) {
+  const hint = REDIRECT_CLASS_TOPIC_HINTS[commandClass];
+  return !!hint && hint.test(stripMiserCompoundIdentifiers(questionText));
+}
+
+function questionLooksTopical(questionText) {
+  const stripped = stripMiserCompoundIdentifiers(questionText);
+  return Object.values(REDIRECT_CLASS_TOPIC_HINTS).some(hint => hint.test(stripped));
+}
+
+// Rejects the exact shapes CODEX-IQA-R1/R2 B3 confirmed slip through a
+// window/allowance check that only looked at "did a question happen
+// recently": a following tail/journalctl (including a combined short-flag
+// cluster like `-fn50`, not just a standalone `-f`), a watch loop, a
+// while/until/for loop of any shape (not just one that happens to also
+// contain the literal word "sleep"), and an xargs pipeline (repeats its
+// command once per input line by construction). A single pipe chain
+// (`curl ... | jq .`) is NOT rejected -- that is one logical read, matching
+// Fix B.1's commandPipelineSegments' own pipe-is-not-a-boundary rule.
+
+
+// Splits on ; \n && || AND a bare `&` (background job -- CODEX-IQA-R2 B3: two
+// reads joined by `&` previously stayed in one segment and looked "single").
+// Same NOT-split-on-`|` rationale as commandPipelineSegments.
+// R13: the existing splitter DISCARDS which operator joined two segments, so
+// short-circuit semantics are invisible to every caller. This is the same scan,
+// quote-for-quote, but it records the operator that PRECEDED each segment.
+// `commandTopLevelSegments` is left byte-identical so no existing caller moves.
+function commandTopLevelSegmentsWithOps(command) {
+  const input = String(command || '');
+  const parts = [];
+  let current = '';
+  let pendingOp = null;
+  let quote = '';
+  const push = () => { if (current.trim()) parts.push({ text: current, op: pendingOp }); };
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      current += ch;
+      if (ch === quote && closesQuoteHere(input, i, quote)) quote = '';
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; current += ch; continue; }
+    if (ch === ';' || ch === '\n' || ch === '&' || (ch === '|' && input[i + 1] === '|')) {
+      let op = ch;
+      if (ch === '&' && input[i + 1] === '&') { op = '&&'; i++; }
+      else if (ch === '|' && input[i + 1] === '|') { op = '||'; i++; }
+      push();
+      if (current.trim()) pendingOp = op;
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  push();
+  return parts;
+}
+
+function commandTopLevelSegments(command) {
+  const input = String(command || '');
+  const segments = [];
+  let current = '';
+  let quote = '';
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      current += ch;
+      if (ch === quote && closesQuoteHere(input, i, quote)) quote = '';
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; current += ch; continue; }
+    if (ch === ';' || ch === '\n' || ch === '&' || (ch === '|' && input[i + 1] === '|')) {
+      if ((ch === '&' && input[i + 1] === '&') || (ch === '|' && input[i + 1] === '|')) i++;
+      segments.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  segments.push(current);
+  return segments.filter(s => s.trim());
+}
+
+// Follow flags are command arguments, not bytes in reconstructed shell text.
+// Keep each pipe stage and its -- marker separate; quoted filename separators
+// remain data and cannot manufacture a flag after a lossy join.
+function tailShortClusterHasUpperFollow(arg) {
+  if (!/^-[a-zA-Z0-9]+$/.test(arg)) return false;
+  for (const ch of arg.slice(1)) {
+    if (ch === 'F') return true;
+    // GNU tail's -n/-c/-s consume the remainder as their own value.
+    if (ch === 'n' || ch === 'c' || ch === 's') return false;
+  }
+  return false;
+}
+
+// GNU coreutils accepts unique long-option abbreviations. The installed tail
+// option table has only one --f* option, but --s is ambiguous (silent/sleep).
+const TAIL_LONG_OPTIONS = [
+  '--bytes', '--follow', '--lines', '--max-unchanged-stats', '--pid',
+  '--quiet', '--retry', '--silent', '--sleep-interval', '--verbose',
+  '--zero-terminated', '--help', '--version',
+];
+const TAIL_LONG_VALUE_OPTIONS = new Set([
+  '--bytes', '--lines', '--max-unchanged-stats', '--pid', '--sleep-interval',
+]);
+function resolveTailLongOption(arg) {
+  const eq = arg.indexOf('=');
+  const name = eq === -1 ? arg : arg.slice(0, eq);
+  if (name.length < 3) return null;
+  const matches = TAIL_LONG_OPTIONS.filter(option => option.startsWith(name));
+  if (matches.length !== 1) return null;
+  return { name: matches[0], hasValue: eq !== -1, value: eq === -1 ? '' : arg.slice(eq + 1) };
+}
+function isTailFollowValue(value) {
+  return !!value && ('name'.startsWith(value) || 'descriptor'.startsWith(value));
+}
+function isTraditionalTailFollow(args, index) {
+  if (index !== 0 || args.length > 2) return false;
+  // Traditional +[NUM][bcl]f is one option, with at most one file operand.
+  // The leading + is an operand after --, handled by the caller's boundary.
+  return /^\+\d*[bcl]?f$/.test(args[index]);
+}
+// CODEX-IQA-R10 B3-L: a value-taking option's argument decides whether tail
+// ever reaches its follow loop. GNU tail 9.4 exits 1 on a value it rejects
+// (`--lines ~/.miser/miser.log` -> "invalid number of lines"), and exits 1 when
+// the option is missing its argument entirely. A value carrying unexpanded
+// shell syntax is NOT judged here -- we cannot see what it becomes at runtime,
+// so it is treated as possibly valid rather than used to excuse a follow.
+const TAIL_NUMERIC_VALUE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[a-zA-Z]{0,3}$/;
+function tailValueStopsCommand(value) {
+  if (value == null) return true; // option is missing its required argument
+  if (/[$`]/.test(value)) return false; // unexpanded: unknowable, not a negation
+  return !TAIL_NUMERIC_VALUE.test(value);
+}
+// A short cluster whose last character is a value-taking letter with nothing
+// glued after it takes the NEXT argument as its value (-n, -c, -s, and also
+// combined forms such as -fn).
+function tailShortClusterTakesNextValue(arg) {
+  return /^-[a-zA-Z0-9]*[ncs]$/.test(arg);
+}
+function stageHasFollowFlag(stage) {
+  const { head, args } = parseCommandSegment(stage);
+  if (head !== 'tail' && head !== 'journalctl') return false;
+  // CODEX-IQA-R10 B3-L: recognizing a --follow-shaped token is not the verdict.
+  // GNU tail keeps parsing the rest of the argument list, and a later --help,
+  // --version, unrecognized or ambiguous long option, rejected option value, or
+  // missing required argument makes it print/error and exit WITHOUT following
+  // (`tail --f --help FILE` exits 0; audit/vendor-tail-r11.json). So record the
+  // follow and keep scanning: only a follow nothing later negates counts.
+  let sawFollow = false;
+  let valuePending = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (valuePending) {
+      if (tailValueStopsCommand(arg)) return false;
+      valuePending = false;
+      continue;
+    }
+    if (arg === '--') break;
+    if (head === 'tail') {
+      if (arg.startsWith('--')) {
+        const option = resolveTailLongOption(arg);
+        if (!option) return false; // invalid/ambiguous long option: tail exits
+        if (option.name === '--help' || option.name === '--version') return false;
+        if (option.name === '--follow') {
+          // A rejected --follow=VALUE is an exit, not a quiet non-follow.
+          if (option.hasValue && !isTailFollowValue(option.value)) return false;
+          sawFollow = true;
+          continue;
+        }
+        if (TAIL_LONG_VALUE_OPTIONS.has(option.name)) {
+          if (!option.hasValue) valuePending = true;
+          else if (tailValueStopsCommand(option.value)) return false;
+        } else if (option.hasValue) return false; // this option takes no =value
+        continue;
+      }
+      if (isTraditionalTailFollow(args, i)) { sawFollow = true; continue; }
+      if (/^-[a-zA-Z0-9]*f[a-zA-Z0-9]*$/.test(arg) || tailShortClusterHasUpperFollow(arg)) {
+        sawFollow = true;
+      }
+      if (tailShortClusterTakesNextValue(arg)) valuePending = true;
+      continue;
+    }
+    // journalctl's own -F lists fields; retain only its existing follow forms.
+    if (arg === '--follow' || arg.startsWith('--follow=')) return true;
+    if (/^-[a-zA-Z0-9]*f[a-zA-Z0-9]*$/.test(arg)) return true;
+  }
+  if (valuePending) return false; // option never got its required argument
+  return sawFollow;
+}
+
+const UNBOUNDED_CONTROL_PATTERN = /(?:^|\s)watch\s|\bwhile\b[\s\S]*\bdo\b|\buntil\b[\s\S]*\bdo\b|\bfor\b[\s\S]*\bdo\b|\bxargs\b|\bsleep\s+\d+(?:\.\d+)?\s*&&/i;
+// R12 Hit 2 (live NACHO-ORCH repro 2026-09-14): boundedness is a property of
+// each command, not of how many commands share one Bash call. The round-11
+// form demanded EXACTLY ONE top-level segment, so a genuinely bounded
+// `tail -30 PROPOSAL-v10.md` silently forfeited its exemption the moment it
+// was batched behind `;`/`&&` with an ls/grep/find that were each bounded too
+// -- and the batch was redirected as POLL_MISER. Judge EVERY segment instead:
+// the call is bounded when no segment is unbounded. Single-segment behaviour is
+// unchanged by construction (`[x].every(f)` === `f(x)`), and the whole-text
+// UNBOUNDED_CONTROL_PATTERN check above still rejects a batch containing a
+// watch/while/until/for/xargs construct anywhere in it.
+function isBoundedReadCommand(commandText) {
+  const raw = String(commandText || '');
+  if (!raw.trim()) return false;
+  if (UNBOUNDED_CONTROL_PATTERN.test(raw)) return false;
+  const segments = commandTopLevelSegments(raw);
+  // A non-empty string that yields no segments at all (`;;;`) is not a read.
+  if (!segments.length) return false;
+  return segments.every(segment => !pipeStages(segment).some(stageHasFollowFlag));
+}
+
+// R12: relaxing the "exactly one segment" rule must not turn one Bash call into
+// a cheap way to run the SAME poll several times. Batching unrelated bounded
+// work alongside one bounded read is the false positive we are fixing; batching
+// N reads OF THE REDIRECTED SUBJECT is exactly the repeat-polling the redirect
+// exists to stop, and the inherited PROPOSAL-v4 regressions
+// (`tail -n 50 ~/.miser/miser.log; tail -n 50 ~/.miser/miser.log`, and the same
+// joined by `&`) assert precisely that. So count the segments that carry the
+// subject of the class being exempted and allow at most one.
+const REDIRECT_CLASS_SUBJECT_TESTS = {
+  POLL_MISER: segment => commandMatches(normalizedText(segment), POLL_MISER_PATTERNS) || isMiserPoll(segment),
+  POLL_TERMDECK: segment => commandMatches(normalizedText(segment), POLL_TERMDECK_PATTERNS),
+  POLL_CI: segment => commandMatches(normalizedText(segment), POLL_CI_PATTERNS),
+  POLL_HEALTH: segment => commandMatches(normalizedText(segment), POLL_HEALTH_PATTERNS),
+  SWEEP_REPO: segment => commandMatches(normalizedText(segment), SWEEP_REPO_PATTERNS),
+};
+function hasAtMostOneSubjectSegment(commandText, commandClass) {
+  const isSubject = REDIRECT_CLASS_SUBJECT_TESTS[commandClass];
+  if (!isSubject) return true; // class carries no subject test: nothing extra to enforce
+  let seen = 0;
+  for (const segment of commandTopLevelSegments(String(commandText || ''))) {
+    if (isSubject(segment) && ++seen > 1) return false;
+  }
+  return true;
+}
+
+// R13 BLOCKER 1 (CODEX-IQA-R12 enforcement.js:1314,1636): classification picks
+// the FIRST matching class and the exemption was then evaluated for THAT class
+// alone. `gh run view 1; tail -30 ~/.miser/miser.log` classified POLL_CI, held
+// exactly one CI segment, and the pass excused the whole call -- laundering an
+// unrelated Miser read through a CI authorization. An exemption must be scoped
+// PER CLASS: enumerate every protected class actually present among the
+// segments and require each one to earn its own pass (its own on-topic
+// question, its own unused one-shot, its own single-subject cap). One class's
+// pass can never excuse another class's segment.
+function protectedClassesInCommand(commandText) {
+  const found = new Set();
+  for (const segment of commandTopLevelSegments(String(commandText || ''))) {
+    for (const cls of Object.keys(REDIRECT_CLASS_SUBJECT_TESTS)) {
+      if (REDIRECT_CLASS_SUBJECT_TESTS[cls](segment)) found.add(cls);
+    }
+  }
+  return found;
+}
+// Every class this call must clear: the classified one plus any other protected
+// class riding along in some segment. (The classified class is included even
+// when no segment test recognizes it -- e.g. a whole-text-only match -- so the
+// exemption can never get WEAKER than the round-12 single-class rule.)
+function exemptionClassesFor(classification, commandText) {
+  const classes = protectedClassesInCommand(commandText);
+  if (isRedirectableCommandClass(classification.commandClass)) classes.add(classification.commandClass);
+  return [...classes];
+}
+// Returns the array of classes exempted, or null when the call is not exempt.
+function boundedOperatorReadClasses(classification, st, policy, body) {
+  if (!st || st.lastDirectQuestionAssistantTurns == null) return null;
+  if (classification.terminalShape !== 'tool_result') return null;
+  if (classification.commandClass === 'LOOP_SHELL') return null;
+  const orch = policy.orchControl || {};
+  const windowTurns = orch.boundedReadMaxAssistantTurns ?? DEFAULT_POLICY.orchControl.boundedReadMaxAssistantTurns;
+  const turnsSince = classification.assistantTurns - st.lastDirectQuestionAssistantTurns;
+  if (turnsSince < 1 || turnsSince > windowTurns) return null;
+  const shape = terminalMessageShape(body);
+  const tool = toolCommandForShape(shape);
+  const commandText = String(tool.command || tool.rawArguments || '');
+  if (!isBoundedReadCommand(commandText)) return null;
+  const classes = exemptionClassesFor(classification, commandText);
+  if (!classes.length) return null;
+  for (const cls of classes) {
+    if (cls === 'LOOP_SHELL') return null;
+    if (!questionMentionsTopic(st.lastDirectQuestionText, cls)) return null;
+    if (st.boundedReadClassesUsed && st.boundedReadClassesUsed.has(cls)) return null;
+    if (!hasAtMostOneSubjectSegment(commandText, cls)) return null;
+  }
+  return classes;
+}
+function isBoundedOperatorRead(classification, st, policy, body) {
+  return boundedOperatorReadClasses(classification, st, policy, body) !== null;
+}
+
+// R12 NEW (live NACHO-ORCH repro 2026-09-14): a single `GET /api/sessions/<id>`
+// confirming a spawn that this panel JUST performed was redirected as
+// POLL_TERMDECK. Root cause: POLL_TERMDECK is decided purely from the URL
+// shape, and the only exemption path (isBoundedOperatorRead) is armed
+// EXCLUSIVELY by a direct operator question -- performing a DISPATCH_OK action
+// arms nothing at all. So the classifier has no representation of "one bounded
+// confirmation read after an action", which is the same category as CHARGE.md
+// Pattern B, now on the TermDeck API surface. This allowance is deliberately
+// the narrowest thing that closes it: it is armed only by a DISPATCH_OK action
+// that actually ran, it expires after DISPATCH_CONFIRM_MAX_TURNS assistant
+// turns, it is one-shot per armed action, it covers ONLY POLL_TERMDECK, it
+// requires a bounded read naming a SPECIFIC session id, and it refuses a bulk
+// listing or any non-GET method. A second check, a listing, or a scheduled
+// poll is still redirected exactly as before.
+const DISPATCH_CONFIRM_MAX_TURNS = 2;
+const TERMDECK_SINGLE_SESSION_URL = /\/api\/sessions\/[A-Za-z0-9._:-]+/i;
+const TERMDECK_SESSION_LIST_URL = /\/api\/sessions(?![/A-Za-z0-9._:-])/i;
+// R13 BLOCKER 3b (CODEX-IQA-R12 enforcement.js:1685): the round-12 check only
+// rejected the spaced/equals `-X`/`--request` spellings, so `-XDELETE`,
+// `-XPOST`, `-d`, `--data*`, `-F`, `-T` and `--head` all sailed through and a
+// MUTATING request could collect the read exemption. Instead of blacklisting
+// spellings, prove the opposite: the stage must be a fetch we can see is a
+// plain GET. Anything we cannot parse as such is refused.
+// curl short options that take a value, so a cluster's tail is that value and
+// must not be re-read as more flags.
+// R14 (CODEX-IQA-R13 enforcement.js:1839,1861): `K` was listed here as an
+// ordinary value-taking option, so `curl -K request.conf URL` parsed as a plain
+// GET even though that file can set `request = DELETE`, attach a body, or add
+// further URLs -- defeating both the method check and the cardinality count.
+// The contents of an external config file are not visible to us, so a command
+// that reads one is not PROVABLY a plain GET and is refused. `K` is removed
+// from the value-option list so the cluster scan below can reject it.
+const CURL_SHORT_VALUE_OPTS = 'XdFTHEbcoAeumtwzUY';
+// Long options that change the method or attach a body.
+const CURL_METHOD_LONG = /^--(?:request|data|data-raw|data-binary|data-ascii|data-urlencode|json|form|form-string|form-escape|upload-file|head|next)\b/i;
+// Long options that read request configuration we cannot inspect.
+const CURL_EXTERNAL_CONFIG_LONG = /^--config\b/i;
+const CURL_FORCE_GET_LONG = /^--get\b/i;
+function curlStageIsPlainGet(stage) {
+  const { head, args } = parseCommandSegment(stage);
+  if (head !== 'curl' && head !== 'wget') return false;
+  if (head === 'wget') {
+    // wget defaults to GET; any method/body option disqualifies it.
+    return !args.some(arg => /^--(?:method|post-data|post-file|body-data|body-file)\b/i.test(arg));
+  }
+  let forcesGet = false;
+  let methodChanging = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (CURL_FORCE_GET_LONG.test(arg)) { forcesGet = true; continue; }
+    if (CURL_EXTERNAL_CONFIG_LONG.test(arg)) return false;
+    if (CURL_METHOD_LONG.test(arg)) {
+      // `--data` under an explicit `--get` is still a GET query string.
+      if (/^--(?:data|data-raw|data-binary|data-ascii|data-urlencode|json)\b/i.test(arg)) { methodChanging = methodChanging || !forcesGet; continue; }
+      return false;
+    }
+    if (arg === '--') break;
+    if (arg.startsWith('--') || !arg.startsWith('-') || arg.length < 2) continue;
+    // Short cluster: scan until a value-taking option consumes the remainder.
+    for (let k = 1; k < arg.length; k++) {
+      const ch = arg[k];
+      if (ch === 'X' || ch === 'F' || ch === 'T' || ch === 'I' || ch === 'K') return false;
+      if (ch === 'G') { forcesGet = true; }
+      if (ch === 'd') { methodChanging = true; break; }
+      if (CURL_SHORT_VALUE_OPTS.includes(ch)) break; // rest of cluster is its value
+    }
+  }
+  // `-G -d` is a GET; a bare `-d`/`--data` is a POST.
+  return !(methodChanging && !forcesGet);
+}
+// R13 BLOCKER 3c (CODEX-IQA-R12 enforcement.js:1643,1688): cardinality was
+// counted in SHELL SEGMENTS, but one curl invocation issues one request PER
+// URL. `curl URL/a URL/b URL/c` is a single segment and matched the unanchored
+// single-session regex, so three polls ran under a one-shot allowance. Count
+// actual request TARGETS instead.
+const TERMDECK_SESSION_URL_GLOBAL = /\/api\/sessions\/[A-Za-z0-9._:-]+/gi;
+const CURL_GLOB_CHARS = /[{}\[\]]/;
+function isSingleSessionStatusRead(commandText) {
+  const raw = String(commandText || '');
+  if (!raw.trim()) return false;
+  if (TERMDECK_SESSION_LIST_URL.test(raw)) return false;
+  let targets = 0;
+  for (const segment of commandTopLevelSegments(raw)) {
+    for (const stage of pipeStages(segment)) {
+      const tokens = segmentArgTokens(stage);
+      const urlTokens = tokens.filter(tok => TERMDECK_SINGLE_SESSION_URL.test(tok));
+      if (!urlTokens.length) continue;
+      // Every stage that issues a session request must itself be a plain GET.
+      if (!curlStageIsPlainGet(stage)) return false;
+      for (const tok of urlTokens) {
+        // curl expands `{a,b}` / `[1-3]` into SEVERAL requests from one token.
+        if (CURL_GLOB_CHARS.test(tok)) return false;
+        targets += (tok.match(TERMDECK_SESSION_URL_GLOBAL) || []).length;
+      }
+    }
+  }
+  // Exactly one real HTTP request against exactly one named session.
+  return targets === 1;
+}
+function isBoundedDispatchConfirmation(classification, st, body) {
+  if (!st) return false;
+  if (classification.terminalShape !== 'tool_result') return false;
+  if (classification.commandClass !== 'POLL_TERMDECK') return false;
+  const tool = toolCommandForShape(terminalMessageShape(body));
+  const commandText = String(tool.command || tool.rawArguments || '');
+  // R13: with BLOCKER 3d fixed, `~/bin/spawn-lane.sh ...; curl .../sessions/<id>`
+  // no longer classifies DISPATCH_OK, so the dispatch and its one confirmation
+  // read can now arrive in the SAME call. That is still Pattern B, so accept a
+  // dispatch this very command reachably runs, alongside the existing
+  // <=2-turn window armed by a previous turn.
+  const armedNow = commandRunsDispatchAction(commandText);
+  if (!armedNow) {
+    if (st.lastDispatchActionAssistantTurns == null) return false;
+    const turnsSince = classification.assistantTurns - st.lastDispatchActionAssistantTurns;
+    if (turnsSince < 1 || turnsSince > DISPATCH_CONFIRM_MAX_TURNS) return false;
+    if (st.dispatchConfirmClassesUsed && st.dispatchConfirmClassesUsed.has(classification.commandClass)) return false;
+  }
+  if (!isBoundedReadCommand(commandText)) return false;
+  if (!hasAtMostOneSubjectSegment(commandText, classification.commandClass)) return false;
+  // Every OTHER protected class riding along must clear its own rules too
+  // (BLOCKER 1): this allowance covers POLL_TERMDECK and nothing else.
+  if (exemptionClassesFor(classification, commandText).some(cls => cls !== 'POLL_TERMDECK')) return false;
+  return isSingleSessionStatusRead(commandText);
 }
 
 function textLooksPollingCommandLike(text) {
@@ -1176,7 +2134,10 @@ function classifyRequest(project, panel, body, compactHeaders = {}, rawTokens = 
     conversationFingerprint: conversationFingerprint(body),
     commandClass: command.commandClass,
     terminalShape: command.terminalShape,
+    dispatchActionRan: !!command.dispatchActionRan,
     redirectable: isRedirectableCommandClass(command.commandClass),
+    directOperatorQuestion: command.terminalShape === 'real_user_text' && textLooksLikeDirectQuestion(latestPromptText),
+    stopInstruction: command.terminalShape === 'real_user_text' && textLooksLikeStopInstruction(latestPromptText),
     explicitNonOrchRole: role === 'worker',
     firstUserPromptText: firstUserPromptText(body),
     latestUserText: latestText,
@@ -1260,6 +2221,11 @@ function createEnforcementState(opts = {}) {
         lastTerminalShape: null,
         lastCountedAt: null,
         lastCountedFingerprint: null,
+        lastDirectQuestionAssistantTurns: null,
+        lastDirectQuestionText: '',
+        boundedReadClassesUsed: null,
+        lastDispatchActionAssistantTurns: null,
+        dispatchConfirmClassesUsed: null,
         freshInput: 0,
         weighted: 0,
         blocks: 0,
@@ -1282,6 +2248,11 @@ function createEnforcementState(opts = {}) {
       st.postCapHandoffTurns = 0;
       st.inboundBradReplyTurns = 0;
     }
+    st.lastDirectQuestionAssistantTurns = null;
+    st.lastDirectQuestionText = '';
+    st.boundedReadClassesUsed = null;
+    st.lastDispatchActionAssistantTurns = null;
+    st.dispatchConfirmClassesUsed = null;
     return st;
   }
 
@@ -1305,6 +2276,11 @@ function createEnforcementState(opts = {}) {
     st.dispatchFinalizeUsed = false;
     st.lastCountedAt = null;
     st.lastCountedFingerprint = null;
+    st.lastDirectQuestionAssistantTurns = null;
+    st.lastDirectQuestionText = '';
+    st.boundedReadClassesUsed = null;
+    st.lastDispatchActionAssistantTurns = null;
+    st.dispatchConfirmClassesUsed = null;
     return st;
   }
 
@@ -1352,6 +2328,11 @@ function createEnforcementState(opts = {}) {
     st.controlTurns = 0;
     st.postCapHandoffTurns = 0;
     st.inboundBradReplyTurns = 0;
+    st.lastDirectQuestionAssistantTurns = null;
+    st.lastDirectQuestionText = '';
+    st.boundedReadClassesUsed = null;
+    st.lastDispatchActionAssistantTurns = null;
+    st.dispatchConfirmClassesUsed = null;
     return st;
   }
 
@@ -1381,6 +2362,35 @@ function createEnforcementState(opts = {}) {
     st.lastMessageCount = classification.messageCount;
     st.lastConversationFingerprint = classification.conversationFingerprint || st.lastConversationFingerprint;
     st.lastTerminalShape = classification.terminalShape || st.lastTerminalShape;
+    if (classification.stopInstruction) {
+      // Immediately disarm rather than waiting for the turn-window to expire
+      // a now-unwanted allowance (CODEX-IQA-R2 B4).
+      st.lastDirectQuestionAssistantTurns = null;
+      st.lastDirectQuestionText = '';
+      st.boundedReadClassesUsed = null;
+      st.lastDispatchActionAssistantTurns = null;
+      st.dispatchConfirmClassesUsed = null;
+    } else if (classification.directOperatorQuestion) {
+      // A topic-less follow-up ("Are you still there?") must not clobber a
+      // still-pending allowance armed by an earlier, genuinely on-topic
+      // question -- direct fix for CODEX-IQA-R2 B4 (round 2 treated this as
+      // an accepted over-blocking tradeoff; it is fixed here instead). A
+      // topical question always (re-)arms fresh, and an unarmed session
+      // still records itself so the turn-window bound applies from here.
+      const topical = questionLooksTopical(classification.latestUserPromptText);
+      if (topical || st.lastDirectQuestionAssistantTurns == null) {
+        st.lastDirectQuestionAssistantTurns = classification.assistantTurns;
+        st.lastDirectQuestionText = classification.latestUserPromptText || classification.latestUserText || '';
+        st.boundedReadClassesUsed = new Set();
+      }
+    }
+    // R12 NEW: a DISPATCH_OK action that actually RAN (a tool_result, not a
+    // mention of one in prose) arms exactly one bounded confirmation read.
+    if (classification.commandClass === 'DISPATCH_OK' && classification.terminalShape === 'tool_result'
+        && classification.dispatchActionRan) {
+      st.lastDispatchActionAssistantTurns = classification.assistantTurns;
+      st.dispatchConfirmClassesUsed = new Set();
+    }
     const duplicateCountedTurn = opts.countedManagement && isDuplicateCountedTurn(st, classification, now, opts);
     const countsForPoll = opts.protectedPanel ? opts.countedManagement : classification.isControl;
     const countsForControl = opts.protectedPanel ? opts.countedManagement && classification.isControl : classification.isControl;
@@ -1635,17 +2645,374 @@ function isFreshBootSetupRead(policy, classification, body) {
   return !!(boundedHead && Number(boundedHead[1]) <= 200 && safeBootSetupReadPath(boundedHead[2]));
 }
 
-function hardSafetyCommandReason(command, rawArgumentsFallback = false) {
+// --- Fix A (v3): narrow data-payload blanking, not general quote-stripping ---
+//
+// Only these commands, and only these specific flags, hand their argument to
+// something OTHER than this process's own operand handling -- an HTTP request
+// body, sent to a remote endpoint, never read/executed locally as shell
+// syntax. Every other quoted argument anywhere else (cat's file path,
+// printenv's var name, rg's pattern, bash -c's or eval's script, a heredoc
+// body) is the real operand/code and must stay fully scannable. Not
+// generalizing this list is the entire fix for A1/A2 (CODEX-IQA-R1): if we
+// never strip anything for any other command, there is nothing left for a
+// bypass to exploit.
+const DATA_TRANSPORT_COMMANDS = new Set(['curl', 'wget']);
+// Case-SENSITIVE and a real `--data*` prefix match (CODEX-IQA-R2 A1's curl-
+// flag citation): round 2 enumerated exact long-flag names AND matched
+// case-insensitively, which (a) would silently miss any future curl
+// `--data-xxx` variant and (b) let `-D` (curl's unrelated dump-headers-to-
+// file flag) match `-d` case-insensitively. Neither was a confirmed exploit,
+// but both are fixed here while this line is already being rewritten rather
+// than left as latent risk.
+const DATA_PAYLOAD_FLAG = /^(?:-d|--data(?:-[a-z]+)*|--post-data)(?:=([\s\S]*))?$/;
+
+// A command wrapper never changes WHAT executes, only how -- resolve through
+// it to find the real head (env, sudo, nice, nohup, timeout all commonly
+// precede the real command). Shared with Fix B's parseCommandSegment.
+const COMMAND_WRAPPER_HEADS = new Set(['env', 'nice', 'nohup', 'timeout', 'sudo', 'command', 'exec']);
+
+const MAX_SUBSTITUTION_DEPTH = 24;
+const MAX_SUBSTITUTION_SCAN_LEN = 20000;
+const MAX_COMMAND_SCAN_LEN = 200000; // far past any real command; fail closed (scan unchanged) rather than parse
+
+// Quote-aware AND depth-bounded. Quote-aware: a `)` character sitting inside
+// an unclosed quote never decrements paren depth, so `$(printf ')';
+// git push origin main)` cannot have its substitution closed early by the
+// quoted `)`. Depth-bounded: past MAX_SUBSTITUTION_DEPTH we stop trying to
+// look inside nested `$(...)` and signal overflow instead of recursing
+// further.
+//
+// `parenIndex` is the index of the OPENING `(` character itself (the caller
+// always passes the position right after a `$`). CODEX-IQA-R2 A3: round 2's
+// loop started scanning AT that same `(` and counted it toward `paren`,
+// which meant the loop needed one EXTRA unmatched `)` beyond the substitution's
+// real close before it would ever return -- on a substitution with no nested
+// parens at all, this ran the scan off the end of the string (silently
+// swallowing whatever came after, including a real subsequent command) or,
+// when a stray later `)` happened to exist, over-captured everything up to
+// that point (`$(printf ok)XYZ` yielded inner `'printf ok)XYZ'`). Starting
+// the loop at `parenIndex + 1` and only incrementing `paren` for a REAL
+// nested `(` (never the substitution's own opening one) fixes both shapes.
+function readBalancedParen(text, parenIndex, depth = 0) {
+  if (depth > MAX_SUBSTITUTION_DEPTH) return { inner: '', endIndex: parenIndex, overflow: true };
+  let paren = 0;
+  let quote = '';
+  for (let i = parenIndex + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < text.length) { i++; continue; }
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '\\' && i + 1 < text.length) { i++; continue; }   // <- NEW: unquoted backslash-escape
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '$' && text[i + 1] === '(') {
+      const inner = readBalancedParen(text, i + 1, depth + 1);
+      if (inner.overflow) return inner;
+      i = inner.endIndex;
+      continue;
+    }
+    if (ch === '(') { paren++; continue; }
+    if (ch === ')') {
+      if (paren === 0) return { inner: text.slice(parenIndex + 1, i), endIndex: i };
+      paren--;
+    }
+  }
+  return { inner: text.slice(parenIndex + 1), endIndex: text.length - 1 };
+}
+
+// Pulls ONLY live $(...)/`...` substitution content out of a span (used
+// exclusively on an already-identified curl/wget data-payload argument);
+// everything else in the span (the literal JSON/text payload) is discarded,
+// which is correct here specifically because this function is only ever
+// called on text we have already decided is a removed data payload.
+//
+// CODEX-IQA-R2 A3's primary bug: round 2 recursed into `extractLiveSubstitutions`
+// to look for FURTHER nested substitutions inside a found one, but never
+// actually appended the substitution's own inner text to `out` -- only
+// whatever its recursive call happened to find. A substitution whose body
+// contains no NESTED `$(...)`/backtick of its own (e.g. `$(printf ')';
+// git push origin main)`) therefore vanished entirely, deleting a live
+// `git push` from the scan. Fixed by appending `inner`/the backtick body
+// itself; a flat, non-recursive single pass is sufficient because the
+// eventual hard-safety scan is a plain substring/regex match over the
+// reconstructed text -- it does not care whether a nested substitution's
+// syntax is still visibly nested or not, only whether the executed text is
+// present somewhere in the string at all.
+//
+// Returns `{ overflow: true }` if the span is too long or too deeply nested
+// to safely parse (CODEX-IQA-R2 A4) -- the caller (`blankDataPayloadSpans`)
+// must react to that by leaving the ORIGINAL span text in place, unblanked,
+// rather than discarding it: failing OPEN by deleting an unscanned payload
+// is exactly the bug being fixed, not an acceptable degradation.
+function extractLiveSubstitutions(text) {
+  if (text.length > MAX_SUBSTITUTION_SCAN_LEN) return { overflow: true };
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '\\' && i + 1 < text.length) { i++; continue; }
+    if (ch === '$' && text[i + 1] === '(') {
+      const result = readBalancedParen(text, i + 1);
+      if (result.overflow) return result;
+      out += ' ' + result.inner + ' ';
+      i = result.endIndex;
+      continue;
+    }
+    if (ch === '`') {
+      const end = text.indexOf('`', i + 1);
+      if (end === -1) break;
+      out += ' ' + text.slice(i + 1, end) + ' ';
+      i = end;
+      continue;
+    }
+  }
+  return { overflow: false, text: out };
+}
+
+// Minimal quote-aware tokenizer with ORIGINAL-STRING spans (start/end),
+// because Fix A needs to blank an exact byte range, not just extract
+// resolved token text. Recognizes ; \n && || | as top-level boundaries
+// (each pipeline stage is a distinct process, so the "current head command"
+// resets there too). No recursion, no paren-tracking -- O(n), cannot be the
+// site of an A4-style stack blowout regardless of input shape.
+function isEscapedAt(command, pos) {
+  let backslashes = 0;
+  let j = pos - 1;
+  while (j >= 0 && command[j] === '\\') { backslashes++; j--; }
+  return backslashes % 2 === 1;
+}
+function isRedirectionAmpersand(command, i) {
+  const prev = command[i - 1];
+  if ((prev === '>' || prev === '<') && !isEscapedAt(command, i - 1)) return true;
+  return command[i + 1] === '>';
+}
+function joinLineContinuations(command) {
+  const n = command.length;
+  let out = '';
+  let quote = '';
+  let i = 0;
+  while (i < n) {
+    const ch = command[i];
+    if (quote === "'") {
+      out += ch;
+      if (ch === "'") quote = '';
+      i++;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < n) {
+      if (command[i + 1] !== '\n') out += ch + command[i + 1];
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      if (!quote) quote = ch;
+      else if (quote === ch) quote = '';
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function shellTokenize(command) {
+  const tokens = [];
+  let i = 0;
+  const n = command.length;
+  while (i < n) {
+    if (command[i] === ';' || command[i] === '\n') { tokens.push({ op: true, text: command[i], start: i, end: i + 1 }); i++; continue; }
+    if (command[i] === '&' && !isRedirectionAmpersand(command, i)) {
+      if (command[i + 1] === '&') { tokens.push({ op: true, text: '&&', start: i, end: i + 2 }); i += 2; continue; }
+      tokens.push({ op: true, text: '&', start: i, end: i + 1 }); i++; continue;
+    }
+    if (/\s/.test(command[i])) { i++; continue; }
+    if (command[i] === '|' && command[i + 1] === '|') { tokens.push({ op: true, text: '||', start: i, end: i + 2 }); i += 2; continue; }
+    if (command[i] === '|') { tokens.push({ op: true, text: '|', start: i, end: i + 1 }); i++; continue; }
+    const start = i;
+    let quote = '';
+    while (i < n) {
+      const ch = command[i];
+      if (quote) {
+        if (ch === '\\' && quote === '"' && i + 1 < n) { i += 2; continue; }
+        if (ch === quote) { quote = ''; i++; continue; }
+        i++; continue;
+      }
+      if (ch === '\\' && i + 1 < n) { i += 2; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
+      if (/\s/.test(ch) || ch === ';' || ch === '\n' || ch === '|') break;
+      if (ch === '&' && !isRedirectionAmpersand(command, i)) break;
+      i++;
+    }
+    tokens.push({ op: false, text: command.slice(start, i), start, end: i });
+  }
+  return tokens;
+}
+
+// Resolves a token's quotes for MATCHING only (flag names, head names) --
+// never used to compute a span; spans always come from token.start/end so
+// blanking stays byte-exact.
+function unquoteWord(word) {
+  let out = '';
+  for (let i = 0; i < word.length; i++) {
+    const ch = word[i];
+    if (ch === "'" || ch === '"') continue;
+    if (ch === '\\' && i + 1 < word.length) { out += word[i + 1]; i++; continue; }
+    out += ch;
+  }
+  return out;
+}
+
+function blankDataPayloadSpans(command) {
+  if (!command || command.length > MAX_COMMAND_SCAN_LEN) return command; // fail closed: too long to safely parse, scan unchanged
+  const command_ = joinLineContinuations(command);
+  const tokens = shellTokenize(command_);
+  const spans = [];
+  let head = null;
+  let expectHeadNext = true;
+  for (let idx = 0; idx < tokens.length; idx++) {
+    const tok = tokens[idx];
+    if (tok.op) { head = null; expectHeadNext = true; continue; }
+    const word = unquoteWord(tok.text);
+    if (expectHeadNext) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue; // FOO=bar env-style prefix; keep waiting
+      const base = path.basename(word).toLowerCase();
+      if (COMMAND_WRAPPER_HEADS.has(base)) continue; // wrapper itself is not the head; next real word is
+      head = base;
+      expectHeadNext = false;
+      continue;
+    }
+    if (!DATA_TRANSPORT_COMMANDS.has(head)) continue;
+    const flagMatch = word.match(DATA_PAYLOAD_FLAG);
+    if (!flagMatch) continue;
+    if (flagMatch[1] !== undefined) {
+      const eq = tok.text.indexOf('=');
+      spans.push({ start: tok.start + eq + 1, end: tok.end });
+    } else if (tokens[idx + 1] && !tokens[idx + 1].op) {
+      spans.push({ start: tokens[idx + 1].start, end: tokens[idx + 1].end });
+      idx++;
+    }
+  }
+  if (!spans.length) return command_; // fast path: the overwhelming majority of commands never touch this at all
+  let out = '';
+  let cursor = 0;
+  for (const span of spans) {
+    out += command_.slice(cursor, span.start);
+    const spanText = command_.slice(span.start, span.end);
+    const extracted = extractLiveSubstitutions(spanText);
+    // CODEX-IQA-R2 A4: on overflow (too deep or too long to safely parse),
+    // fail CLOSED by putting the ORIGINAL span text back verbatim -- fully
+    // scannable, exactly as if this command had never matched a data-transport
+    // flag at all -- instead of round 2's `return ''`, which silently deleted
+    // an unscanned payload (including a live `git push`) from the scan.
+    out += extracted.overflow ? spanText : (extracted.text ? ` ${extracted.text} ` : ' ');
+    cursor = span.end;
+  }
+  out += command_.slice(cursor);
+  return out;
+}
+
+function hardSafetyScanText(command) {
+  const raw = String(command || '');
+  return raw ? blankDataPayloadSpans(raw) : '';
+}
+
+// R12 Hit 3/4 (live NACHO-ORCH repro 2026-09-14): `sensitive-file-read` fired
+// on ANY reference to a sensitive DIRECTORY, so `find ~/.termdeck -iname ...`
+// and `grep -rl ... ~/.termdeck` were gated even though neither can emit a
+// single byte of file CONTENT -- they report path existence and which paths
+// matched. The trigger regex below is left byte-identical; what is added is a
+// SUPPRESSION that fires only when every stage touching a sensitive path is
+// PROVABLY path-only. Anything unrecognized (`bash -c "cat ~/.ssh/id_rsa"`, a
+// wrapper we cannot resolve, an unparsed stage) is not provable, so it keeps
+// tripping. cat/head/tail/sed/nl are never path-only -- a bounded
+// `tail -30 ~/.termdeck/config.yaml` still exposes 30 lines of a sensitive
+// file and must still trip, per the R12 charge.
+const SENSITIVE_READ_PATH = /(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/;
+// find actions that can execute a reader, or write/destroy, rather than just
+// naming paths. -printf/-print0/-print emit find's own format directives only,
+// never file contents, so they are NOT listed; -fprint*/-fls write files and
+// -delete destroys them, so they are (fail closed -- this reason is the only
+// gate those shapes currently hit).
+const FIND_NON_PATH_ONLY_ACTIONS = new Set([
+  '-exec', '-execdir', '-ok', '-okdir', '-delete', '-fls', '-fprint', '-fprint0', '-fprintf',
+]);
+// grep/rg short options whose remaining cluster characters are that option's
+// VALUE, not more flags -- scanning must stop at the first one of these so
+// `-e l` style values are never mistaken for `-l`. `-NUM` (context) likewise
+// consumes the rest of the cluster.
+const GREP_VALUE_SHORT_OPTS = 'ABCDdefm';
+const GREP_PATHS_ONLY_LONG = new Set(['--files-with-matches', '--files-without-match']);
+function grepArgIsPathsOnly(arg) {
+  if (GREP_PATHS_ONLY_LONG.has(arg)) return true;
+  if (arg.startsWith('--') || !arg.startsWith('-') || arg.length < 2) return false;
+  for (let i = 1; i < arg.length; i++) {
+    const ch = arg[i];
+    if (ch === 'l' || ch === 'L') return true;
+    if (GREP_VALUE_SHORT_OPTS.includes(ch) || /\d/.test(ch)) return false;
+  }
+  return false;
+}
+// R13 BLOCKER 2 (CODEX-IQA-R12 enforcement.js:2664,2674): the R12 proof looked
+// only at the OUTER shape of the stage. `printf x | grep -l --label="$(cat
+// ~/.ssh/id_rsa)" x` parses as head `grep` carrying `-l`, so it was suppressed
+// -- while the embedded command substitution read the private key and
+// `--label` emitted it in place of the filename. A command substitution runs an
+// arbitrary command whose output we do not and cannot resolve statically, so no
+// command containing one is PROVABLY path-only. Same for an unresolved
+// expansion (`$VAR`, backtick) inside the sensitive stage itself: its value can
+// supply further flags or a content-bearing argument. Both fail CLOSED, which
+// is the policy this suppression already states for everything unrecognized.
+function commandHasUnresolvableSubstitution(command) {
+  const raw = String(command || '');
+  if (!/[$`]/.test(raw)) return false;
+  const extracted = extractLiveSubstitutions(raw);
+  if (extracted.overflow) return true;        // too deep/long to parse -> unproven
+  return !!String(extracted.text || '').trim(); // any real $(...) or `...` present
+}
+// grep/rg options that replace the emitted path with caller-supplied text, so
+// the output is no longer "just a path" even with -l.
+const GREP_LABEL_OPTS = /^--label(?:=|$)/;
+function stageIsPathOnlySensitiveRead(stage) {
+  const { head, args } = parseCommandSegment(stage);
+  // Any unresolved expansion in the very stage that touches the sensitive path
+  // makes its argv unknowable. Unproven -> not path-only.
+  if (/[$`]/.test(String(stage || ''))) return false;
+  if (head === 'ls') return true; // ls reports names/metadata; it has no content mode
+  if (head === 'find') return !args.some(arg => FIND_NON_PATH_ONLY_ACTIONS.has(arg.toLowerCase()));
+  if (head === 'grep' || head === 'rg') {
+    if (args.some(arg => GREP_LABEL_OPTS.test(arg))) return false;
+    return args.some(grepArgIsPathsOnly);
+  }
+  return false; // cat/head/tail/sed/nl, wrappers, and anything unrecognized
+}
+function sensitiveReadIsProvablyPathOnly(command) {
+  const raw = String(command || '');
+  // Scan the WHOLE command text, not just the matched stage: a substitution in
+  // any segment can read a sensitive file and hand its bytes to the stage that
+  // does the emitting.
+  if (commandHasUnresolvableSubstitution(raw)) return false;
+  const segments = commandTopLevelSegments(raw);
+  if (!segments.length) return false;
+  let sawSensitiveStage = false;
+  for (const segment of segments) {
+    for (const stage of pipeStages(segment)) {
+      if (!SENSITIVE_READ_PATH.test(stage.toLowerCase())) continue;
+      sawSensitiveStage = true;
+      if (!stageIsPathOnlySensitiveRead(stage)) return false;
+    }
+  }
+  // If splitting found no sensitive stage at all, the whole-text regex matched
+  // across a boundary our splitter cannot see. Unproven -> keep tripping.
+  return sawSensitiveStage;
+}
+
+function hardSafetyCommandReason(command) {
   const commandish = normalizedText(command).toLowerCase();
   if (!commandish) return '';
-  // JSON delimiters are command boundaries only in the raw-argument scan;
-  // quotes inside a normal shell command can introduce harmless literal text.
-  const envCommandBoundary = rawArgumentsFallback
-    ? /(^|[\s"[{])(env|printenv|export|set)(\s|$)/
-    : /(^|\s)(env|printenv|export|set)(\s|$)/;
+  const envCommandBoundary = /(^|\s)(env|printenv|export|set)(\s|$)/;
   if (envCommandBoundary.test(commandish)
       && /(secret|token|key|password|credential|anthropic|openai|termdeck)/.test(commandish)) return 'sensitive-env';
-  if (/\b(?:cat|head|tail|sed|nl|rg|grep|find|ls)\b[\s\S]*(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/.test(commandish)) return 'sensitive-file-read';
+  if (/\b(?:cat|head|tail|sed|nl|rg|grep|find|ls)\b[\s\S]*(?:~\/\.ssh|\/home\/[^/\s]+\/\.ssh|~\/\.termdeck|\/home\/[^/\s]+\/\.termdeck|~\/\.claude\.json|\/\.claude\.json|~\/\.gitconfig|\/\.gitconfig)/.test(commandish)
+      && !sensitiveReadIsProvablyPathOnly(command)) return 'sensitive-file-read';
   if (/\brg\b[\s\S]*(?:secret|token|password|credential)[\s\S]*\/home\/nacho\b/.test(commandish)) return 'broad-secret-search';
   if (/\bgit\s+branch\b[\s\S]*(?:-d|-D|--delete)\b/.test(commandish)) return 'destructive-git-branch';
   if (/\bgit\s+(?:commit|push|merge)\b/.test(commandish)) return 'git-write-operation';
@@ -1667,8 +3034,8 @@ function hardSafetyReason(classification, body = null) {
     if (filePath && /(?:^|\/)\.(?:ssh|termdeck)(?:\/|$)|(?:^|\/)\.claude\.json$|(?:^|\/)\.gitconfig$/.test(filePath)) {
       return 'sensitive-file-read';
     }
-    const commandReason = hardSafetyCommandReason(tool.command || prompt)
-      || hardSafetyCommandReason(tool.rawArguments, true);
+    const commandReason = hardSafetyCommandReason(hardSafetyScanText(tool.command) || prompt)
+      || (tool.argumentsUnvalidated && looksExecCapableToolName(tool.name) ? 'unvalidated-tool-arguments' : '');
     if (commandReason) return commandReason;
   }
   return '';
@@ -2028,10 +3395,32 @@ function redirectPanelAction(classification) {
   return `Stop. Do not retry or run ${commandClass} from this panel; wait for operator/control-plane input.`;
 }
 
-function buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body) {
+function buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body, st) {
   const redirectMode = policy.redirect && policy.redirect.mode ? policy.redirect.mode : DEFAULT_POLICY.redirect.mode;
   if (!['warn', 'enforce'].includes(redirectMode)) return null;
   if (!safeForSyntheticRedirect(body, classification)) return null;
+  // Defense in depth alongside the checkEnforcement-level short-circuit
+  // (CODEX-IQA-R2 B5): that short-circuit is the primary fix (it also
+  // prevents unrelated DOWNSTREAM budget checks from firing on the same
+  // turn, which this function alone cannot do), but keeping this guard here
+  // too costs nothing and means this function is independently correct.
+  if (classification.terminalShape === 'real_user_text' && classification.directOperatorQuestion) return null;
+  const exemptedClasses = boundedOperatorReadClasses(classification, st, policy, body);
+  if (exemptedClasses) {
+    // R13 BLOCKER 1: burn the one-shot for EVERY class this call consumed;
+    // recording only the classified one would let the next turn re-spend the
+    // others.
+    if (st) {
+      st.boundedReadClassesUsed = st.boundedReadClassesUsed || new Set();
+      for (const cls of exemptedClasses) st.boundedReadClassesUsed.add(cls);
+    }
+    return null;
+  }
+  if (isBoundedDispatchConfirmation(classification, st, body)) {
+    st.dispatchConfirmClassesUsed = st.dispatchConfirmClassesUsed || new Set();
+    st.dispatchConfirmClassesUsed.add(classification.commandClass);
+    return null;
+  }
 
   const artifact = readWatcherArtifact(classification.commandClass, guardDeps);
   const reason = 'zero-llm-redirect';
@@ -2272,7 +3661,23 @@ function checkEnforcement(project, panel, body, compactHeaders = {}, rawTokens =
   pruneTimes(st.likelyPollAt, now - 60 * 60 * 1000);
   pruneTimes(st.controlAt, now - 60 * 60 * 1000);
 
-  const redirect = redirectEligible ? buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body) : null;
+  // CODEX-IQA-R2 B5: a genuine inbound operator question (real_user_text,
+  // question-shaped) must never be redirect- OR budget-blocked, no matter
+  // what commandClass/topic its own prompt text happens to match. Round 2's
+  // fix only guarded buildRedirectResponse; a LATER, separate check further
+  // down this same function (e.g. orch-assignment-budget) still fired on the
+  // same turn, because that check has no knowledge of buildRedirectResponse's
+  // decision. Promoting the short-circuit to here means it exits the ENTIRE
+  // downstream decision surface for this turn, not just one function. Hard
+  // safety (checked unconditionally above, before this point) is deliberately
+  // NOT bypassed by this -- an operator question is never a vector to skip a
+  // real safety block, and by the time we reach here that check has already
+  // run and (if it found something) already returned.
+  if (classification.terminalShape === 'real_user_text' && classification.directOperatorQuestion) {
+    return null;
+  }
+
+  const redirect = redirectEligible ? buildRedirectResponse(project, panel, policy, classification, state, guardDeps, body, st) : null;
   if (redirect) return redirect;
 
   if (overrideActive) return null;
@@ -2482,3 +3887,5 @@ module.exports = {
     readWatcherArtifact,
   },
 };
+
+module.exports.__test = { commandTopLevelSegmentsWithOps, reachableTopLevelSegments, dispatchOkLaundersPoll, stageIsDispatchAction, stageCarriesPollSubject, commandHasUnresolvableSubstitution, curlStageIsPlainGet, protectedClassesInCommand, hardSafetyReason, hardSafetyScanText, shellTokenize, joinLineContinuations, parseCommandSegment, segmentArgTokens, splitEnvDashSValue, pipeStages, commandPipelineSegments, commandTopLevelSegments, stageHasFollowFlag, isBoundedReadCommand, sensitiveReadIsProvablyPathOnly, isSingleSessionStatusRead, commandRunsDispatchAction, hasAtMostOneSubjectSegment, stripPatternArgs, stripMiserCompoundIdentifiers, questionMentionsTopic };
