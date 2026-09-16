@@ -1,16 +1,16 @@
 'use strict';
 
-// compress() v2 test suite — LOSSLESS dedup, no truncation, no ceiling.
+// compress() v2 test suite — no truncation, no ceiling.
 // Covers AC1–AC10 (+ the §8.6 threshold grep-guard). All tests are socket-free:
 // nothing here binds :20128 or connects to Anthropic/Codex/Ollama.
 //
-// §8.7 build-time verification note: Anthropic's `tool_result` block legally
-// carries a text stub in its `content` (content is a string OR an array of
-// blocks — https://docs.anthropic.com/en/api/messages, tool_result schema). So
-// replacing a duplicate result's `content` with the string stub
-// `[miser: identical to turn N]` is wire-legal and model-equivalent for a
-// byte-identical newest copy. Image/document blocks are NOT touched (out of
-// scope, §7 Q1) — there is no proven wire-legal stub form for them.
+// RTK-sprint §7 UPDATE: the Anthropic middle dedup is RETIRED. Every assertion
+// below that used to expect a `[miser: identical to turn N]` stub on the
+// Anthropic path now asserts the OWNED BEHAVIOUR CHANGE instead — duplicate
+// tool_results are forwarded intact. The OpenAI dedup path (openai.test.js) is
+// unchanged and still dedups. Tests that already asserted "both kept" are
+// unchanged and still pass; they simply no longer distinguish the two regimes,
+// so the flipped tests below are what pin the retirement.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -24,7 +24,6 @@ const {
   normalizeAnthropicBody,
   requestCarriesClientCache,
   MIN_KEEP,
-  __test,
 } = require('../src/compress.js');
 
 // ---------------------------------------------------------------------------
@@ -123,20 +122,21 @@ function bigDuplicateTranscript(dup, uniquePrefix) {
   ];
 }
 
-test('AC1: 200K request with heavy duplicate tool_results is deduped + forwarded (never 413)', () => {
+test('AC1: 200K request with heavy duplicate tool_results is forwarded intact (never 413)', () => {
   const dup = 'D'.repeat(200000); // ~200K chars of duplicate payload
   const messages = bigDuplicateTranscript(dup, 'unique');
   const result = compress({ messages });
   assert.ok(result.body && Array.isArray(result.messages));
-  // Older duplicate (idx2) collapsed to a stub; newest (idx10) intact.
-  assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+  // §7 RETIREMENT: no stub. AC1's real invariant was always "never 413" — a
+  // large duplicate-heavy body forwards, whole, rather than being rejected.
+  assert.equal(result.messages[2].content[0].content, dup);
   assert.equal(result.messages[10].content[0].content, dup);
-  assert.ok(result.tokens < result.rawTokens);
+  assert.equal(result.tokens, result.rawTokens);
   assert.ok(validateMessageIntegrity(result.messages).valid);
 });
 
 function assertDedupSkippedForCacheControl(name, patchBody) {
-  test(`v4 S1: Anthropic dedup skips when client cache_control is present at ${name}`, () => {
+  test(`v4 S1: no Anthropic rewrite when client cache_control is present at ${name}`, () => {
     const dup = 'CACHE-SAFE-DUP-' + 'z'.repeat(400);
     const body = patchBody({ messages: bigDuplicateTranscript(dup, 'unique') });
     const result = compress(body);
@@ -170,15 +170,22 @@ assertDedupSkippedForCacheControl('tools[] entry', body => ({
   tools: [{ name: 'Read', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral' } }],
 }));
 
-test('v4 S1: Anthropic dedup still runs without client cache_control', () => {
+// §10.7(29) — THE OWNED BEHAVIOUR CHANGE, asserted explicitly rather than
+// pretended away. Before the §7 retirement these two inputs were the LIVE dedup
+// path (Codex's probe ran the real compress() and confirmed it executed for
+// both). After it, neither rewrites anything. This is the pair of tests that
+// would fail first if the retirement were ever silently reverted.
+test('§7(29): a request WITHOUT cache_control no longer gets middle-dedup (owned change)', () => {
   const dup = 'NO-CACHE-DUP-' + 'n'.repeat(400);
   const result = compress({ messages: bigDuplicateTranscript(dup, 'unique') });
   assert.equal(requestCarriesClientCache(result.body), false);
-  assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+  // Formerly: messages[2] was `[miser: identical to turn 10]`.
+  assert.equal(result.messages[2].content[0].content, dup);
   assert.equal(result.messages[10].content[0].content, dup);
+  assert.equal(result.tokens, result.rawTokens);
 });
 
-test('v4 S1: MISER_DEDUP_FORCE=1 restores Anthropic dedup with client cache_control', () => {
+test('§7(29): MISER_DEDUP_FORCE=1 is now INERT on the Anthropic path (owned change)', () => {
   const prev = process.env.MISER_DEDUP_FORCE;
   try {
     process.env.MISER_DEDUP_FORCE = '1';
@@ -187,12 +194,26 @@ test('v4 S1: MISER_DEDUP_FORCE=1 restores Anthropic dedup with client cache_cont
       cache_control: { type: 'ephemeral' },
       messages: bigDuplicateTranscript(dup, 'unique'),
     });
-    assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+    // Formerly: the env var forced dedup on despite the cache_control gate.
+    assert.equal(result.messages[2].content[0].content, dup);
     assert.equal(result.messages[10].content[0].content, dup);
   } finally {
     if (prev === undefined) delete process.env.MISER_DEDUP_FORCE;
     else process.env.MISER_DEDUP_FORCE = prev;
   }
+});
+
+// §10.7(28) — the retired surface is GONE, not merely unreachable. A stale
+// export would let a caller resurrect the path the sprint deliberately retired.
+test('§7(28): the retired dedup surface is no longer exported', () => {
+  const mod = require('../src/compress.js');
+  for (const name of ['dedupMiddle', 'dedupKey', 'buildPairings', '__test']) {
+    assert.equal(mod[name], undefined, `compress.js still exports ${name}`);
+  }
+  // Preserved neighbours: normalization, adjacency re-validation, cache hint.
+  assert.equal(typeof mod.normalizeAnthropicBody, 'function');
+  assert.equal(typeof mod.validateMessageIntegrity, 'function');
+  assert.equal(typeof mod.requestCarriesClientCache, 'function');
 });
 
 // ===========================================================================
@@ -320,16 +341,17 @@ test('AC3: Read(f)=A … Edit … Read(f)=B keeps BOTH (different content, same 
   assert.ok(validateMessageIntegrity(result.messages).valid);
 });
 
-test('AC3: Read(f)=A … Read(f)=A stubs the older, newest authoritative & reconstructable', () => {
+test('AC3: Read(f)=A … Read(f)=A keeps BOTH after the §7 retirement', () => {
   const same = 'byte-identical contents of a.js';
   const messages = transcriptTwoResults(
     { name: 'Read', input: { file_path: '/a.js' } }, { content: same },
     { name: 'Read', input: { file_path: '/a.js' } }, { content: same },
   );
   const result = compress({ messages });
-  assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+  // Formerly stubbed to `[miser: identical to turn 10]`; now forwarded intact.
+  assert.equal(result.messages[2].content[0].content, same);
   assert.equal(result.messages[2].content[0].tool_use_id, 'tu1');
-  assert.equal(result.messages[10].content[0].content, same); // reconstruct target
+  assert.equal(result.messages[10].content[0].content, same);
 });
 
 test('AC3: identical bytes from DIFFERENT tools/files → BOTH kept (paired identity)', () => {
@@ -355,13 +377,14 @@ test('AC3: identical text with OPPOSITE is_error → BOTH kept', () => {
   assert.equal(result.messages[10].content[0].content, 'ambiguous stdout');
 });
 
-test('AC3: same content AND same is_error collapses, preserving is_error on the stub', () => {
+test('AC3: same content AND same is_error keeps BOTH after the §7 retirement', () => {
   const messages = transcriptTwoResults(
     { name: 'Bash', input: { cmd: 'x' } }, { content: 'same failing output', is_error: true },
     { name: 'Bash', input: { cmd: 'x' } }, { content: 'same failing output', is_error: true },
   );
   const result = compress({ messages });
-  assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+  // Formerly collapsed to a stub carrying is_error; now forwarded intact.
+  assert.equal(result.messages[2].content[0].content, 'same failing output');
   assert.equal(result.messages[2].content[0].is_error, true);
   assert.equal(result.messages[10].content[0].content, 'same failing output');
 });
@@ -686,14 +709,13 @@ test('AC5: validateMessageIntegrity rejects an unanswered tool_use', () => {
   assert.match(r.error, /following/);
 });
 
-// LOAD-BEARING revert proof. The real dedupMiddle preserves tool_use_id, so it
-// can never break adjacency — leaving the §3.5 revert branch untested. We inject
-// a dedup that DELIBERATELY corrupts a tool_result's tool_use_id (breaking
-// adjacency) and assert compress() detects the integrity failure and REVERTS to
-// the §3.1-normalized (pre-dedup) messages. If the `validateMessageIntegrity(work)`
-// / revert block is removed, compress() would forward the corrupted messages and
-// this test FAILS (adjacency broken + wrong tool_use_id surfaced).
-test('AC5: compress() reverts dedup when miser\'s OWN dedup would break adjacency', () => {
+// The §3.5 keep-or-revert branch went out with the dedup it existed to revert
+// (there is now nothing for compress() to undo). What REPLACES that coverage is
+// the stronger structural claim: compress() cannot break adjacency at all,
+// because it no longer rewrites any tool_result on the Anthropic path. The
+// exported validateMessageIntegrity is unchanged and still covered by the two
+// tests above.
+test('§7(28): compress() forwards tool pairs untouched, so adjacency cannot break', () => {
   const messages = [
     { role: 'user', content: 'FIRST TASK' },
     { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'fn', input: { n: 1 } }] },
@@ -701,37 +723,17 @@ test('AC5: compress() reverts dedup when miser\'s OWN dedup would break adjacenc
     { role: 'assistant', content: [{ type: 'tool_use', id: 'tu2', name: 'fn', input: { n: 2 } }] },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu2', content: 'r2' }] },
   ];
-  // Injected adjacency-breaking "dedup": rewrite an outside-tail tool_result's
-  // tool_use_id so it no longer pairs with the preceding assistant tool_use.
-  const breakingDedup = (work) => {
-    for (const m of work) {
-      if (m.role !== 'user' || !Array.isArray(m.content)) continue;
-      m.content = m.content.map(b =>
-        (b && b.type === 'tool_result') ? { ...b, tool_use_id: 'CORRUPTED', content: 'STUBBED' } : b);
-    }
-  };
-  // The dedup impl is injected via the module-private test-only seam (NOT via the
-  // public compress(body, opts) API — production callers can't reach it). Always
-  // reset in finally so the override never leaks into another test.
-  let result;
-  __test.setDedupImpl(breakingDedup);
-  try {
-    result = compress({ messages });
-  } finally {
-    __test.setDedupImpl(null);
-  }
-  // Reverted: the forwarded messages are the pre-dedup normalized set, NOT the
-  // corrupted ones. Original tool_use_ids + content survive; adjacency holds.
+  const result = compress({ messages });
   assert.equal(result.messages[2].content[0].tool_use_id, 'tu1');
   assert.equal(result.messages[2].content[0].content, 'r1');
   assert.equal(result.messages[4].content[0].tool_use_id, 'tu2');
   assert.equal(result.messages[4].content[0].content, 'r2');
   assert.ok(validateMessageIntegrity(result.messages).valid);
-  // Guard: prove the injected dedup really WOULD have broken adjacency (so the
-  // test is meaningful — it forces the revert branch, not a no-op).
-  const corrupted = messages.map(m => ({ ...m }));
-  breakingDedup(corrupted);
-  assert.equal(validateMessageIntegrity(corrupted).valid, false);
+  // Every forwarded tool_result block is the SAME OBJECT the client sent (the
+  // Anthropic path no longer clones-and-rewrites), which is the property that
+  // makes "cannot break adjacency" structural rather than incidental.
+  assert.equal(result.messages[2].content[0], messages[2].content[0]);
+  assert.equal(result.messages[4].content[0], messages[4].content[0]);
 });
 
 // ===========================================================================
@@ -792,7 +794,7 @@ test('AC8: role:system hoist puts top-level system on the FORWARDED body', () =>
 // ===========================================================================
 // AC10 — deploy-reaches-prod canary shape (compress half).
 // ===========================================================================
-test('AC10: middle duplicate tool_result (locatable pair, outside preserve set) → stub forwarded', () => {
+test('AC10: middle duplicate tool_result (locatable pair, outside preserve set) → forwarded intact', () => {
   const dup = 'CANARY-DUP-' + 'q'.repeat(500);
   const mk = (id, content) => ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] });
   const messages = [
@@ -811,7 +813,9 @@ test('AC10: middle duplicate tool_result (locatable pair, outside preserve set) 
   ];
   const result = compress({ messages });
   assert.equal(result.messages.length, 12);
-  assert.match(result.messages[2].content[0].content, /^\[miser: identical to turn 10\]$/);
+  // §7 RETIREMENT: the canary's compress half no longer stubs. The shape it
+  // guards — locatable pair, outside the preserve set, forwarded whole — holds.
+  assert.equal(result.messages[2].content[0].content, dup);
   assert.equal(result.messages[10].content[0].content, dup);
 });
 

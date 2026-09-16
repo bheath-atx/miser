@@ -77,3 +77,43 @@ git -C /home/nacho/miser stash    # or: git -C /home/nacho/miser reset --hard 3d
 Capture `journalctl --user -u miser -n 200` BEFORE rolling forward again. The
 failure is almost certainly in the failover path (translate-responses / router
 Codex leg); the wire format is pinned in `CODEX-WIRE-FORMAT-PINNED.md`.
+
+---
+
+## RTK pre-context output filter — rollback
+
+Added by the RTK sprint. There is **no persistent state to unwind**: no schema, no
+migration, no store, no daemon. Every failure path already forwards the request
+body unmodified, so *runtime* degradation needs no action at all.
+
+### Kill switch (operational action — needs Brad's approval per CLAUDE.md)
+
+Unset **either** variable and restart:
+
+```bash
+MISER_RTK_FILTER=      # or
+MISER_TIER_B_OUTPUT_TRIM=
+```
+
+Either one alone disables the feature. With it off there is no spawn, no memo
+allocation, and no body-freeze cost.
+
+### Two things that need care on a code revert
+
+1. **The additive `rtk` stats bucket.** Readers must tolerate its absence; old
+   snapshots simply do not have it, and `finalizeAggregate` treats a missing
+   bucket as empty rather than fabricating one. Reverting the code leaves any
+   already-written `rtk` keys in the stats file — they are inert, not corrupt.
+
+2. **The `compress.js` middle-dedup retirement is a BEHAVIOUR CHANGE, not a
+   flag.** It reverts with its commit. While the retirement is in place,
+   requests without `cache_control` — and any run with `MISER_DEDUP_FORCE=1` —
+   no longer get middle-dedup on the Anthropic path, and `MISER_DEDUP_FORCE` is
+   inert there. The OpenAI `/v1/chat/completions` dedup is untouched.
+
+### RTK version changes cause a ONE-TIME prefix rewrite
+
+`MISER_RTK_VERSION` participates in the memo key, so changing the pinned binary
+invalidates every cached summary and rewrites the forwarded prefix once. That is
+a single prompt-cache miss per affected conversation, not a recurring cost —
+but do not roll a version change out mid-incident alongside another change.

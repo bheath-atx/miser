@@ -8,18 +8,20 @@
 // working memory every turn while masking the pressure so the client's native
 // compaction never fired.
 //
-// v2 removes ALL truncation and ALL size ceilings. Its ONLY reductions are:
+// v2 removes ALL truncation and ALL size ceilings. On the ANTHROPIC path its
+// only remaining reductions are:
 //   1. hoist `role:system` messages into top-level `system` (§3.1),
-//   2. losslessly dedup byte-identical `tool_result` blocks (§3.3),
-//   3. (opt-in, default OFF) a single cache_control breakpoint on `system` (§3.4).
-// After dedup it re-validates tool adjacency and reverts ONLY the dedup on
-// failure (§3.5). It NEVER removes/reorders messages (beyond the system hoist),
-// NEVER truncates, NEVER repairs a client-illegal opener, and emits NO synthetic
-// client rejection. A client-illegal request is forwarded as-is so Anthropic's
-// authoritative error reaches the client (I1–I7, §3.1a).
+//   2. (opt-in, default OFF) a single cache_control breakpoint on `system` (§3.4).
+// The §3.3 middle dedup and its §3.5 keep-or-revert check were RETIRED in the
+// RTK sprint — see the §3.3 note below for what that changed and why. The
+// OpenAI `/v1/chat/completions` dedup (§3.8) is a separate path and is
+// UNCHANGED. compress() NEVER removes/reorders messages (beyond the system
+// hoist), NEVER truncates, NEVER repairs a client-illegal opener, and emits NO
+// synthetic client rejection. A client-illegal request is forwarded as-is so
+// Anthropic's authoritative error reaches the client (I1–I7, §3.1a).
 //
-// Pipeline order is FIXED: §3.1 → §3.1a (no-op, by construction) → §3.3 dedup →
-// §3.5 validate/revert → §3.4 cache-hint (LAST, so a revert can never drop it).
+// Anthropic pipeline order is FIXED: §3.1 → §3.1a (no-op, by construction) →
+// §3.4 cache-hint.
 //
 // compress() returns { body, messages, tokens, rawTokens } (I6): `body` is the
 // REDUCED body (hoisted system, optional cache hint) that proxy.js forwards to
@@ -162,30 +164,36 @@ function normalizeAnthropicBody(body, messages) {
   return { body: out, messages: cleanMessages };
 }
 
-// --- §3.3 lossless tool_result dedup ----------------------------------------
+// --- §3.3 Anthropic middle dedup — RETIRED --------------------------------
+//
+// The Anthropic-format middle dedup (dedupKey, buildPairings, dedupMiddle, the
+// isStubbableToolResult candidate predicate, the §3.5 dedup-revert, and the
+// test-only dedup-injection seam) was REMOVED in the RTK sprint under Brad's
+// Q1(b) answer.
+//
+// This was a RETIREMENT OF A REACHABLE PATH, not a dead-code deletion. The
+// former gate read `requestCarriesClientCache(normBody) && MISER_DEDUP_FORCE
+// !== '1'`, and requestCarriesClientCache is a RUNTIME CONTENT TEST — true only
+// when a cache_control breakpoint appears on the body, a system block, a
+// message block, or a tools[] entry. Codex ran the real compress() and
+// confirmed dedup EXECUTED both without cache_control and with
+// MISER_DEDUP_FORCE=1. So it was dead for Claude Code's cache_control-carrying
+// traffic and live in general.
+//
+// OWNED BEHAVIOUR CHANGE: requests without cache_control, and any run with
+// MISER_DEDUP_FORCE=1, no longer get middle-dedup. Nothing replaces it on that
+// path; the RTK output filter is a different transform on different blocks and
+// is not a drop-in. MISER_DEDUP_FORCE is now inert for the Anthropic path.
+//
+// DELIBERATELY PRESERVED: `canonicalize` below (shared with the OpenAI dedup
+// key), the whole OpenAI `/v1/chat/completions` dedup path (separate,
+// confirmed-live, explicitly out of scope), system-role normalization, the
+// exported `validateMessageIntegrity`, and the cache hint.
 
 function cloneMsg(msg) {
-  // Shallow clone; dedup replaces `.content` with a fresh array so the caller's
-  // original message objects are never mutated.
+  // Shallow clone; the OpenAI dedup replaces `.content` on the clone so the
+  // caller's original message objects are never mutated.
   return { ...msg };
-}
-
-function contentBlocks(msg) {
-  return Array.isArray(msg.content) ? msg.content : [];
-}
-
-// A tool_result is a dedup CANDIDATE only when replacing its `content` with a
-// STRING stub is provably wire-legal + model-equivalent: content must be a
-// string, or an array of ONLY text blocks. An array carrying any image/document
-// (or unknown) block is OUT OF SCOPE (§3.3 / §7 Q1) — collapsing it to a string
-// stub would change the block TYPE, so we treat such a result as unique.
-function isStubbableToolResult(block) {
-  if (typeof block.content === 'string') return true;
-  if (Array.isArray(block.content)) {
-    return block.content.every(c => c && c.type === 'text');
-  }
-  // null/undefined/object content: not a bulky text payload → leave as-is.
-  return false;
 }
 
 // Recursively sort object keys so two semantically-equal values stringify to the
@@ -198,94 +206,6 @@ function canonicalize(v) {
     return out;
   }
   return v;
-}
-
-// Identity key for a `tool_result` block (I4). Combines PAIRED-TOOL identity
-// (the answering tool_use's name + input, from the immediately-preceding
-// assistant turn) with the block MINUS its `tool_use_id`.
-//
-// `tool_use_id` is only a pairing pointer and legitimately varies between two
-// otherwise-identical results, so it is excluded. EVERY other semantic field
-// (content, is_error, cache_control, …) participates: a differing field → a
-// different key → both preserved. A false-distinct is safe; a false-identical is
-// impossible. If the paired tool_use is un-locatable, the caller treats the block
-// as unique and never calls this (fail-safe, §3.3).
-function dedupKey(pairedName, pairedInput, block) {
-  const { tool_use_id, ...semantic } = block; // exclude ONLY the pairing id
-  return 'tr:' + JSON.stringify(canonicalize([pairedName, pairedInput, semantic]));
-}
-
-// Map every user-turn tool_result → the paired tool_use in the IMMEDIATELY
-// PRECEDING assistant turn. Returns Map<msgIndex, Map<tool_use_id, {name,input}>>.
-// A block whose pairing is un-locatable is simply absent → treated as unique.
-function buildPairings(messages) {
-  const pairings = new Map();
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (!msg || msg.role !== 'user' || !Array.isArray(msg.content)) continue;
-    const prev = messages[i - 1];
-    const useById = new Map();
-    if (prev && prev.role === 'assistant' && Array.isArray(prev.content)) {
-      for (const b of prev.content) {
-        if (b && b.type === 'tool_use') useById.set(b.id, { name: b.name, input: b.input });
-      }
-    }
-    pairings.set(i, useById);
-  }
-  return pairings;
-}
-
-// Lossless middle dedup. Walks newest → oldest so the FIRST occurrence recorded
-// for any key is the NEWEST copy (always authoritative + retained, never stubbed).
-// Older identical copies get ONLY their bulky `content` replaced by a text stub
-// `[miser: identical to turn N]`; `tool_use_id`, `is_error`, and every other
-// semantic field are preserved so pairing/adjacency is untouched. The first
-// non-system user turn (firstTaskIdx) and the recent tail (>= tailStart) are the
-// preserve set and are never rewritten. Mutates the (cloned) `messages` in place.
-function dedupMiddle(messages, firstTaskIdx, tailStart, pairings) {
-  const seen = new Map(); // key -> index of newest occurrence
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    const paired = pairings.get(i);
-
-    // Tail: authoritative newest copies. Record keys, never rewrite.
-    if (i >= tailStart) {
-      if (paired) {
-        for (const b of contentBlocks(m)) {
-          if (b && b.type === 'tool_result' && isStubbableToolResult(b)) {
-            const pair = paired.get(b.tool_use_id);
-            if (!pair) continue; // un-locatable pairing → unique
-            const k = dedupKey(pair.name, pair.input, b);
-            if (!seen.has(k)) seen.set(k, i);
-          }
-        }
-      }
-      continue;
-    }
-
-    // First task/handoff turn is part of the preserve set — never touch it.
-    if (i === firstTaskIdx) continue;
-    if (!Array.isArray(m.content) || !paired) continue;
-
-    m.content = m.content.map(b => {
-      // Only tool_result blocks are dedup candidates. Text blocks (which may
-      // carry unique user instructions or distinct assistant reasoning) and
-      // image/document blocks (out of scope, §7 Q1) are NEVER collapsed.
-      if (!b || b.type !== 'tool_result') return b;
-      if (!isStubbableToolResult(b)) return b; // image/document content → out of scope (§3.3)
-      const pair = paired.get(b.tool_use_id);
-      if (!pair) return b; // un-locatable paired tool_use → treat as unique (fail-safe)
-      const k = dedupKey(pair.name, pair.input, b);
-      if (seen.has(k)) {
-        // Preserve every semantic field (tool_use_id, is_error, …); replace ONLY
-        // the bulky content with the stub marker pointing at the newest copy.
-        return { ...b, content: `[miser: identical to turn ${seen.get(k)}]` };
-      }
-      seen.set(k, i);
-      return b;
-    });
-  }
 }
 
 // --- §3.4 optional cache-hint (opt-in, default OFF) -------------------------
@@ -464,26 +384,6 @@ function dedupOpenAIMessages(messages, tailStart) {
 }
 
 // ---------------------------------------------------------------------------
-// TEST-ONLY dedup injection seam (§3.5 revert coverage).
-//
-// The real `dedupMiddle` preserves `tool_use_id` and every semantic field, so it
-// can NEVER break adjacency — which would leave the §3.5 validate/revert branch
-// permanently dead (untestable). To keep that branch load-bearing we allow a test
-// to swap in a deliberately adjacency-breaking dedup and assert compress() detects
-// the integrity failure and reverts.
-//
-// This lives OFF the public `compress(body, opts)` surface (an opts field would let
-// any production caller inject a custom dedup). It is a module-private override set
-// ONLY by `__setDedupImplForTest`, which is exported under a `__test` namespace and
-// is never referenced by production code (proxy.js passes only {format, cacheHint}).
-let _dedupImplOverride = null;
-function __setDedupImplForTest(fn) {
-  // Pass null/undefined to restore the production dedup. Any test that sets this
-  // MUST reset it in a finally block so it can't leak across tests.
-  _dedupImplOverride = (typeof fn === 'function') ? fn : null;
-}
-
-// ---------------------------------------------------------------------------
 // compress() — the single entry point. Returns { body, messages, tokens, rawTokens }
 // where `body` is the REDUCED body proxy.js forwards on EVERY leg (I6).
 // `format` is 'anthropic' (default) or 'openai'. `opts.cacheHint` opts into §3.4.
@@ -514,33 +414,12 @@ function compress(body, opts = {}) {
   // there is no truncation, so miser cannot move a block to position 0. Nothing
   // to do here — an already-illegal client opener forwards as-is.
 
-  // §3.3 lossless tool_result dedup (on a clone; original messages untouched).
-  // v4 cache-safety: Anthropic clients carrying cache_control already manage
-  // prompt-cache breakpoints. Rewriting older cached prefix bytes can be
-  // billing-negative, so skip dedup unless the test/emergency override is set.
-  const tailStart = Math.max(0, normMessages.length - MIN_KEEP);
-  const firstTaskIdx = normMessages.findIndex(m => m && m.role === 'user'); // -1 if none
-  const work = normMessages.map(cloneMsg);
-  const skipDedup = requestCarriesClientCache(normBody) && process.env.MISER_DEDUP_FORCE !== '1';
-  if (!skipDedup) {
-    const pairings = buildPairings(work);
-    // Production always uses the real lossless dedupMiddle. A module-private
-    // override (set ONLY via __setDedupImplForTest, never through opts) lets a test
-    // inject an adjacency-breaking dedup to prove the §3.5 revert below is
-    // load-bearing. Not reachable from the public compress(body, opts) surface.
-    const dedupImpl = _dedupImplOverride || dedupMiddle;
-    dedupImpl(work, firstTaskIdx, tailStart, pairings);
-  }
-
-  // §3.5 adjacency re-validation. On failure, revert DEDUP ONLY — back to the
-  // §3.1-normalized messages (system already hoisted; never the raw illegal
-  // input). Normalization is always retained.
-  let finalMessages = work;
-  const integ = validateMessageIntegrity(work);
-  if (!integ.valid) {
-    console.warn(`[miser] compress: dedup rejected (${integ.error}); reverting dedup, forwarding normalized messages`);
-    finalMessages = normMessages;
-  }
+  // §3.3 Anthropic middle dedup is RETIRED (see the §3.3 note above). The
+  // §3.5 keep-or-revert check went with it: its only job was to revert THIS
+  // module's own dedup, and with nothing rewritten there is nothing to revert
+  // and no way for compress() to break adjacency it did not already receive.
+  // `validateMessageIntegrity` itself is unchanged and still exported.
+  const finalMessages = normMessages;
 
   // §3.4 cache-hint LAST (on the final message set), opt-in + default OFF.
   let outBody = { ...normBody, messages: finalMessages };
@@ -565,10 +444,5 @@ module.exports = {
   validateMessageIntegrity,
   normalizeAnthropicBody,
   requestCarriesClientCache,
-  dedupMiddle,
   MIN_KEEP,
-  // Test-only seam (see __setDedupImplForTest above). Namespaced under `__test`
-  // and never referenced by production code, so the public compress() surface
-  // cannot be used to inject a custom dedup.
-  __test: { setDedupImpl: __setDedupImplForTest },
 };

@@ -8,6 +8,7 @@ const { parseStopgapWatchdogEnv } = require('./stopgap-watchdog.js');
 const { parseEnforcement } = require('./enforcement.js');
 const { parsePairAdvisor } = require('./pair-advisor.js');
 const { parseWatchConfig } = require('./watchd.js');
+const { parseRtkConfig } = require('./outputfilter.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
 // (which collides with the panel routing grammar). Exported for unit tests so
@@ -74,11 +75,19 @@ module.exports = {
       return {};
     } catch (_) { return {}; }
   })(),
-  // Tier B opt-in flags (default OFF; no behavior is wired in v3).
+  // Tier B opt-in flags (default OFF).
+  // `toolOutputTrim` is the UMBRELLA kill-switch for the RTK pre-context output
+  // filter below. It was declared-but-unread before that sprint; `rtk.enabled`
+  // now requires BOTH it and MISER_RTK_FILTER, so unsetting EITHER disables the
+  // feature (PROPOSAL-RTK-ONLY.md §9 and §11).
   tierB: {
     toolSchemaCompress: /^(1|true|on|yes)$/i.test(process.env.MISER_TIER_B_SCHEMA_COMPRESS || ''),
     toolOutputTrim: /^(1|true|on|yes)$/i.test(process.env.MISER_TIER_B_OUTPUT_TRIM || ''),
   },
+  // RTK pre-context shell-output filter. Pure env parse — no filesystem access
+  // and no subprocess at module load (the spawn jail is created lazily on first
+  // use, and the binary version probe runs on first filtered block).
+  rtk: parseRtkConfig(process.env),
   compactHintUrgentFraction: parseFloat(process.env.COMPACT_HINT_URGENT_FRACTION ?? '0.70'),
   compactHintRecommendFraction: parseFloat(process.env.COMPACT_HINT_RECOMMEND_FRACTION ?? '0.40'),
   contextEditProjects: contextEditConfig.projects,

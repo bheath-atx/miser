@@ -63,6 +63,31 @@ function buildMetricsText(statsResult) {
     lines.push(`miser_cost_usd_7d{project="${labelEscape(project)}"} ${cost}`);
   }
 
+  // RTK pre-context output filter (§8). metrics.js emits named families only —
+  // it exports no arbitrary fields — so a new stats bucket needs its own
+  // HELP/TYPE block and emit here or it is invisible to Prometheus. Emitted
+  // unconditionally when the bucket exists, INCLUDING at zero: a latch-trip
+  // counter that only appears after the first trip cannot be alerted on.
+  //
+  // NAMING, deliberately NOT the proposal's literal `miser_rtk_latch_trips_total`:
+  // every family this builder emits is a ROLLING 7-DAY aggregate, so the value
+  // goes DOWN as old days age out. A `_total` suffix declares a monotonic
+  // counter and would make rate()/increase() silently wrong. The repo already
+  // encodes that invariant as a test ("No _total metric names should appear"),
+  // and it is correct. These are gauges, named and typed as such.
+  const rtk = statsResult && statsResult.perTechnique && statsResult.perTechnique.rtk;
+  lines.push('# HELP miser_rtk_latch_trips RTK output-filter fault latch trips in the rolling window; non-zero means filtering latched off for that process.');
+  lines.push('# TYPE miser_rtk_latch_trips gauge');
+  if (rtk && Number.isFinite(rtk.latchTrips)) {
+    lines.push(`miser_rtk_latch_trips ${rtk.latchTrips}`);
+  }
+
+  lines.push('# HELP miser_rtk_blocks_filtered Tool-result blocks replaced by an RTK filter summary in the rolling window.');
+  lines.push('# TYPE miser_rtk_blocks_filtered gauge');
+  if (rtk && Number.isFinite(rtk.blocksFiltered)) {
+    lines.push(`miser_rtk_blocks_filtered ${rtk.blocksFiltered}`);
+  }
+
   lines.push('# HELP miser_authoritative Stats rolling-window aggregate authority state (1 authoritative, 0 non-authoritative).');
   lines.push('# TYPE miser_authoritative gauge');
   if (statsResult && typeof statsResult.authoritative === 'boolean') {

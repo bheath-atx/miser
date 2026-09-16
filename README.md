@@ -118,6 +118,43 @@ Malformed config, unknown keys, invalid project names, and out-of-bounds values 
 
 ---
 
+## RTK pre-context output filter
+
+Default OFF. When enabled, eligible `tool_result` blocks are replaced by RTK's structured summary of the same shell output before the request is forwarded upstream. RTK is a local Rust binary invoked as `rtk pipe --filter <id>` — no daemon, no network, no persistent state, and no runtime dependency added to miser.
+
+**Both switches are required.** `MISER_TIER_B_OUTPUT_TRIM` is the umbrella kill switch: unsetting *either* variable disables the feature.
+
+```bash
+MISER_TIER_B_OUTPUT_TRIM=1 MISER_RTK_FILTER=1 MISER_RTK_BIN=/usr/local/bin/rtk
+```
+
+| Env | Default | Meaning |
+|---|---|---|
+| `MISER_TIER_B_OUTPUT_TRIM` | off | umbrella kill switch (required) |
+| `MISER_RTK_FILTER` | off | RTK master enable (required) |
+| `MISER_RTK_BIN` | `rtk` | absolute path in production |
+| `MISER_RTK_VERSION` | `0.48.0` (source pin `79347d5`) | mandatory exact version check before filtering; empty keeps the pin; participates in the memo key |
+| `MISER_RTK_FILTERS` | Phase 1 list | filter allowlist; admission gated on the cross-process fixture |
+| `MISER_RTK_MIN_BYTES` | `2048` | below this, forward raw without spawning |
+| `MISER_RTK_MAX_BYTES` | `1048576` | above this, forward raw (matches RTK's 1 MiB stdin cap) |
+| `MISER_RTK_MIN_GAIN_BYTES` | `256` | accept margin — a heuristic, **not** token evidence |
+| `MISER_RTK_TIMEOUT_MS` | `5000` | crash guard only; firing trips the latch |
+| `MISER_RTK_MEMO_ENTRIES` | `2048` | in-memory memo; `0` disables it with zero byte-level effect |
+| `MISER_RTK_FILTER_FLAG` | `--filter` | RTK's filter-selection flag |
+| `MISER_RTK_JAIL_DIR` | `$TMPDIR/miser-rtk-jail` | base for the pinned config home + neutral cwd |
+| `MISER_RTK_CONFIG_HOME` | `<jail>/config` | absolute, empty, read-only `XDG_CONFIG_HOME` |
+| `MISER_RTK_CWD` | `<jail>/cwd` | separately pinned neutral cwd |
+
+**Phase 1 allowlist:** `pytest`, `prettier`, `phpunit`, `pest`, `paratest`, `php-test`, `ecs`, `grep`, `rg`. Excluded because their output ordering is not a total function of the input (a sort on a count or length with no tiebreak leaves tied entries in randomized per-process order): `log`, `ruff-check`, `ruff-format`, `tsc`, `mypy`, `cargo-test`. Excluded for other reasons: `go-test` (fidelity), `pint`, `sqlfluff-lint`, `phpstan`, `vitest`, `find`.
+
+**Ordering.** The filter runs *after* enforcement classification and *after* `compress()`, on a clone, immediately before upstream dispatch. Enforcement's hard-safety classifiers match raw command and output text and must keep doing so, so `originalBody` is deep-frozen for the whole request while the feature is on.
+
+**Faults.** The first fault of any kind — timeout, non-zero exit, missing binary, invalid UTF-8, or RTK's own caught-filter-panic stderr warning — disables filtering for the remainder of the process, emits a warning, and increments `miser_rtk_latch_trips`. Every failure path forwards the block unmodified.
+
+**Savings are measured, not predicted.** Miser has no tokenizer, so a byte gain does not prove fewer provider tokens. Watch the `rtk` stats bucket and `/api/miser/metrics`; if the first week shows no real usage delta, turn the feature off rather than tuning it.
+
+---
+
 ## Guardrails (Sprint B)
 
 Two opt-in guardrails, both consuming the measured usage layer. Both are OFF by default (`null`-as-OFF: unset or malformed env → feature fully off, zero overhead, one startup warning if the env var was set but invalid). Neither ever mutates a forwarded request body or header.
