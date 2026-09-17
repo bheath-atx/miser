@@ -9,6 +9,7 @@ const { parseEnforcement } = require('./enforcement.js');
 const { parsePairAdvisor } = require('./pair-advisor.js');
 const { parseWatchConfig } = require('./watchd.js');
 const { parseRtkConfig } = require('./outputfilter.js');
+const { parseHeadroomConfig } = require('./headroom.js');
 
 // B4 startup guard: refuse to start if any configured project name contains '--'
 // (which collides with the panel routing grammar). Exported for unit tests so
@@ -88,6 +89,7 @@ module.exports = {
   // and no subprocess at module load (the spawn jail is created lazily on first
   // use, and the binary version probe runs on first filtered block).
   rtk: parseRtkConfig(process.env),
+  headroom: parseHeadroomConfig(process.env),
   compactHintUrgentFraction: parseFloat(process.env.COMPACT_HINT_URGENT_FRACTION ?? '0.70'),
   compactHintRecommendFraction: parseFloat(process.env.COMPACT_HINT_RECOMMEND_FRACTION ?? '0.40'),
   contextEditProjects: contextEditConfig.projects,

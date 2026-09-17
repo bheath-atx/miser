@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { compress } = require('./compress.js');
+const { compress, messageTokens } = require('./compress.js');
 const { routeRequest, getLegErrors } = require('./router.js');
 const { getAllUsage } = require('./quota.js');
 const {
@@ -24,6 +24,7 @@ const { getPanelStats, getPersistenceStatus, getRecordRejectionStatus: getPanelR
 const { alertRoutingHealth } = require('./alert-routes.js');
 const { createWatcher } = require('./watchd.js');
 const { createOutputFilter } = require('./outputfilter.js');
+const { createHeadroomFilter } = require('./headroom.js');
 
 const projectFingerprints = new Map();
 const contextBreaker = new Map();
@@ -318,6 +319,8 @@ function createProxy(deps = {}) {
   // OFF means no spawn, no memo allocation, and no freeze cost.
   const outputFilter = deps.outputFilter
     || (config.rtk && config.rtk.enabled ? createOutputFilter(config.rtk, deps.rtkDeps || {}) : null);
+  const headroomFilter = deps.headroomFilter
+    || (config.headroom && config.headroom.enabled ? createHeadroomFilter(config.headroom, deps.headroomDeps || {}) : null);
   let watcher = deps.watcher || null;
   const getWatcher = () => {
     if (!watcher) watcher = createWatcher(config.watch || {});
@@ -631,7 +634,7 @@ function createProxy(deps = {}) {
       let rtkMessages = messages;
       let rtkBody = prunedBody;
       let rtkStats = null;
-      if (outputFilter && format === 'anthropic') {
+      if (outputFilter && !headroomFilter && format === 'anthropic') {
         try {
           const filtered = await outputFilter.applyToMessages(prunedBody.messages);
           rtkStats = filtered.stats;
@@ -649,8 +652,28 @@ function createProxy(deps = {}) {
         }
       }
 
+      // Headroom uses the SAME dispatch-stage slot as RTK. Always start from
+      // raw pre-filter messages: stacking lossy passes could erase guard words.
+      if (headroomFilter && format === 'anthropic') {
+        try {
+          const filtered = await headroomFilter.applyToMessages(prunedBody.messages);
+          rtkMessages = filtered.messages;
+          rtkBody = { ...prunedBody, messages: filtered.messages };
+        } catch (e) {
+          console.warn('[miser] headroom filter error (fail-open):', e.message);
+        }
+      }
+
+      // Count Headroom only after the guarded filter has accepted its output.
+      // Keep dedup and RTK attribution unchanged; use the same token estimator
+      // as compress() on both sides of the Headroom transformation.
+      const headroomSavedTokens = headroomFilter && format === 'anthropic'
+        ? Math.max(0, prunedBody.messages.reduce((sum, m) => sum + messageTokens(m), 0)
+          - rtkMessages.reduce((sum, m) => sum + messageTokens(m), 0))
+        : 0;
       const legacyStats = {
         inputTokensRemoved: savedTokens,
+        headroomSavedTokens,
         toolsRemoved,
         pollClass: compactHeaders['x-miser-poll-class'],
         rtk: rtkStats,

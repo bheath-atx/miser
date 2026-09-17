@@ -2208,3 +2208,33 @@ test('RTK: (30) with the feature OFF the body is forwarded unchanged and nothing
     echo.server.close(); restoreEnv();
   }
 });
+
+test('Headroom config wires guarded text into the existing dispatch stage without stacking RTK', async () => {
+  const echo = await startEcho(() => ({ status: 200, body: { ok: true } }));
+  const { createProxy, restoreEnv } = freshProxy(echo.url, { MISER_HEADROOM: '1' });
+  let rtkCalls = 0, headroomCalls = 0;
+  const raw = 'ordinary operation and its accompanying details '.repeat(30);
+  const messages = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'h1', name: 'Bash', input: { command: 'cat log' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'h1', content: raw }] },
+  ];
+  try {
+    const handler = createProxy({
+      headroomDeps: { compress: async text => { headroomCalls++; assert.equal(text, raw); return 'retained summary'; } },
+      outputFilter: { applyToMessages: async () => { rtkCalls++; throw Error('must not stack'); } },
+    });
+    const res = fakeRes(), done = res.whenDone();
+    await handler(fakeReq('POST', '/v1/messages', { model: 'claude', max_tokens: 50, messages }), res);
+    await done;
+    assert.equal(headroomCalls, 1);
+    assert.equal(rtkCalls, 0);
+    assert.equal(echo.captured[0].body.messages[1].content[0].content, 'retained summary');
+    assert.equal(messages[1].content[0].content, raw);
+    const { messageTokens } = require('../src/compress.js');
+    const expectedSavings = messages.reduce((sum, m) => sum + messageTokens(m), 0)
+      - echo.captured[0].body.messages.reduce((sum, m) => sum + messageTokens(m), 0);
+    assert.ok(expectedSavings > 0);
+    const stats = require('../src/stats.js').getStats();
+    assert.equal(stats.totals.inputTokensRemoved, expectedSavings);
+  } finally { restoreEnv(); echo.server.close(); }
+});

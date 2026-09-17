@@ -19,7 +19,7 @@ const STATS_FILE = process.env.MISER_STATS_FILE
 // ABSENT from an older snapshot (test/fixtures-pre-v4-stats-snapshot.json is
 // the precedent). Declared HERE, above every consumer, because the retention /
 // migration pass runs during module load and would otherwise hit the TDZ.
-const TECHNIQUE_NAMES = Object.freeze(['dedup', 'cacheHint', 'toolPrune', 'rtk']);
+const TECHNIQUE_NAMES = Object.freeze(['dedup', 'cacheHint', 'toolPrune', 'rtk', 'headroom']);
 const TECHNIQUE_EXTRA_FIELDS = Object.freeze({
   toolPrune: ['toolsRemovedCount'],
   rtk: ['blocksFiltered', 'blocksRawPinned', 'memoHits', 'latchTrips'],
@@ -821,7 +821,7 @@ function pruneWeeklyRetention(statsObj, now) {
 }
 
 function addOptimizerFields(target, source) {
-  const hasOptimizer = !!(source && (source.dedup || source.cacheHint || source.toolPrune || source.rtk
+  const hasOptimizer = !!(source && (source.dedup || source.cacheHint || source.toolPrune || source.rtk || source.headroom
     || Number.isFinite(source.likelyPollCount) || Number.isFinite(source.workTurnCount)));
   if (!hasOptimizer) return;
   ensureOptimizerFields(target);
@@ -1112,6 +1112,7 @@ function ensureOptimizerFields(bucket) {
   if (!bucket.cacheHint) bucket.cacheHint = emptyTechniqueBucket();
   if (!bucket.toolPrune) bucket.toolPrune = emptyToolPruneBucket();
   if (!bucket.rtk) bucket.rtk = emptyRtkBucket();
+  if (!bucket.headroom) bucket.headroom = emptyTechniqueBucket();
   if (!Number.isFinite(bucket.likelyPollCount)) bucket.likelyPollCount = 0;
   if (!Number.isFinite(bucket.workTurnCount)) bucket.workTurnCount = 0;
   return bucket;
@@ -1335,6 +1336,7 @@ function recordEnforcementEvent(project, event = {}, nowFn = defaultNow) {
 function applyOptimizerStats(bucket, opts = {}) {
   const {
     inputTokensRemoved = 0,
+    headroomSavedTokens = 0,
     cacheBillingDelta = 0,
     toolsRemoved = 0,
     pollClass,
@@ -1346,6 +1348,11 @@ function applyOptimizerStats(bucket, opts = {}) {
     bucket.dedup.estRemovedTokens = (bucket.dedup.estRemovedTokens || 0) + inputTokensRemoved;
     bucket.dedup.inputTokensRemoved += inputTokensRemoved;
     bucket.dedup.appliedCount += 1;
+  }
+  if (headroomSavedTokens > 0) {
+    bucket.headroom.estRemovedTokens += headroomSavedTokens;
+    bucket.headroom.inputTokensRemoved += headroomSavedTokens;
+    bucket.headroom.appliedCount += 1;
   }
   if (techniques.cacheHint) {
     bucket.cacheHint.cacheBillingDelta += cacheBillingDelta;
@@ -1540,7 +1547,7 @@ function accumulateProjectAggregate(perProject, proj, projData, projectFilter) {
   // preserved). Projects with EXCLUSIVELY guardrail keys (budget/policy)
   // must not appear with fabricated zeroed legacy buckets.
   const hasLegacy = !!(projData.usage || projData.contextManagement
-    || projData.dedup || projData.cacheHint || projData.toolPrune || projData.rtk);
+    || projData.dedup || projData.cacheHint || projData.toolPrune || projData.rtk || projData.headroom);
   // Guardrail activity only counts when counts are positive (sparse contract §2.3).
   const hasGuardrail = (projData.budget && (projData.budget.blockedCount || 0) > 0)
     || (projData.policy && ((projData.policy.modelDriftCount || 0) > 0 || (projData.policy.contextBloatCount || 0) > 0))
@@ -1670,7 +1677,7 @@ function finalizeAggregate(perProject, weights = DEFAULT_WEIGHTS) {
   // buckets that actually remove input tokens (dedup, cacheHint, rtk);
   // toolPrune removes tool definitions and is reported by its own field.
   const sumOver = (names, field) => names.reduce((sum, t) => sum + (perTechnique[t][field] || 0), 0);
-  const TOKEN_REMOVING = ['dedup', 'cacheHint', 'rtk'];
+  const TOKEN_REMOVING = ['dedup', 'cacheHint', 'rtk', 'headroom'];
   const totals = {
     inputTokensRemoved: sumOver(TOKEN_REMOVING, 'inputTokensRemoved'),
     estRemovedTokens: sumOver(TOKEN_REMOVING, 'estRemovedTokens'),
