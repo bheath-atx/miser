@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { compress } = require('./compress.js');
+const { compress, messageTokens } = require('./compress.js');
 const { routeRequest, getLegErrors } = require('./router.js');
 const { getAllUsage } = require('./quota.js');
 const {
@@ -664,8 +664,16 @@ function createProxy(deps = {}) {
         }
       }
 
+      // Count Headroom only after the guarded filter has accepted its output.
+      // Keep dedup and RTK attribution unchanged; use the same token estimator
+      // as compress() on both sides of the Headroom transformation.
+      const headroomSavedTokens = headroomFilter && format === 'anthropic'
+        ? Math.max(0, prunedBody.messages.reduce((sum, m) => sum + messageTokens(m), 0)
+          - rtkMessages.reduce((sum, m) => sum + messageTokens(m), 0))
+        : 0;
       const legacyStats = {
         inputTokensRemoved: savedTokens,
+        headroomSavedTokens,
         toolsRemoved,
         pollClass: compactHeaders['x-miser-poll-class'],
         rtk: rtkStats,

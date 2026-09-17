@@ -2230,5 +2230,11 @@ test('Headroom config wires guarded text into the existing dispatch stage withou
     assert.equal(rtkCalls, 0);
     assert.equal(echo.captured[0].body.messages[1].content[0].content, 'retained summary');
     assert.equal(messages[1].content[0].content, raw);
+    const { messageTokens } = require('../src/compress.js');
+    const expectedSavings = messages.reduce((sum, m) => sum + messageTokens(m), 0)
+      - echo.captured[0].body.messages.reduce((sum, m) => sum + messageTokens(m), 0);
+    assert.ok(expectedSavings > 0);
+    const stats = require('../src/stats.js').getStats();
+    assert.equal(stats.totals.inputTokensRemoved, expectedSavings);
   } finally { restoreEnv(); echo.server.close(); }
 });

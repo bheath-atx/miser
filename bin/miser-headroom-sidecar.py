@@ -8,11 +8,11 @@ from importlib.metadata import version
 STATUS_PATTERN = r'\b(?:WITHHELD|NOT|FAIL|FAILED|FAILURE|SKIP|SKIPPED|DENIED|BLOCKED|REJECTED|ERROR|WARNING|NEVER|WITHOUT|NO)\b'
 MAX_BYTES = 1024 * 1024
 
-def build_compressor():
+def build_compressor_factory():
     os.environ.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
                       HEADROOM_KOMPRESS_BACKEND='pytorch', HEADROOM_KOMPRESS_MUST_KEEP='1',
                       HEADROOM_COMPRESSION_DEADLINE_MS='0',
-                      HEADROOM_KOMPRESS_CANARY_THRESHOLD_SECONDS='0', TOKENIZERS_PARALLELISM='false')
+                      HEADROOM_KOMPRESS_CANARY_SECONDS='0', TOKENIZERS_PARALLELISM='false')
     if version('headroom-ai') != '0.37.0':
         raise RuntimeError('Requires headroom-ai==0.37.0')
     import torch
@@ -27,9 +27,11 @@ def build_compressor():
         model_id=os.environ.get('MISER_HEADROOM_MODEL', 'chopratejas/kompress-v2-base'), min_input_words=64))
     if not compressor.preload(allow_download=False):
         raise RuntimeError('Provision local model weights before startup')
-    return compressor
+    # The library caches model/tokenizer weights globally. Only config is shared;
+    # request-local failure latches and all other instance state start fresh.
+    return lambda: kompress.KompressCompressor(compressor.config)
 
-def handler_for(compressor):
+def handler_for(compressor_factory):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -52,7 +54,7 @@ def handler_for(compressor):
                 self.send_error(400)
                 return
             try:
-                result = compressor.compress(payload['text'], target_ratio=ratio, allow_download=False)
+                result = compressor_factory().compress(payload['text'], target_ratio=ratio, allow_download=False)
                 body = json.dumps({'compressed': result.compressed}).encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
@@ -66,4 +68,4 @@ def handler_for(compressor):
 if __name__ == '__main__':
     # Single inference at a time; weights reused, no per-session state or CCR.
     HTTPServer(('127.0.0.1', int(os.environ.get('MISER_HEADROOM_PORT', '20129'))),
-               handler_for(build_compressor())).serve_forever()
+               handler_for(build_compressor_factory())).serve_forever()

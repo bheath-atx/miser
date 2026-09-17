@@ -88,3 +88,14 @@ test('HTTP request is query-free; bad response and deadline fail open', async t 
   mode = 'bad'; assert.equal((await filter.applyToMessages(transcript(prose))).changed, false);
   mode = 'hang'; assert.equal((await filter.applyToMessages(transcript(prose))).changed, false);
 });
+test('Python sidecar isolates permanent failure latches across HTTP blocks', t => {
+  const { spawnSync } = require('node:child_process');
+  const path = require('node:path');
+  const probe = spawnSync('python3', ['-c', 'import headroom.transforms.kompress_compressor'], { encoding: 'utf8', timeout: 15000 });
+  if (probe.error || probe.status !== 0) {
+    t.skip('Optional python3/Headroom environment is unavailable');
+    return;
+  }
+  const result = spawnSync('python3', [path.join(__dirname, 'helpers/headroom-sidecar-regression.py')], { encoding: 'utf8', timeout: 15000 });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
