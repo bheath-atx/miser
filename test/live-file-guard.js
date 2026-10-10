@@ -319,14 +319,15 @@ function assertNoHomeMiserFilesModified() {
   const beforeNames = [...initialHomeMiserFiles.keys()].sort();
   const afterNames = [...current.keys()].sort();
   if (beforeNames.join('\0') !== afterNames.join('\0')) {
-    throw new Error(`[miser-live-file-guard] live ~/.miser-* file set changed: before=${beforeNames.join(',')} after=${afterNames.join(',')}`);
+    throw new Error(`[miser-live-file-guard] ${snapshotDirOverridden ? `snapshot-dir ${snapshotDir}/.miser-*` : 'live ~/.miser-*'} file set changed: before=${beforeNames.join(',')} after=${afterNames.join(',')}`);
   }
   for (const name of beforeNames) {
     const before = initialHomeMiserFiles.get(name);
     const after = current.get(name);
     for (const key of ['size', 'mtimeMs', 'ctimeMs', 'mode']) {
       if (before[key] !== after[key]) {
-        throw new Error(`[miser-live-file-guard] live ~/${name} changed (${key}: ${before[key]} -> ${after[key]})`);
+        const where = snapshotDirOverridden ? snapshotDir : '~';
+        throw new Error(`[miser-live-file-guard] ${snapshotDirOverridden ? 'snapshot-dir' : 'live'} ${where}/${name} changed (${key}: ${before[key]} -> ${after[key]})`);
       }
     }
   }
