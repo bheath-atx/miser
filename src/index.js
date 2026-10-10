@@ -68,7 +68,7 @@ const guardDeps = buildGuardDeps(config);
 wireAlertDispatcher(config, guardDeps);
 
 // B2: wire cache-thrash detector into guardDeps (no-op when MIN_REQUESTS=0).
-wireCacheThrashDeps(config, guardDeps);
+wireCacheThrashDeps(config, guardDeps, { now: Date.now });
 
 let stopgapWatchdog = null;
 if (config.stopgapWatchdog && config.stopgapWatchdog.enabled) {

@@ -184,6 +184,7 @@ module.exports = {
   cacheThrashInputSpikeRatio: parseFloat(process.env.MISER_CACHE_THRASH_INPUT_SPIKE_RATIO ?? '2.0'),
   cacheThrashMinRequests:     parseInt(process.env.MISER_CACHE_THRASH_MIN_REQUESTS        || '10', 10),
   cacheThrashRingSize:        parseInt(process.env.MISER_CACHE_THRASH_RING_SIZE            || '50', 10),
+  cacheThrashIdleResetMs:     0, // Disabled by default; enabled setting requires separate authority.
   // Stopgap stuck-panel watchdog. OFF unless explicitly enabled because it can
   // inject into TermDeck panels.
   stopgapWatchdog: parseStopgapWatchdogEnv(process.env),

@@ -444,22 +444,63 @@ test('AR30: positively — budgets/policy/(E)poll-rewrite-only with an incomplet
 // executable (guardDeps did not exist before index.js:59, and buildGuardDeps
 // returns a fresh object that would discard a pre-wired one).
 // ---------------------------------------------------------------------------
-test('AR31a: index.js sequences buildGuardDeps -> wireAlertDispatcher -> wireCacheThrashDeps', () => {
-  const idx = fs.readFileSync(path.join(SRC_DIR, 'index.js'), 'utf8');
+// The AR31a oracle over an index.js source text, factored out so the SAME checks
+// can be run against synthetic mutants (negative controls below). The production
+// call passes the injected clock seam as a THIRD argument (`{ now: Date.now }`,
+// B1 clock injection); the oracle accepts exactly that form, on a statement line
+// of its own (so a comment or dead text cannot satisfy it), exactly once.
+const THRASH_WIRE_STATEMENT = /^wireCacheThrashDeps\(config, guardDeps, \{ now: Date\.now \}\);$/m;
+const THRASH_CALL_LINES = /^[ \t]*wireCacheThrashDeps\(/gm;
+function assertStartupComposition(idx) {
   const iBuild = idx.indexOf('buildGuardDeps(config)');
   const iAlert = idx.indexOf('wireAlertDispatcher(config, guardDeps)');
-  const iThrash = idx.indexOf('wireCacheThrashDeps(config, guardDeps)');
+  const thrashCall = THRASH_WIRE_STATEMENT.exec(idx);
+  const iThrash = thrashCall ? thrashCall.index : -1;
   assert.ok(iBuild >= 0 && iAlert >= 0 && iThrash >= 0, 'all three composition calls are present');
   assert.ok(iBuild < iAlert, 'guardDeps must be CONSTRUCTED before the dispatcher is wired into it');
   assert.ok(iAlert < iThrash, 'the dispatcher is wired before the remaining feature wiring');
   assert.equal((idx.match(/wireAlertDispatcher\(/g) || []).length, 1,
     'exactly one call site for the composition root');
+  assert.equal((idx.match(THRASH_CALL_LINES) || []).length, 1,
+    'exactly one wireCacheThrashDeps call statement, and it is the 3-arg { now: Date.now } form');
+}
+
+test('AR31a: index.js sequences buildGuardDeps -> wireAlertDispatcher -> wireCacheThrashDeps', () => {
+  const idx = fs.readFileSync(path.join(SRC_DIR, 'index.js'), 'utf8');
+  assertStartupComposition(idx);
 
   // buildGuardDeps' signature is UNCHANGED — i.e. the fix did not take the
   // API-changing route (mutate a caller-owned object).
   const budgets = fs.readFileSync(path.join(SRC_DIR, 'budgets.js'), 'utf8');
   assert.match(budgets, /function buildGuardDeps\(config, seams = \{\}\)/,
     "buildGuardDeps keeps its (config, seams) signature");
+});
+
+// Negative controls for the AR31a oracle: each mutant is the REAL index.js with
+// one defect applied, and must be rejected by the same assertions that accept
+// the real file. The omitted-seam mutant is the regression R1 exists to catch.
+test('AR31a negative controls: the oracle rejects synthetic index.js mutants', () => {
+  const idx = fs.readFileSync(path.join(SRC_DIR, 'index.js'), 'utf8');
+  const real = 'wireCacheThrashDeps(config, guardDeps, { now: Date.now });';
+  assert.equal(idx.split(real).length - 1, 1, 'precondition: real index.js has the accepted 3-arg call once');
+  assert.doesNotThrow(() => assertStartupComposition(idx), 'control precondition: real index.js passes');
+  const alert = 'wireAlertDispatcher(config, guardDeps);';
+  const mutants = {
+    'omitted clock seam (legacy 2-arg call)': idx.replace(real, 'wireCacheThrashDeps(config, guardDeps);'),
+    'empty seams object': idx.replace(real, 'wireCacheThrashDeps(config, guardDeps, {});'),
+    'seam invoked instead of passed': idx.replace(real, 'wireCacheThrashDeps(config, guardDeps, { now: Date.now() });'),
+    'different clock': idx.replace(real, 'wireCacheThrashDeps(config, guardDeps, { now: () => 0 });'),
+    'extra seam keys': idx.replace(real, 'wireCacheThrashDeps(config, guardDeps, { now: Date.now, x: 1 });'),
+    'call only present in a comment': idx.replace(real, '// ' + real),
+    'seam text only in a comment above a 2-arg call':
+      idx.replace(real, '// ' + real + '\nwireCacheThrashDeps(config, guardDeps);'),
+    'duplicate call': idx.replace(real, real + '\n' + real),
+    'wired before the dispatcher': idx.replace(alert, '').replace(real, real + '\n' + alert),
+  };
+  for (const [name, mutated] of Object.entries(mutants)) {
+    assert.notEqual(mutated, idx, `mutant '${name}' must actually differ from index.js`);
+    assert.throws(() => assertStartupComposition(mutated), assert.AssertionError, `oracle must reject: ${name}`);
+  }
 });
 
 test('AR31a: behavioural companion — every single-feature config has a function dispatcher after the sequence', () => {

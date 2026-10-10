@@ -254,16 +254,31 @@ os.homedir = function guardedHomedir() {
   return originalHomedir.call(this);
 };
 
+// The before/after snapshot normally watches the real HOME. A running Miser
+// service rewrites ~/.miser-stats.json every ~13s, which fails any test file that
+// runs longer than that window regardless of what the tests do. A caller may
+// point ONLY this snapshot at a task-owned fixture directory via
+// MISER_LIVE_FILE_GUARD_SNAPSHOT_DIR; HOME, the fs/promises write blocks, the
+// homedir trap and the env-isolation checks are unchanged. Unset (or empty) =
+// old behaviour: the snapshot watches HOME. An explicit override must name an
+// existing directory holding at least one .miser-* protected fixture file, so a
+// mistyped or empty fixture fails loudly instead of silently watching nothing.
+function resolveSnapshotDir(envValue, homeDir) {
+  return envValue ? path.resolve(envValue) : homeDir;
+}
+const snapshotDirOverridden = Boolean(process.env.MISER_LIVE_FILE_GUARD_SNAPSHOT_DIR);
+const snapshotDir = resolveSnapshotDir(process.env.MISER_LIVE_FILE_GUARD_SNAPSHOT_DIR, home);
+
 function snapshotHomeMiserFiles() {
   const out = new Map();
   let names = [];
   try {
-    names = fs.readdirSync(home).filter(name => name.startsWith('.miser-'));
+    names = fs.readdirSync(snapshotDir).filter(name => name.startsWith('.miser-'));
   } catch (err) {
-    throw new Error(`[miser-live-file-guard] cannot list HOME for live-file snapshot: ${err.message}`);
+    throw new Error(`[miser-live-file-guard] cannot list ${snapshotDir} for live-file snapshot: ${err.message}`);
   }
   for (const name of names) {
-    const file = path.join(home, name);
+    const file = path.join(snapshotDir, name);
     const stat = fs.statSync(file);
     out.set(name, {
       size: stat.size,
@@ -276,6 +291,9 @@ function snapshotHomeMiserFiles() {
 }
 
 const initialHomeMiserFiles = snapshotHomeMiserFiles();
+if (snapshotDirOverridden && initialHomeMiserFiles.size < 1) {
+  throw new Error(`[miser-live-file-guard] MISER_LIVE_FILE_GUARD_SNAPSHOT_DIR ${snapshotDir} holds no .miser-* protected fixture file (need >= 1)`);
+}
 
 function assertSafeResolvedPath(envName, resolvedPath) {
   const defaultPath = homeDefaults.get(envName);
@@ -336,6 +354,9 @@ global.__miserLiveFileGuard = {
   scrubAlertEnv,
   NETWORK_ALLOW,
   tmpRoot,
+  snapshotDir,
+  snapshotDirOverridden,
+  resolveSnapshotDir,
   homeDefaults,
   isolatedDefaults,
   isHomeMiserPath,

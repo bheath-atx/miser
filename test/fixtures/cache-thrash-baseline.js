@@ -1,6 +1,6 @@
 'use strict';
 
-function createCacheThrashChecker(config, { now = Date.now } = {}) {
+function createCacheThrashChecker(config) {
   if (config.cacheThrashMinRequests === 0) {
     return {
       check: () => {},
@@ -26,28 +26,15 @@ function createCacheThrashChecker(config, { now = Date.now } = {}) {
     const cacheWrite1h = (creation.ephemeral_1h_input_tokens) || rawUsage.cache_creation_input_tokens || 0;
 
     const priorEntries = [...state.ring];
-    const ts = now();
-    const last = priorEntries[priorEntries.length - 1];
-    const idleResetMs = config.cacheThrashIdleResetMs;
-    const warmStart = Number.isFinite(idleResetMs) && idleResetMs > 0
-      && last && Number.isFinite(last.ts) && Number.isFinite(ts)
-      && ts - last.ts >= idleResetMs;
-    state.ring.push({ inputTokens, cacheWrite1h, ts, warm: Boolean(warmStart) });
+    state.ring.push({ inputTokens, cacheWrite1h });
     if (state.ring.length > maxRing) state.ring.shift();
-
-    if (warmStart) {
-      // Keep the status flag in step with the usable (non-warm, positive) entries left in the ring.
-      state.hasNonZeroPriorBaseline = state.ring.some(e => !e.warm && e.cacheWrite1h > 0);
-      return { warm: true, insufficientBaseline: priorEntries.length < minReq, shouldAlert: false };
-    }
 
     if (priorEntries.length < minReq) {
       return { warm: false, insufficientBaseline: true, shouldAlert: false };
     }
 
-    const cacheBaselineEntries = priorEntries.filter(e => !e.warm);
-    const avgCacheWrite1hPrior = cacheBaselineEntries.length > 0
-      ? cacheBaselineEntries.reduce((s, e) => s + e.cacheWrite1h, 0) / cacheBaselineEntries.length
+    const avgCacheWrite1hPrior = priorEntries.length > 0
+      ? priorEntries.reduce((s, e) => s + e.cacheWrite1h, 0) / priorEntries.length
       : 0;
     const avgInputTokensPrior = priorEntries.length > 0
       ? priorEntries.reduce((s, e) => s + e.inputTokens, 0) / priorEntries.length
@@ -135,7 +122,7 @@ function wireCacheThrashDeps(config, guardDeps, seams) {
     guardDeps.sendAlert = seams.sendAlert;
   }
   const factory = (seams && seams.createCacheThrashChecker) || createCacheThrashChecker;
-  const thrash = factory(config, { now: (seams && seams.now) || Date.now });
+  const thrash = factory(config);
   guardDeps.checkCacheThrash    = thrash.check;
   guardDeps.getCacheThrashStatus = thrash.getStatus;
 }
