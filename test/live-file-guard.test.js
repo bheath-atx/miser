@@ -121,7 +121,8 @@ test('snapshot-dir override still detects changes to .miser-* files in the fixtu
     const q = JSON.stringify(fixture);
     const modified = run(`require('node:fs').appendFileSync(${q}, ' ')`);
     assert.notEqual(modified.status, 0, 'a modified fixture file must fail the guard');
-    assert.match(modified.stderr, /live ~\/\.miser-stats\.json changed/);
+    assert.match(modified.stderr, new RegExp(`snapshot-dir ${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.miser-stats\\.json changed`));
+    assert.doesNotMatch(modified.stderr, /live ~/);
     const added = run(`require('node:fs').writeFileSync(${JSON.stringify(path.join(dir, '.miser-new.json'))}, 'x')`);
     assert.notEqual(added.status, 0, 'an added fixture file must fail the guard');
     assert.match(added.stderr, /file set changed/);

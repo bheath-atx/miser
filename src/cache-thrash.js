@@ -19,6 +19,13 @@ function createCacheThrashChecker(config, { now = Date.now } = {}) {
     return _states.get(project);
   }
 
+  // Single source of truth for the post-push status flags; getStatus() and the
+  // idle warm-start branch of check() both derive from it.
+  function statusOf(state) {
+    if (state.ring.length < minReq) return { warm: false, insufficientBaseline: true };
+    return { warm: true, insufficientBaseline: !state.hasNonZeroPriorBaseline };
+  }
+
   function observeUsage(state, project, rawUsage) {
     const inputTokens = (rawUsage.input_tokens) || 0;
     const creation = (rawUsage.cache_creation && typeof rawUsage.cache_creation === 'object')
@@ -38,7 +45,7 @@ function createCacheThrashChecker(config, { now = Date.now } = {}) {
     if (warmStart) {
       // Keep the status flag in step with the usable (non-warm, positive) entries left in the ring.
       state.hasNonZeroPriorBaseline = state.ring.some(e => !e.warm && e.cacheWrite1h > 0);
-      return { warm: true, insufficientBaseline: priorEntries.length < minReq, shouldAlert: false };
+      return { ...statusOf(state), shouldAlert: false };
     }
 
     if (priorEntries.length < minReq) {
@@ -111,8 +118,7 @@ function createCacheThrashChecker(config, { now = Date.now } = {}) {
   function getStatus(project) {
     const state = _states.get(project);
     if (!state || state.ring.length === 0) return { warm: false, insufficientBaseline: true };
-    if (state.ring.length < minReq) return { warm: false, insufficientBaseline: true };
-    return { warm: true, insufficientBaseline: !state.hasNonZeroPriorBaseline };
+    return statusOf(state);
   }
 
   return { check, getStatus };
